@@ -1,0 +1,42 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bash-and-naming:
+    name: Bash 语法与节点命名规则
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 jq 与 yq
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+          # mikefarah/yq v4，脚本内 yq eval 用法依赖该实现；sha256 取自官方 checksums
+          YQ_VERSION="v4.44.3"
+          YQ_SHA256="a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7"
+          curl -fsSL -o /tmp/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  /tmp/yq" | sha256sum -c -
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+          jq --version
+          yq --version
+
+      - name: Bash 语法检查
+        run: |
+          set -euo pipefail
+          for f in singbox.sh advanced_relay.sh parser.sh xray_manager.sh tests/test_node_naming.sh; do
+            bash -n "$f"
+            echo "bash -n $f ok"
+          done
+
+      - name: 节点命名规则测试
+        run: bash tests/test_node_naming.sh

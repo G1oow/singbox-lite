@@ -4,7 +4,7 @@ umask 077
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.1.3"
+XRAY_SCRIPT_VERSION="3.1.4"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -36,6 +36,41 @@ if ! declare -f _info >/dev/null 2>&1; then
     _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
     _warn()    { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
     _warning() { _warn "$1"; }
+fi
+
+# --- 节点命名规则: <地区旗帜> <地区>-<协议>-<机器ID> ---
+# 正常由 singbox.sh 通过 export -f 提供；单独运行本脚本时复用主脚本缓存的地区与机器ID，
+# 两者都存在时名称与菜单入口一致，否则退化为带端口的旧式名称，保证默认名唯一且不为空。
+if ! declare -f _node_default_name >/dev/null 2>&1; then
+    _node_default_name() {
+        local proto="$1" port="${2:-}" region="" mid="" cache_dir="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
+        [ -n "$proto" ] || return 1
+        if [ -s "${cache_dir}/node-region.cache" ]; then
+            region=$(head -n 1 "${cache_dir}/node-region.cache" 2>/dev/null | tr -d '\r')
+        fi
+        if [ -s "${cache_dir}/machine-id" ]; then
+            mid=$(head -n 1 "${cache_dir}/machine-id" 2>/dev/null | tr -d '[:space:]')
+        fi
+        if [ -n "$region" ] && [ -n "$mid" ]; then
+            printf '%s-%s-%s' "$region" "$proto" "$mid"
+        elif [ -n "$port" ]; then
+            printf 'X-%s-%s' "$proto" "$port"
+        else
+            printf 'X-%s' "$proto"
+        fi
+    }
+fi
+
+# 改端口时只替换名称里独立的端口段，避免误改机器ID等其它数字段
+if ! declare -f _node_name_replace_port >/dev/null 2>&1; then
+    _node_name_replace_port() {
+        local name="$1" old_port="$2" new_port="$3"
+        if [ -z "$name" ] || [ -z "$old_port" ] || [ -z "$new_port" ]; then
+            printf '%s' "$name"
+            return 0
+        fi
+        printf '%s' "$name" | sed -E 's/(^|-)'"${old_port}"'(-|$)/\1'"${new_port}"'\2/'
+    }
 fi
 
 _xray_flock_wait() {
@@ -1052,7 +1087,7 @@ _add_vless_reality_vision() {
     read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
     sni=${custom_sni:-www.amd.com}
     
-    local default_name="X-VLESS-TCP-REALITY-VISION-${port}"
+    local default_name=$(_node_default_name "Vless-Reality" "$port")
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -1119,7 +1154,7 @@ _add_vless_grpc_reality() {
     read -p "请输入 gRPC serviceName (默认: grpc): " custom_svc
     service_name=${custom_svc:-grpc}
     
-    local default_name="X-gRPC-Reality-${port}"
+    local default_name=$(_node_default_name "Vless-gRPC-Reality" "$port")
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -1175,7 +1210,7 @@ _add_trojan_xhttp_reality() {
     read -p "请输入 XHTTP 路径 (默认: ${path}): " custom_path
     path=${custom_path:-$path}
     
-    local default_name="X-Trojan-XHTTP-${port}"
+    local default_name=$(_node_default_name "Trojan-XHTTP-Reality" "$port")
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -1226,7 +1261,7 @@ _add_trojan_grpc_reality() {
     read -p "请输入 gRPC serviceName (默认: trojan-grpc): " custom_svc
     service_name=${custom_svc:-trojan-grpc}
     
-    local default_name="X-Trojan-gRPC-${port}"
+    local default_name=$(_node_default_name "Trojan-gRPC-Reality" "$port")
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -1352,7 +1387,7 @@ _add_shadowsocks_xray() {
     
     local port=$(_input_port)
     
-    local default_name="${name_prefix}-${port}"
+    local default_name=$(_node_default_name "${name_prefix}" "$port")
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -1420,7 +1455,7 @@ _add_vless_h2_tls() {
     read -p "请输入 H2 路径 (默认: ${path}): " custom_path
     path=${custom_path:-$path}
     
-    local default_name="X-VLESS-H2-${port}"
+    local default_name=$(_node_default_name "Vless-H2-TLS" "$port")
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -1506,7 +1541,7 @@ _add_xray_vless_grpc_tls() {
     read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
     service_name=${custom_svc:-$service_name}
     
-    local default_name="X-VLESS-gRPC-TLS-${port}"
+    local default_name=$(_node_default_name "Vless-gRPC-TLS" "$port")
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -1590,7 +1625,7 @@ _add_trojan_grpc_tls() {
     read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
     service_name=${custom_svc:-$service_name}
     
-    local default_name="X-Trojan-gRPC-TLS-${port}"
+    local default_name=$(_node_default_name "Trojan-gRPC-TLS" "$port")
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -1818,7 +1853,7 @@ _modify_xray_port() {
     local new_port=$(_input_port)
     
     # tag 保持稳定，避免证书路径与元数据键随端口改名后失配。
-    local new_name=$(echo "$target_name" | sed "s/${old_port}/${new_port}/g")
+    local new_name=$(_node_name_replace_port "$target_name" "$old_port" "$new_port")
     local old_link=$(jq -r --arg t "$target_tag" '.[$t].share_link // empty' "$XRAY_METADATA" 2>/dev/null)
     local new_link=""
     if [ -n "$old_link" ]; then
