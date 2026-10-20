@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="29"
+export SCRIPT_VERSION="30"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -187,6 +187,71 @@ _get_public_ip() {
     echo "$ip"
 }
 _get_ip() { _get_public_ip; } # 别名兼容
+
+# --- 客户端连接地址: 自动探测公网 IPv4 / IPv6 ---
+# 双栈 VPS 让用户选择用哪个地址；单栈 VPS 自动使用唯一地址，不再打断创建流程。
+# 需要指定域名或其他地址时，可设置环境变量 NODE_CONNECT_ADDR="example.com"。
+# 探测失败（无外网、DNS 异常）时回退到已检测地址或手动输入，不阻断节点创建。
+_conn_ipv4() {
+    local ip
+    ip=$(timeout 5 curl -fsS4 --max-time 3 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS4 --max-time 3 https://ipinfo.io/ip 2>/dev/null)
+    ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && printf '%s' "$ip"
+    return 0
+}
+
+_conn_ipv6() {
+    local ip
+    ip=$(timeout 5 curl -fsS6 --max-time 3 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS6 --max-time 3 https://ipinfo.io/ip 2>/dev/null)
+    ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+    if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then printf '%s' "$ip"; fi
+    return 0
+}
+
+# 返回客户端连接地址；IPv6 返回不带方括号的原始地址，由调用方按需加 []
+_choose_connect_addr() {
+    local fallback="${1:-${server_ip:-}}"
+    local v4="" v6="" choice="" manual=""
+    if [ -n "${NODE_CONNECT_ADDR:-}" ]; then
+        printf '%s' "$NODE_CONNECT_ADDR"
+        return 0
+    fi
+    v4=$(_conn_ipv4)
+    v6=$(_conn_ipv6)
+    if [ -n "$v4" ] && [ -n "$v6" ]; then
+        _info "检测到公网 IPv4: ${v4}"
+        _info "检测到公网 IPv6: ${v6}"
+        echo "请选择客户端连接地址:" >&2
+        echo "  1) IPv4  ${v4}" >&2
+        echo "  2) IPv6  ${v6}" >&2
+        echo "  3) 手动输入 IP 或域名" >&2
+        read -p "请选择 [1/2/3] (默认: 1): " choice
+        case "$(printf '%s' "$choice" | tr -d '[:space:]')" in
+            2) printf '%s' "$v6"; return 0 ;;
+            3) read -p "请输入连接地址: " manual; printf '%s' "${manual:-$v4}"; return 0 ;;
+            *) printf '%s' "$v4"; return 0 ;;
+        esac
+    fi
+    if [ -n "$v4" ]; then
+        _info "检测到公网 IPv4: ${v4}（单栈 VPS，已自动使用）"
+        printf '%s' "$v4"
+        return 0
+    fi
+    if [ -n "$v6" ]; then
+        _info "检测到公网 IPv6: ${v6}（单栈 VPS，已自动使用）"
+        printf '%s' "$v6"
+        return 0
+    fi
+    _warn "未能自动检测公网 IPv4 / IPv6。"
+    if [ -n "$fallback" ] && [ "$fallback" != "127.0.0.1" ] && [ "$fallback" != "null" ]; then
+        _info "使用已检测到的地址: ${fallback}"
+        printf '%s' "$fallback"
+        return 0
+    fi
+    read -p "请输入连接地址: " manual
+    printf '%s' "$manual"
+    return 0
+}
 # --- 节点命名规则: <地区旗帜> <地区>-<协议>-<机器ID> ---
 # 例如: 🇭🇰 香港-hy2-ZT1234 / 🇭🇰 香港-Vless-Reality-ZT1234
 # 地区按公网 IP 归属地自动识别，机器ID 首次生成后允许用户确认，两者都缓存在状态目录。
@@ -1545,7 +1610,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _node_cc_flag _node_cc_name _node_region_name_ok _node_region_detect _node_region _node_machine_id_random _node_machine_id _node_name_taken _node_default_name _node_name_replace_port
+export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _conn_ipv4 _conn_ipv6 _choose_connect_addr _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _node_cc_flag _node_cc_name _node_region_name_ok _node_region_detect _node_region _node_machine_id_random _node_machine_id _node_name_taken _node_default_name _node_name_replace_port
 
 export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
@@ -4032,10 +4097,7 @@ _add_vless_ws_tls() {
     else
         _info "--- VLESS (WebSocket+TLS) 设置向导 ---"
         _info "请输入客户端用于“连接”的地址:"
-        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-        _info "  - (其他) 您也可以手动输入一个IP或域名"
-        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
-        client_server_addr=${connection_address:-$server_ip}
+        client_server_addr=$(_choose_connect_addr "$server_ip")
         
         # IPv6 处理
         if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
@@ -4214,10 +4276,7 @@ _add_vless_grpc_tls() {
     else
         _info "--- VLESS (gRPC+TLS) 设置向导 ---"
         _info "请输入客户端用于“连接”的地址:"
-        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-        _info "  - (其他) 您也可以手动输入一个IP或域名"
-        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
-        client_server_addr=${connection_address:-$server_ip}
+        client_server_addr=$(_choose_connect_addr "$server_ip")
 
         # IPv6 处理
         if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
@@ -4380,10 +4439,7 @@ _add_trojan_ws_tls() {
     else
         _info "--- Trojan (WebSocket+TLS) 设置向导 ---"
         _info "请输入客户端用于“连接”的地址:"
-        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-        _info "  - (其他) 您也可以手动输入一个IP或域名"
-        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
-        client_server_addr=${connection_address:-$server_ip}
+        client_server_addr=$(_choose_connect_addr "$server_ip")
         
         # IPv6 处理
         if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
@@ -4771,8 +4827,7 @@ _add_anytls() {
             *) _error "无效选择"; return 1 ;;
         esac
 
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
+        node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
             read -p "请输入起始监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -4867,8 +4922,7 @@ _add_vless_reality() {
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
+        node_ip=$(_choose_connect_addr "$server_ip")
         read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
         server_name=${camouflage_domain:-"www.amd.com"}
         while true; do
@@ -4915,8 +4969,7 @@ _add_vless_tcp() {
             return 1
         fi
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
+        node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -4999,8 +5052,7 @@ _add_hysteria2() {
             use_multiport="true"
         fi
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
+        node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -5164,8 +5216,7 @@ _add_tuic() {
         port="$BATCH_PORT"
         server_name="${BATCH_SNI:-www.amd.com}"
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
+        node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -5301,8 +5352,7 @@ _add_shadowsocks_menu() {
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
+        node_ip=$(_choose_connect_addr "$server_ip")
         read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
     fi
     
@@ -5474,8 +5524,7 @@ _add_socks() {
         username=$(${SINGBOX_BIN} generate rand --hex 8)
         password=$(${SINGBOX_BIN} generate rand --hex 16)
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
+        node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -8605,9 +8654,7 @@ _batch_create_nodes() {
     
     # [修复] 强制初始化服务器 IP，防止各协议函数因变量未定义生成空配置
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
-    local batch_ip="${server_ip}"
-    read -p "请输入批量节点绑定的IP地址 (回车默认: ${server_ip}): " custom_batch_ip
-    batch_ip=${custom_batch_ip:-$server_ip}
+    local batch_ip=$(_choose_connect_addr "$server_ip")
     export BATCH_IP="$batch_ip"
     
     # 2.1 SNI 收集 (强制净化处理)

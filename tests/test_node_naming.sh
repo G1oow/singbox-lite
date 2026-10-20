@@ -35,8 +35,13 @@ sed -n '/^# --- 节点命名规则/,/^# 系统环境检测/{/^# 系统环境检�
     "$ROOT/singbox.sh" > "$WORK/naming.sh"
 sed -n '/^# --- 节点命名规则/,/^_xray_flock_wait() {/{/^_xray_flock_wait() {/d;p}' \
     "$ROOT/xray_manager.sh" > "$WORK/xray_naming.sh"
+sed -n '/^# --- 客户端连接地址/,/^# --- 节点命名规则/{/^# --- 节点命名规则/d;p}' \
+    "$ROOT/singbox.sh" > "$WORK/conn.sh"
+sed -n '/^# --- 客户端连接地址/,/^# --- 自签证书生成/{/^# --- 自签证书生成/d;p}' \
+    "$ROOT/xray_manager.sh" > "$WORK/xray_conn.sh"
 # shellcheck disable=SC1090
 . "$WORK/naming.sh"
+. "$WORK/conn.sh"
 
 fail=0
 check() { # 描述 期望 实际
@@ -117,6 +122,44 @@ standalone=$(bash -c '. "$1"; _node_default_name "Vless-Reality" 443' _ "$WORK/x
 check "缓存齐全时与菜单入口一致" "🇭🇰 香港-Vless-Reality-ZT7K2M" "$standalone"
 standalone_empty=$(SINGBOX_DIR="$WORK/empty" bash -c '. "$1"; _node_default_name "Vless-Reality" 443' _ "$WORK/xray_naming.sh")
 check "缓存缺失时退化为旧式名称" "X-Vless-Reality-443" "$standalone_empty"
+
+echo "== 连接地址选择 (IPv4 / IPv6) =="
+# 打桩探测结果，测试不依赖外网
+_info() { :; }
+_warn() { :; }
+_error() { :; }
+_conn_ipv4() { printf '%s' "${STUB_V4:-}"; }
+_conn_ipv6() { printf '%s' "${STUB_V6:-}"; }
+
+STUB_V4="1.2.3.4"; STUB_V6="2001:db8::1"
+check "双栈默认使用 IPv4" "1.2.3.4" "$(printf '\n' | _choose_connect_addr 9.9.9.9)"
+check "双栈选择 IPv6" "2001:db8::1" "$(printf '2\n' | _choose_connect_addr 9.9.9.9)"
+check "双栈手动输入域名" "example.com" "$(printf '3\nexample.com\n' | _choose_connect_addr 9.9.9.9)"
+
+STUB_V4="1.2.3.4"; STUB_V6=""
+check "单栈 IPv4 自动使用" "1.2.3.4" "$(_choose_connect_addr 9.9.9.9)"
+
+STUB_V4=""; STUB_V6="2001:db8::1"
+check "单栈 IPv6 自动使用" "2001:db8::1" "$(_choose_connect_addr 9.9.9.9)"
+
+STUB_V4=""; STUB_V6=""
+check "探测失败回退已检测地址" "9.9.9.9" "$(_choose_connect_addr 9.9.9.9)"
+check "探测失败且无地址时手动输入" "vpn.example.org" \
+    "$(printf 'vpn.example.org\n' | _choose_connect_addr 127.0.0.1)"
+
+STUB_V4="1.2.3.4"; STUB_V6="2001:db8::1"
+check "NODE_CONNECT_ADDR 覆盖" "my.domain" \
+    "$(printf '\n' | NODE_CONNECT_ADDR=my.domain _choose_connect_addr 9.9.9.9)"
+
+echo "== Xray 单独运行时的地址选择兜底 =="
+standalone_addr=$(bash -c '
+    . "$1"
+    _info() { :; }; _warn() { :; }; _error() { :; }
+    _conn_ipv4() { printf 1.2.3.4; }
+    _conn_ipv6() { printf 2001:db8::1; }
+    printf "\n" | _choose_connect_addr 9.9.9.9
+' _ "$WORK/xray_conn.sh")
+check "独立脚本可用等价实现" "1.2.3.4" "$standalone_addr"
 
 echo
 if [ "$fail" -ne 0 ]; then

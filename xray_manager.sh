@@ -4,7 +4,7 @@ umask 077
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.1.4"
+XRAY_SCRIPT_VERSION="3.1.5"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -562,6 +562,61 @@ if ! declare -f _get_public_ip >/dev/null 2>&1; then
     }
 fi
 
+# --- 客户端连接地址: 自动探测公网 IPv4 / IPv6 ---
+# 正常由 singbox.sh 通过 export -f 提供；单独运行本脚本时使用下面的等价实现。
+# 双栈 VPS 让用户选择，单栈 VPS 自动使用唯一地址；可用 NODE_CONNECT_ADDR 覆盖。
+if ! declare -f _choose_connect_addr >/dev/null 2>&1; then
+    _conn_ipv4() {
+        local ip
+        ip=$(timeout 5 curl -fsS4 --max-time 3 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS4 --max-time 3 https://ipinfo.io/ip 2>/dev/null)
+        ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+        [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && printf '%s' "$ip"
+        return 0
+    }
+    _conn_ipv6() {
+        local ip
+        ip=$(timeout 5 curl -fsS6 --max-time 3 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS6 --max-time 3 https://ipinfo.io/ip 2>/dev/null)
+        ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+        if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then printf '%s' "$ip"; fi
+        return 0
+    }
+    _choose_connect_addr() {
+        local fallback="${1:-${server_ip:-}}"
+        local v4="" v6="" choice="" manual=""
+        if [ -n "${NODE_CONNECT_ADDR:-}" ]; then
+            printf '%s' "$NODE_CONNECT_ADDR"
+            return 0
+        fi
+        v4=$(_conn_ipv4)
+        v6=$(_conn_ipv6)
+        if [ -n "$v4" ] && [ -n "$v6" ]; then
+            _info "检测到公网 IPv4: ${v4}"
+            _info "检测到公网 IPv6: ${v6}"
+            echo "请选择客户端连接地址:" >&2
+            echo "  1) IPv4  ${v4}" >&2
+            echo "  2) IPv6  ${v6}" >&2
+            echo "  3) 手动输入 IP 或域名" >&2
+            read -p "请选择 [1/2/3] (默认: 1): " choice
+            case "$(printf '%s' "$choice" | tr -d '[:space:]')" in
+                2) printf '%s' "$v6"; return 0 ;;
+                3) read -p "请输入连接地址: " manual; printf '%s' "${manual:-$v4}"; return 0 ;;
+                *) printf '%s' "$v4"; return 0 ;;
+            esac
+        fi
+        if [ -n "$v4" ]; then _info "检测到公网 IPv4: ${v4}（单栈 VPS，已自动使用）"; printf '%s' "$v4"; return 0; fi
+        if [ -n "$v6" ]; then _info "检测到公网 IPv6: ${v6}（单栈 VPS，已自动使用）"; printf '%s' "$v6"; return 0; fi
+        _warn "未能自动检测公网 IPv4 / IPv6。"
+        if [ -n "$fallback" ] && [ "$fallback" != "127.0.0.1" ] && [ "$fallback" != "null" ]; then
+            _info "使用已检测到的地址: ${fallback}"
+            printf '%s' "$fallback"
+            return 0
+        fi
+        read -p "请输入连接地址: " manual
+        printf '%s' "$manual"
+        return 0
+    }
+fi
+
 # --- 自签证书生成 (Hysteria2 专用) ---
 _generate_xray_cert() {
     local domain="$1" cert_path="$2" key_path="$3"
@@ -1079,8 +1134,7 @@ _add_vless_reality_vision() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
     
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
+    node_ip=$(_choose_connect_addr "$server_ip")
     
     local port=$(_input_port)
     local sni="www.amd.com"
@@ -1142,8 +1196,7 @@ _add_vless_grpc_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
     
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
+    node_ip=$(_choose_connect_addr "$server_ip")
     
     local port=$(_input_port)
     local sni="www.amd.com"
@@ -1198,8 +1251,7 @@ _add_trojan_xhttp_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
     
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
+    node_ip=$(_choose_connect_addr "$server_ip")
     
     local port=$(_input_port)
     local sni="www.amd.com"
@@ -1249,8 +1301,7 @@ _add_trojan_grpc_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
     
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
+    node_ip=$(_choose_connect_addr "$server_ip")
     
     local port=$(_input_port)
     local sni="www.amd.com"
@@ -1382,8 +1433,7 @@ _add_shadowsocks_xray() {
     fi
     password=$(_generate_xray_shadowsocks_password "$method") || return 1
     
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
+    node_ip=$(_choose_connect_addr "$server_ip")
     
     local port=$(_input_port)
     
@@ -1443,8 +1493,7 @@ _add_vless_h2_tls() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
     
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
+    node_ip=$(_choose_connect_addr "$server_ip")
     
     local port=$(_input_port)
     local sni="www.amd.com"
@@ -1529,8 +1578,7 @@ _add_xray_vless_grpc_tls() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
     
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
+    node_ip=$(_choose_connect_addr "$server_ip")
     
     local port=$(_input_port)
     local sni="www.amd.com"
@@ -1613,8 +1661,7 @@ _add_trojan_grpc_tls() {
     [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
     local node_ip="$server_ip"
     
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
+    node_ip=$(_choose_connect_addr "$server_ip")
     
     local port=$(_input_port)
     local sni="www.amd.com"
