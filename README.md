@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v28`、`advanced_relay.sh v19`、`xray_manager.sh v3.1.3`。
+当前文档按以下脚本版本整理：`singbox.sh v29`、`advanced_relay.sh v19`、`xray_manager.sh v3.1.4`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -48,7 +48,7 @@
 ## 安装与启动
 
 ```bash
-(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
+(curl -LfsS https://raw.githubusercontent.com/G1oow/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/G1oow/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
 以后直接运行：
@@ -94,6 +94,29 @@ sb
 | 退出 | 0 | 退出脚本 |
 
 `[5] 修改节点` 会按实际协议显示可用项目。所有主节点均可修改名称、客户端连接地址、端口和认证信息；Reality 可更新伪装域名并轮换密钥，TLS 类节点可更新 SNI、自签证书或自定义证书，WebSocket/gRPC 可修改传输路径，Hysteria2 还可调整混淆、端口跳跃和客户端带宽。保存时会统一校验 sing-box 配置并同步元数据、分享链接与 Clash/Mihomo 配置，失败则自动回滚。
+
+## 节点命名规则
+
+节点默认名称统一为 `地区旗帜 地区-协议-机器ID`：
+
+| 协议 | 默认名称示例 |
+| --- | --- |
+| Hysteria2 | `🇭🇰 香港-hy2-ZT7K2M` |
+| VLESS + TCP + Reality + Vision | `🇭🇰 香港-Vless-Reality-ZT7K2M` |
+| VLESS + WebSocket + TLS | `🇭🇰 香港-Vless-WS-ZT7K2M` |
+| VLESS + gRPC + TLS | `🇭🇰 香港-Vless-gRPC-ZT7K2M` |
+| Trojan + WebSocket + TLS | `🇭🇰 香港-Trojan-WS-ZT7K2M` |
+| TUIC v5 | `🇭🇰 香港-tuic-ZT7K2M` |
+| Shadowsocks | `🇭🇰 香港-SS-2022-aes256-ZT7K2M` |
+| Argo 临时/固定隧道 | `🇭🇰 香港-Argo-Temp-Vless-8443-ZT7K2M` |
+| 批量创建 | `🇭🇰 香港-Vless-WS-8443-ZT7K2M` |
+| Xray VLESS + gRPC + Reality | `🇭🇰 香港-Vless-gRPC-Reality-ZT7K2M` |
+
+- 地区：按本机公网 IP 归属地自动识别，结果写入 `/usr/local/etc/sing-box/node-region.cache`；只有首次创建节点时会联网查询，之后直接使用缓存。
+- 机器ID：首次创建节点时提示输入，默认自动生成 `ZT` + 4 位大写字母/数字，写入 `/usr/local/etc/sing-box/machine-id` 并在之后复用。
+- 端口：普通节点默认不带端口；批量创建、或同一名称已存在时会自动追加端口，避免 `clash.yaml` 出现重名节点。
+- 覆盖方式：`NODE_REGION="🇯🇵 日本" sb` 可临时指定地区；删除上述两个缓存文件即可重新识别地区或重新生成机器ID；节点名称仍可在创建时手动修改。
+- 归属地查询使用 `ipwho.is`，失败时回退 `ipinfo.io/country`；两者都不可用时显示 `🌐 未知`，不影响节点创建。
 
 ## sing-box 节点协议
 
@@ -245,6 +268,8 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 | `/usr/local/etc/sing-box/relay.json` | 中转和用户态端口转发配置 |
 | `/usr/local/etc/sing-box/clash.yaml` | sing-box/Xray 共享客户端配置 |
 | `/usr/local/etc/sing-box/metadata.json` | 主节点元数据和分享链接 |
+| `/usr/local/etc/sing-box/node-region.cache` | 节点命名使用的地区旗帜与地区名缓存 |
+| `/usr/local/etc/sing-box/machine-id` | 节点命名使用的机器ID |
 | `/usr/local/etc/sing-box/core-version.lock` | 固定版 `1.13.21` 的持久升级锁 |
 | `/usr/local/etc/sing-box/relay.d/` | 中转、端口转发和辅助状态 |
 | `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
@@ -401,3 +426,9 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - sing-box 与 Xray 的 Shadowsocks 创建菜单统一补齐 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`xchacha20-ietf-poly1305` 和三种 SS2022 加密方式，并保留原有 Padding、ShadowTLS 组合。
 - SS2022 改为按算法生成严格长度的 Base64 密钥：AES-128 使用 16 字节，AES-256 与 ChaCha20 使用 32 字节；sing-box 批量创建同步支持七种纯 SS 加密方式。
 - sing-box `[5] 修改节点` 在重新生成 Shadowsocks 认证信息时复用相同的密钥规则，并同步更新服务端配置、元数据、分享链接与 Clash/Mihomo 配置。
+
+### 2026.09.06
+
+- 节点默认命名统一为 `地区旗帜 地区-协议-机器ID`（如 `🇭🇰 香港-hy2-ZT7K2M`）：地区按公网 IP 归属地自动识别并缓存，机器ID 首次生成后持久化复用，sing-box 与 Xray 节点共用同一规则。
+- 普通节点默认名称不再携带端口；批量创建或同名节点已存在时自动追加端口，避免共享 `clash.yaml` 重名冲突。
+- 一键安装命令与脚本内 `GITHUB_RAW_BASE` 指向 `G1oow/singbox-lite` 仓库。

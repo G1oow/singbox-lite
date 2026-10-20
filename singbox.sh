@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="28"
+export SCRIPT_VERSION="29"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -15,7 +15,7 @@ SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_FIXED_VERSION="1.13.21"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/G1oow/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # --- 核心工具函数 ---
@@ -187,6 +187,193 @@ _get_public_ip() {
     echo "$ip"
 }
 _get_ip() { _get_public_ip; } # 别名兼容
+# --- 节点命名规则: <地区旗帜> <地区>-<协议>-<机器ID> ---
+# 例如: 🇭🇰 香港-hy2-ZT1234 / 🇭🇰 香港-Vless-Reality-ZT1234
+# 地区按公网 IP 归属地自动识别，机器ID 首次生成后允许用户确认，两者都缓存在状态目录。
+# 如需手动指定地区，可设置环境变量 NODE_REGION="🇯🇵 日本"。
+NODE_REGION_CACHE_FILE="${SINGBOX_DIR}/node-region.cache"
+NODE_MACHINE_ID_FILE="${SINGBOX_DIR}/machine-id"
+NODE_REGION_FALLBACK="🌐 未知"
+
+# 国家/地区代码 -> 旗帜 emoji (区域指示符 U+1F1E6 ~ U+1F1FF)
+_node_cc_flag() {
+    local cc="${1^^}" b1 b2
+    [[ "$cc" =~ ^[A-Z]{2}$ ]] || { printf '🌐'; return 0; }
+    # 直接输出 UTF-8 字节，避免 C locale 下 printf '\U' 不生效
+    b1=$(printf '%02X' $(( 0xA6 + $(printf '%d' "'${cc:0:1}") - 65 )))
+    b2=$(printf '%02X' $(( 0xA6 + $(printf '%d' "'${cc:1:1}") - 65 )))
+    printf '%b' "\\xF0\\x9F\\x87\\x${b1}\\xF0\\x9F\\x87\\x${b2}"
+}
+
+# 国家/地区代码 -> 中文名称 (未收录时返回空，由调用方回退)
+_node_cc_name() {
+    case "${1^^}" in
+        HK) printf '香港' ;; TW) printf '台湾' ;; MO) printf '澳门' ;; CN) printf '中国' ;;
+        JP) printf '日本' ;; KR) printf '韩国' ;; SG) printf '新加坡' ;; MY) printf '马来西亚' ;;
+        TH) printf '泰国' ;; VN) printf '越南' ;; PH) printf '菲律宾' ;; ID) printf '印度尼西亚' ;;
+        IN) printf '印度' ;; PK) printf '巴基斯坦' ;; BD) printf '孟加拉国' ;; LK) printf '斯里兰卡' ;;
+        KH) printf '柬埔寨' ;; LA) printf '老挝' ;; MM) printf '缅甸' ;; NP) printf '尼泊尔' ;;
+        MN) printf '蒙古' ;; KZ) printf '哈萨克斯坦' ;; UZ) printf '乌兹别克斯坦' ;; KG) printf '吉尔吉斯斯坦' ;;
+        AE) printf '阿联酋' ;; SA) printf '沙特阿拉伯' ;; QA) printf '卡塔尔' ;; KW) printf '科威特' ;;
+        BH) printf '巴林' ;; OM) printf '阿曼' ;; JO) printf '约旦' ;; IL) printf '以色列' ;;
+        TR) printf '土耳其' ;; IR) printf '伊朗' ;; IQ) printf '伊拉克' ;; LB) printf '黎巴嫩' ;;
+        US) printf '美国' ;; CA) printf '加拿大' ;; MX) printf '墨西哥' ;; BR) printf '巴西' ;;
+        AR) printf '阿根廷' ;; CL) printf '智利' ;; CO) printf '哥伦比亚' ;; PE) printf '秘鲁' ;;
+        VE) printf '委内瑞拉' ;; EC) printf '厄瓜多尔' ;; UY) printf '乌拉圭' ;; PY) printf '巴拉圭' ;;
+        BO) printf '玻利维亚' ;; PA) printf '巴拿马' ;; CR) printf '哥斯达黎加' ;; GT) printf '危地马拉' ;;
+        DO) printf '多米尼加' ;; PR) printf '波多黎各' ;; CU) printf '古巴' ;; JM) printf '牙买加' ;;
+        TT) printf '特立尼达和多巴哥' ;; BS) printf '巴哈马' ;; BB) printf '巴巴多斯' ;; HN) printf '洪都拉斯' ;;
+        SV) printf '萨尔瓦多' ;; NI) printf '尼加拉瓜' ;; GB) printf '英国' ;; IE) printf '爱尔兰' ;;
+        FR) printf '法国' ;; DE) printf '德国' ;; NL) printf '荷兰' ;; BE) printf '比利时' ;;
+        LU) printf '卢森堡' ;; CH) printf '瑞士' ;; AT) printf '奥地利' ;; IT) printf '意大利' ;;
+        ES) printf '西班牙' ;; PT) printf '葡萄牙' ;; GR) printf '希腊' ;; CY) printf '塞浦路斯' ;;
+        MT) printf '马耳他' ;; SE) printf '瑞典' ;; NO) printf '挪威' ;; DK) printf '丹麦' ;;
+        FI) printf '芬兰' ;; IS) printf '冰岛' ;; PL) printf '波兰' ;; CZ) printf '捷克' ;;
+        SK) printf '斯洛伐克' ;; HU) printf '匈牙利' ;; RO) printf '罗马尼亚' ;; BG) printf '保加利亚' ;;
+        HR) printf '克罗地亚' ;; SI) printf '斯洛文尼亚' ;; RS) printf '塞尔维亚' ;; BA) printf '波黑' ;;
+        MK) printf '北马其顿' ;; AL) printf '阿尔巴尼亚' ;; ME) printf '黑山' ;; EE) printf '爱沙尼亚' ;;
+        LV) printf '拉脱维亚' ;; LT) printf '立陶宛' ;; BY) printf '白俄罗斯' ;; UA) printf '乌克兰' ;;
+        MD) printf '摩尔多瓦' ;; RU) printf '俄罗斯' ;; GE) printf '格鲁吉亚' ;; AM) printf '亚美尼亚' ;;
+        AZ) printf '阿塞拜疆' ;; AU) printf '澳大利亚' ;; NZ) printf '新西兰' ;; FJ) printf '斐济' ;;
+        PG) printf '巴布亚新几内亚' ;; GU) printf '关岛' ;; ZA) printf '南非' ;; EG) printf '埃及' ;;
+        NG) printf '尼日利亚' ;; KE) printf '肯尼亚' ;; MA) printf '摩洛哥' ;; TN) printf '突尼斯' ;;
+        DZ) printf '阿尔及利亚' ;; GH) printf '加纳' ;; TZ) printf '坦桑尼亚' ;; ET) printf '埃塞俄比亚' ;;
+        UG) printf '乌干达' ;; SN) printf '塞内加尔' ;; CI) printf '科特迪瓦' ;; CM) printf '喀麦隆' ;;
+        MU) printf '毛里求斯' ;; SC) printf '塞舌尔' ;; RE) printf '留尼汪' ;; MZ) printf '莫桑比克' ;;
+        ZW) printf '津巴布韦' ;; ZM) printf '赞比亚' ;; BW) printf '博茨瓦纳' ;; NA) printf '纳米比亚' ;;
+        *) printf '' ;;
+    esac
+}
+
+# 校验外部返回的地区名，避免异常字符进入节点名
+_node_region_name_ok() {
+    local n="$1"
+    [ -n "$n" ] || return 1
+    [ "${#n}" -le 24 ] || return 1
+    case "$n" in
+        *[[:cntrl:]]*) return 1 ;;
+        *['"`$&|;<>\\']*) return 1 ;;
+    esac
+    return 0
+}
+
+# 探测公网 IP 归属地，输出 "<旗帜> <地区>"
+_node_region_detect() {
+    local json="" cc="" name="" zh=""
+    # 1) ipwho.is: 一次请求同时返回国家代码和本地化名称 (HTTPS)
+    json=$(timeout 6 curl -fsS4 --max-time 4 "https://ipwho.is/?lang=zh-CN" 2>/dev/null)
+    [ -z "$json" ] && json=$(timeout 6 curl -fsS6 --max-time 4 "https://ipwho.is/?lang=zh-CN" 2>/dev/null)
+    if [ -n "$json" ]; then
+        cc=$(printf '%s' "$json" | jq -r '.country_code // empty' 2>/dev/null)
+        name=$(printf '%s' "$json" | jq -r '.country // empty' 2>/dev/null)
+    fi
+    # 2) 回退: 只取国家代码，再使用内置中文名
+    if ! [[ "$cc" =~ ^[A-Za-z]{2}$ ]]; then
+        cc=$(timeout 5 curl -fsS4 --max-time 3 "https://ipinfo.io/country" 2>/dev/null | tr -d '[:space:]')
+        [ -z "$cc" ] && cc=$(timeout 5 curl -fsS6 --max-time 3 "https://ipinfo.io/country" 2>/dev/null | tr -d '[:space:]')
+        name=""
+    fi
+    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || return 1
+    cc="${cc^^}"
+    zh=$(_node_cc_name "$cc")
+    if [ -n "$zh" ]; then
+        name="$zh"
+    elif ! _node_region_name_ok "$name"; then
+        name="$cc"
+    fi
+    printf '%s %s' "$(_node_cc_flag "$cc")" "$name"
+}
+
+# 地区前缀，如 "🇭🇰 香港"；成功结果缓存，失败不缓存以便下次重试
+_node_region() {
+    local region=""
+    if [ -n "${NODE_REGION:-}" ]; then
+        printf '%s' "$NODE_REGION"
+        return 0
+    fi
+    if [ -s "$NODE_REGION_CACHE_FILE" ]; then
+        region=$(head -n 1 "$NODE_REGION_CACHE_FILE" 2>/dev/null | tr -d '\r')
+    fi
+    if [ -z "$region" ]; then
+        region=$(_node_region_detect) || region=""
+        if [ -z "$region" ]; then
+            printf '%s' "$NODE_REGION_FALLBACK"
+            return 0
+        fi
+        mkdir -p "$SINGBOX_DIR" 2>/dev/null
+        printf '%s\n' "$region" > "$NODE_REGION_CACHE_FILE" 2>/dev/null
+        chmod 600 "$NODE_REGION_CACHE_FILE" 2>/dev/null
+    fi
+    printf '%s' "$region"
+}
+
+# 生成默认机器ID: ZT + 4 位大写字母/数字
+_node_machine_id_random() {
+    local raw=""
+    raw=$(od -An -tx1 -N4 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ "${#raw}" -ge 4 ] || raw=$(date +%s%N 2>/dev/null | md5sum 2>/dev/null | cut -c1-8)
+    printf 'ZT%s' "$(printf '%s' "${raw:0:4}" | tr 'a-z' 'A-Z')"
+}
+
+# 机器ID: 持久化在状态目录，首次生成后允许用户修改，之后自动复用
+_node_machine_id() {
+    local id="" default_id="" input=""
+    if [ -s "$NODE_MACHINE_ID_FILE" ]; then
+        id=$(head -n 1 "$NODE_MACHINE_ID_FILE" 2>/dev/null | tr -d '[:space:]')
+    fi
+    if [[ "$id" =~ ^[A-Za-z0-9_-]{1,16}$ ]]; then
+        printf '%s' "$id"
+        return 0
+    fi
+    default_id=$(_node_machine_id_random)
+    if [ "${BATCH_MODE:-false}" = "true" ] || [ ! -t 0 ]; then
+        id="$default_id"
+    else
+        read -r -p "请输入机器ID (用于节点命名, 默认: ${default_id}): " input
+        id="${input:-$default_id}"
+        if ! [[ "$id" =~ ^[A-Za-z0-9_-]{1,16}$ ]]; then
+            _warn "机器ID 仅支持 1-16 位字母、数字、下划线或连字符，已回退默认值: ${default_id}"
+            id="$default_id"
+        fi
+    fi
+    mkdir -p "$SINGBOX_DIR" 2>/dev/null
+    if printf '%s\n' "$id" > "$NODE_MACHINE_ID_FILE" 2>/dev/null; then
+        chmod 600 "$NODE_MACHINE_ID_FILE" 2>/dev/null
+    fi
+    printf '%s' "$id"
+}
+
+# 节点名是否已被占用 (共享 Clash YAML 与各核心元数据)
+_node_name_taken() {
+    local n="$1" f=""
+    [ -n "$n" ] || return 1
+    if [ -s "${CLASH_YAML_FILE:-}" ] && [ -x "${YQ_BINARY:-}" ]; then
+        export NODE_NAME_CHECK="$n"
+        if ${YQ_BINARY} eval '.proxies[] | select(.name == env(NODE_NAME_CHECK)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | grep -Fxq "$n"; then
+            return 0
+        fi
+    fi
+    for f in "${METADATA_FILE:-}" "${ARGO_METADATA_FILE:-}" "${XRAY_METADATA:-/usr/local/etc/xray/metadata.json}"; do
+        [ -n "$f" ] && [ -s "$f" ] || continue
+        jq -e --arg n "$n" '[.[]? | .name? // empty] | index($n) != null' "$f" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+# 生成默认节点名: "<旗帜> <地区>-<协议>-<机器ID>"，同名冲突或批量模式时追加端口
+# 用法: _node_default_name <协议标签> [端口] [force_port]
+_node_default_name() {
+    local proto="$1" port="${2:-}" force_port="${3:-false}" region="" machine_id=""
+    [ -n "$proto" ] || return 1
+    region=$(_node_region)
+    [ -n "$region" ] || region="$NODE_REGION_FALLBACK"
+    machine_id=$(_node_machine_id)
+    if [ -n "$port" ] && { [ "$force_port" = "true" ] || _node_name_taken "${region}-${proto}-${machine_id}"; }; then
+        printf '%s-%s-%s-%s' "$region" "$proto" "$port" "$machine_id"
+    else
+        printf '%s-%s-%s' "$region" "$proto" "$machine_id"
+    fi
+}
 
 # 系统环境检测
 _detect_init_system() {
@@ -1349,7 +1536,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
+export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _node_cc_flag _node_cc_name _node_region_name_ok _node_region_detect _node_region _node_machine_id_random _node_machine_id _node_name_taken _node_default_name
 
 export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
@@ -2150,7 +2337,7 @@ _add_argo_node() {
     if [ "$argo_type" == "fixed" ]; then
         default_prefix="Argo-Fixed"
     fi
-    local default_name="${default_prefix}-${proto_name}-${port}"
+    local default_name=$(_node_default_name "Argo-${proto_name}" "$port" true)
 
     echo ""
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -3925,9 +4112,9 @@ _add_vless_ws_tls() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-VLESS-WS-${port}"
+        name=$(_node_default_name "Vless-WS" "$port" true)
     else
-        local default_name="VLESS-WS-${port}"
+        local default_name=$(_node_default_name "Vless-WS")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4097,9 +4284,9 @@ _add_vless_grpc_tls() {
 
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-VLESS-gRPC-${port}"
+        name=$(_node_default_name "Vless-gRPC" "$port" true)
     else
-        local default_name="VLESS-gRPC-${port}"
+        local default_name=$(_node_default_name "Vless-gRPC")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4286,9 +4473,9 @@ _add_trojan_ws_tls() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-Trojan-WS-${port}"
+        name=$(_node_default_name "Trojan-WS" "$port" true)
     else
-        local default_name="Trojan-WS-${port}"
+        local default_name=$(_node_default_name "Trojan-WS")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4608,9 +4795,9 @@ _add_anytls() {
         1)
             local name
             if [ "$BATCH_MODE" = "true" ]; then
-                name="Batch-AnyTLS-${port}"
+                name=$(_node_default_name "AnyTLS" "$port" true)
             else
-                local default_name="AnyTLS-${port}"
+                local default_name=$(_node_default_name "AnyTLS")
                 read -p "请输入 AnyTLS 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
@@ -4620,9 +4807,9 @@ _add_anytls() {
         2)
             local name
             if [ "$BATCH_MODE" = "true" ]; then
-                name="Batch-Any-Reality-${port}"
+                name=$(_node_default_name "Any-Reality" "$port" true)
             else
-                local default_name="Any-Reality-${port}"
+                local default_name=$(_node_default_name "Any-Reality")
                 read -p "请输入 Any-Reality 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
@@ -4634,8 +4821,8 @@ _add_anytls() {
             local reality_port=$((port + 1))
             local tls_name reality_name
             if [ "$BATCH_MODE" = "true" ]; then
-                tls_name="Batch-AnyTLS-${tls_port}"
-                reality_name="Batch-Any-Reality-${reality_port}"
+                tls_name=$(_node_default_name "AnyTLS" "$tls_port" true)
+                reality_name=$(_node_default_name "Any-Reality" "$reality_port" true)
             else
                 local default_tls_name="AnyTLS-${tls_port}"
                 local default_reality_name="Any-Reality-${reality_port}"
@@ -4667,7 +4854,7 @@ _add_vless_reality() {
         # 批量模式变量预加载，增加多层保底，防止变量泄露
         server_name=$(echo "${BATCH_SNI}" | xargs)
         [[ -z "$server_name" ]] && server_name="$DEFAULT_SNI"
-        name="Batch-VLESS-TCP-Reality-Vision-${port}"
+        name=$(_node_default_name "Vless-Reality" "$port" true)
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
     else
@@ -4681,7 +4868,7 @@ _add_vless_reality() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        local default_name="VLESS-TCP-REALITY-VISION-${port}"
+        local default_name=$(_node_default_name "Vless-Reality")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4729,10 +4916,10 @@ _add_vless_tcp() {
         done
     fi
     # [!] 自定义名称 (批量模式下自动分配)
-    local default_name="VLESS-TCP-${port}"
+    local default_name=$(_node_default_name "Vless-TCP")
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-TCP-${port}"
+        name=$(_node_default_name "Vless-TCP" "$port" true)
     else
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
@@ -4866,9 +5053,9 @@ _add_hysteria2() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-Hysteria2-${port}"
+        name=$(_node_default_name "hy2" "$port" true)
     else
-        local default_name="Hysteria2-${port}"
+        local default_name=$(_node_default_name "hy2")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4991,9 +5178,9 @@ _add_tuic() {
     # [!] 自主生成与名称分配
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-TUICv5-${port}"
+        name=$(_node_default_name "tuic" "$port" true)
     else
-        local default_name="TUICv5-${port}"
+        local default_name=$(_node_default_name "tuic")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -5113,9 +5300,9 @@ _add_shadowsocks_menu() {
     # [!] 新增：自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-${name_prefix}-${port}"
+        name=$(_node_default_name "${name_prefix}" "$port" true)
     else
-        local default_name="${name_prefix}-${port}"
+        local default_name=$(_node_default_name "${name_prefix}")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -5290,8 +5477,12 @@ _add_socks() {
         read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
     fi
     local tag="socks-in-${port}"
-    local name="Batch-SOCKS5-${port}"
-    [ "$BATCH_MODE" != "true" ] && name="SOCKS5-${port}"
+    local name=""
+    if [ "$BATCH_MODE" = "true" ]; then
+        name=$(_node_default_name "SOCKS5" "$port" true)
+    else
+        name=$(_node_default_name "SOCKS5")
+    fi
     local display_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && display_ip="[$node_ip]"
 
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$username" --arg pw "$password" \
