@@ -191,9 +191,8 @@ _get_ip() { _get_public_ip; } # 别名兼容
 # 例如: 🇭🇰 香港-hy2-ZT1234 / 🇭🇰 香港-Vless-Reality-ZT1234
 # 地区按公网 IP 归属地自动识别，机器ID 首次生成后允许用户确认，两者都缓存在状态目录。
 # 如需手动指定地区，可设置环境变量 NODE_REGION="🇯🇵 日本"。
-NODE_REGION_CACHE_FILE="${SINGBOX_DIR}/node-region.cache"
-NODE_MACHINE_ID_FILE="${SINGBOX_DIR}/machine-id"
-NODE_REGION_FALLBACK="🌐 未知"
+# 注意: 这些函数会通过 export -f 传给 xray_manager.sh 等子进程，普通变量不会跟着导出，
+# 因此状态文件路径和回退值都在函数内部按 ${SINGBOX_DIR} 现算。
 
 # 国家/地区代码 -> 旗帜 emoji (区域指示符 U+1F1E6 ~ U+1F1FF)
 _node_cc_flag() {
@@ -286,23 +285,23 @@ _node_region_detect() {
 
 # 地区前缀，如 "🇭🇰 香港"；成功结果缓存，失败不缓存以便下次重试
 _node_region() {
-    local region=""
+    local region="" cache_file="${SINGBOX_DIR:-/usr/local/etc/sing-box}/node-region.cache"
     if [ -n "${NODE_REGION:-}" ]; then
         printf '%s' "$NODE_REGION"
         return 0
     fi
-    if [ -s "$NODE_REGION_CACHE_FILE" ]; then
-        region=$(head -n 1 "$NODE_REGION_CACHE_FILE" 2>/dev/null | tr -d '\r')
+    if [ -s "$cache_file" ]; then
+        region=$(head -n 1 "$cache_file" 2>/dev/null | tr -d '\r')
     fi
     if [ -z "$region" ]; then
         region=$(_node_region_detect) || region=""
         if [ -z "$region" ]; then
-            printf '%s' "$NODE_REGION_FALLBACK"
+            printf '🌐 未知'
             return 0
         fi
-        mkdir -p "$SINGBOX_DIR" 2>/dev/null
-        printf '%s\n' "$region" > "$NODE_REGION_CACHE_FILE" 2>/dev/null
-        chmod 600 "$NODE_REGION_CACHE_FILE" 2>/dev/null
+        mkdir -p "${SINGBOX_DIR:-/usr/local/etc/sing-box}" 2>/dev/null
+        printf '%s\n' "$region" > "$cache_file" 2>/dev/null
+        chmod 600 "$cache_file" 2>/dev/null
     fi
     printf '%s' "$region"
 }
@@ -317,9 +316,9 @@ _node_machine_id_random() {
 
 # 机器ID: 持久化在状态目录，首次生成后允许用户修改，之后自动复用
 _node_machine_id() {
-    local id="" default_id="" input=""
-    if [ -s "$NODE_MACHINE_ID_FILE" ]; then
-        id=$(head -n 1 "$NODE_MACHINE_ID_FILE" 2>/dev/null | tr -d '[:space:]')
+    local id="" default_id="" input="" id_file="${SINGBOX_DIR:-/usr/local/etc/sing-box}/machine-id"
+    if [ -s "$id_file" ]; then
+        id=$(head -n 1 "$id_file" 2>/dev/null | tr -d '[:space:]')
     fi
     if [[ "$id" =~ ^[A-Za-z0-9_-]{1,16}$ ]]; then
         printf '%s' "$id"
@@ -336,9 +335,9 @@ _node_machine_id() {
             id="$default_id"
         fi
     fi
-    mkdir -p "$SINGBOX_DIR" 2>/dev/null
-    if printf '%s\n' "$id" > "$NODE_MACHINE_ID_FILE" 2>/dev/null; then
-        chmod 600 "$NODE_MACHINE_ID_FILE" 2>/dev/null
+    mkdir -p "${SINGBOX_DIR:-/usr/local/etc/sing-box}" 2>/dev/null
+    if printf '%s\n' "$id" > "$id_file" 2>/dev/null; then
+        chmod 600 "$id_file" 2>/dev/null
     fi
     printf '%s' "$id"
 }
@@ -349,7 +348,7 @@ _node_name_taken() {
     [ -n "$n" ] || return 1
     if [ -s "${CLASH_YAML_FILE:-}" ] && [ -x "${YQ_BINARY:-}" ]; then
         export NODE_NAME_CHECK="$n"
-        if ${YQ_BINARY} eval '.proxies[] | select(.name == env(NODE_NAME_CHECK)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | grep -Fxq "$n"; then
+        if ${YQ_BINARY} eval '.proxies[] | select(.name == env(NODE_NAME_CHECK)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | grep -Fxq -- "$n"; then
             return 0
         fi
     fi
@@ -366,13 +365,23 @@ _node_default_name() {
     local proto="$1" port="${2:-}" force_port="${3:-false}" region="" machine_id=""
     [ -n "$proto" ] || return 1
     region=$(_node_region)
-    [ -n "$region" ] || region="$NODE_REGION_FALLBACK"
+    [ -n "$region" ] || region="🌐 未知"
     machine_id=$(_node_machine_id)
     if [ -n "$port" ] && { [ "$force_port" = "true" ] || _node_name_taken "${region}-${proto}-${machine_id}"; }; then
         printf '%s-%s-%s-%s' "$region" "$proto" "$port" "$machine_id"
     else
         printf '%s-%s-%s' "$region" "$proto" "$machine_id"
     fi
+}
+
+# 改端口时只替换名称里独立的端口段，避免误改机器ID等其它数字段
+_node_name_replace_port() {
+    local name="$1" old_port="$2" new_port="$3"
+    if [ -z "$name" ] || [ -z "$old_port" ] || [ -z "$new_port" ]; then
+        printf '%s' "$name"
+        return 0
+    fi
+    printf '%s' "$name" | sed -E 's/(^|-)'"${old_port}"'(-|$)/\1'"${new_port}"'\2/'
 }
 
 # 系统环境检测
@@ -1536,7 +1545,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _node_cc_flag _node_cc_name _node_region_name_ok _node_region_detect _node_region _node_machine_id_random _node_machine_id _node_name_taken _node_default_name
+export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _node_cc_flag _node_cc_name _node_region_name_ok _node_region_detect _node_region _node_machine_id_random _node_machine_id _node_name_taken _node_default_name _node_name_replace_port
 
 export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
@@ -2337,7 +2346,7 @@ _add_argo_node() {
     if [ "$argo_type" == "fixed" ]; then
         default_prefix="Argo-Fixed"
     fi
-    local default_name=$(_node_default_name "Argo-${proto_name}" "$port" true)
+    local default_name=$(_node_default_name "${default_prefix}-${proto_name}" "$port" true)
 
     echo ""
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -4114,7 +4123,7 @@ _add_vless_ws_tls() {
     if [ "$BATCH_MODE" = "true" ]; then
         name=$(_node_default_name "Vless-WS" "$port" true)
     else
-        local default_name=$(_node_default_name "Vless-WS")
+        local default_name=$(_node_default_name "Vless-WS" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4286,7 +4295,7 @@ _add_vless_grpc_tls() {
     if [ "$BATCH_MODE" = "true" ]; then
         name=$(_node_default_name "Vless-gRPC" "$port" true)
     else
-        local default_name=$(_node_default_name "Vless-gRPC")
+        local default_name=$(_node_default_name "Vless-gRPC" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4475,7 +4484,7 @@ _add_trojan_ws_tls() {
     if [ "$BATCH_MODE" = "true" ]; then
         name=$(_node_default_name "Trojan-WS" "$port" true)
     else
-        local default_name=$(_node_default_name "Trojan-WS")
+        local default_name=$(_node_default_name "Trojan-WS" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4797,7 +4806,7 @@ _add_anytls() {
             if [ "$BATCH_MODE" = "true" ]; then
                 name=$(_node_default_name "AnyTLS" "$port" true)
             else
-                local default_name=$(_node_default_name "AnyTLS")
+                local default_name=$(_node_default_name "AnyTLS" "$port")
                 read -p "请输入 AnyTLS 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
@@ -4809,7 +4818,7 @@ _add_anytls() {
             if [ "$BATCH_MODE" = "true" ]; then
                 name=$(_node_default_name "Any-Reality" "$port" true)
             else
-                local default_name=$(_node_default_name "Any-Reality")
+                local default_name=$(_node_default_name "Any-Reality" "$port")
                 read -p "请输入 Any-Reality 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
@@ -4824,8 +4833,8 @@ _add_anytls() {
                 tls_name=$(_node_default_name "AnyTLS" "$tls_port" true)
                 reality_name=$(_node_default_name "Any-Reality" "$reality_port" true)
             else
-                local default_tls_name="AnyTLS-${tls_port}"
-                local default_reality_name="Any-Reality-${reality_port}"
+                local default_tls_name=$(_node_default_name "AnyTLS" "$tls_port")
+                local default_reality_name=$(_node_default_name "Any-Reality" "$reality_port")
                 _info "同时创建时，Any-Reality 将使用端口 ${reality_port}。"
                 read -p "请输入 AnyTLS 节点名称 (默认: ${default_tls_name}): " custom_tls_name
                 tls_name=${custom_tls_name:-$default_tls_name}
@@ -4868,7 +4877,7 @@ _add_vless_reality() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        local default_name=$(_node_default_name "Vless-Reality")
+        local default_name=$(_node_default_name "Vless-Reality" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -4916,7 +4925,7 @@ _add_vless_tcp() {
         done
     fi
     # [!] 自定义名称 (批量模式下自动分配)
-    local default_name=$(_node_default_name "Vless-TCP")
+    local default_name=$(_node_default_name "Vless-TCP" "$port")
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
         name=$(_node_default_name "Vless-TCP" "$port" true)
@@ -5055,7 +5064,7 @@ _add_hysteria2() {
     if [ "$BATCH_MODE" = "true" ]; then
         name=$(_node_default_name "hy2" "$port" true)
     else
-        local default_name=$(_node_default_name "hy2")
+        local default_name=$(_node_default_name "hy2" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -5180,7 +5189,7 @@ _add_tuic() {
     if [ "$BATCH_MODE" = "true" ]; then
         name=$(_node_default_name "tuic" "$port" true)
     else
-        local default_name=$(_node_default_name "tuic")
+        local default_name=$(_node_default_name "tuic" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -5302,7 +5311,7 @@ _add_shadowsocks_menu() {
     if [ "$BATCH_MODE" = "true" ]; then
         name=$(_node_default_name "${name_prefix}" "$port" true)
     else
-        local default_name=$(_node_default_name "${name_prefix}")
+        local default_name=$(_node_default_name "${name_prefix}" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
@@ -5481,7 +5490,7 @@ _add_socks() {
     if [ "$BATCH_MODE" = "true" ]; then
         name=$(_node_default_name "SOCKS5" "$port" true)
     else
-        name=$(_node_default_name "SOCKS5")
+        name=$(_node_default_name "SOCKS5" "$port")
     fi
     local display_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && display_ip="[$node_ip]"
 
@@ -6702,7 +6711,7 @@ _modify_port() (
             _error "该 Clash 节点名仍被 Argo/Xray/中转共享引用，拒绝原地改名或改端口: $proposed_old_proxy_name"
             return 1
         fi
-        proposed_new_proxy_name=$(echo "$proposed_old_proxy_name" | sed "s/${old_port}/${new_port}/g")
+        proposed_new_proxy_name=$(_node_name_replace_port "$proposed_old_proxy_name" "$old_port" "$new_port")
         if [ "$proposed_new_proxy_name" != "$proposed_old_proxy_name" ]; then
             export PROXY_NAME="$proposed_new_proxy_name"
             if ${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | grep -Fxq "$proposed_new_proxy_name"; then
@@ -6766,7 +6775,7 @@ _modify_port() (
             current_meta_name=$(jq -r ".\"$tag_to_modify\".name // \"\"" "$METADATA_FILE")
             if [ -n "$current_meta_name" ]; then
                 local new_meta_name
-                new_meta_name=$(echo "$current_meta_name" | sed "s/${old_port}/${new_port}/g")
+                new_meta_name=$(_node_name_replace_port "$current_meta_name" "$old_port" "$new_port")
                 if [ "$new_meta_name" != "$current_meta_name" ]; then
                     _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".name = \"$new_meta_name\"" || return
                 fi

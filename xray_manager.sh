@@ -39,29 +39,37 @@ if ! declare -f _info >/dev/null 2>&1; then
 fi
 
 # --- 节点命名规则: <地区旗帜> <地区>-<协议>-<机器ID> ---
-# 正常由 singbox.sh 导出 _node_default_name；单独运行本脚本时复用主脚本缓存的
-# 地区与机器ID，缓存缺失才退化为旧式名称，保证默认名不会为空。
+# 正常由 singbox.sh 通过 export -f 提供；单独运行本脚本时复用主脚本缓存的地区与机器ID，
+# 两者都存在时名称与菜单入口一致，否则退化为带端口的旧式名称，保证默认名唯一且不为空。
 if ! declare -f _node_default_name >/dev/null 2>&1; then
     _node_default_name() {
-        local proto="$1" port="${2:-}" region="" mid=""
+        local proto="$1" port="${2:-}" region="" mid="" cache_dir="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
         [ -n "$proto" ] || return 1
-        if [ -s "${SINGBOX_DIR}/node-region.cache" ]; then
-            region=$(head -n 1 "${SINGBOX_DIR}/node-region.cache" 2>/dev/null | tr -d '\r')
+        if [ -s "${cache_dir}/node-region.cache" ]; then
+            region=$(head -n 1 "${cache_dir}/node-region.cache" 2>/dev/null | tr -d '\r')
         fi
-        if [ -s "${SINGBOX_DIR}/machine-id" ]; then
-            mid=$(head -n 1 "${SINGBOX_DIR}/machine-id" 2>/dev/null | tr -d '[:space:]')
+        if [ -s "${cache_dir}/machine-id" ]; then
+            mid=$(head -n 1 "${cache_dir}/machine-id" 2>/dev/null | tr -d '[:space:]')
         fi
         if [ -n "$region" ] && [ -n "$mid" ]; then
-            if [ -n "$port" ]; then
-                printf '%s-%s-%s-%s' "$region" "$proto" "$port" "$mid"
-            else
-                printf '%s-%s-%s' "$region" "$proto" "$mid"
-            fi
+            printf '%s-%s-%s' "$region" "$proto" "$mid"
         elif [ -n "$port" ]; then
             printf 'X-%s-%s' "$proto" "$port"
         else
             printf 'X-%s' "$proto"
         fi
+    }
+fi
+
+# 改端口时只替换名称里独立的端口段，避免误改机器ID等其它数字段
+if ! declare -f _node_name_replace_port >/dev/null 2>&1; then
+    _node_name_replace_port() {
+        local name="$1" old_port="$2" new_port="$3"
+        if [ -z "$name" ] || [ -z "$old_port" ] || [ -z "$new_port" ]; then
+            printf '%s' "$name"
+            return 0
+        fi
+        printf '%s' "$name" | sed -E 's/(^|-)'"${old_port}"'(-|$)/\1'"${new_port}"'\2/'
     }
 fi
 
@@ -1845,7 +1853,7 @@ _modify_xray_port() {
     local new_port=$(_input_port)
     
     # tag 保持稳定，避免证书路径与元数据键随端口改名后失配。
-    local new_name=$(echo "$target_name" | sed "s/${old_port}/${new_port}/g")
+    local new_name=$(_node_name_replace_port "$target_name" "$old_port" "$new_port")
     local old_link=$(jq -r --arg t "$target_tag" '.[$t].share_link // empty' "$XRAY_METADATA" 2>/dev/null)
     local new_link=""
     if [ -n "$old_link" ]; then
