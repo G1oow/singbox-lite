@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="30"
+export SCRIPT_VERSION="100"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -8070,7 +8070,7 @@ _main_menu() {
         # 版本标题
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
-        echo "  ║         sing-box 管理脚本 v${SCRIPT_VERSION}         ║"
+        echo "  ║         sing-box 管理脚本 v${SCRIPT_VERSION}        ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
         echo ""
