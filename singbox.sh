@@ -1682,13 +1682,17 @@ _install_dependencies() {
     
     _install_yq
 
-    # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
+    # Alpine 上优先启用 OpenRC 服务；无 OpenRC PID 1 的容器回退直接启动 crond。
     if command -v apk &>/dev/null; then
-        if command -v crond &>/dev/null; then
-            # BusyBox 自带 crond 并不代表系统存在 dcron 的 OpenRC 服务；
-            # 定时任务守护进程属于可选能力，不能让核心安装继承失败状态。
-            rc-service dcron start 2>/dev/null || true
-            rc-update add dcron default 2>/dev/null || true
+        if command -v rc-service &>/dev/null && rc-service dcron start >/dev/null 2>&1; then
+            rc-update add dcron default >/dev/null 2>&1 || true
+        fi
+        if ! { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
+            if command -v crond &>/dev/null; then
+                crond >/dev/null 2>&1 || true
+            elif command -v busybox &>/dev/null; then
+                busybox crond >/dev/null 2>&1 || true
+            fi
         fi
     fi
 
@@ -3061,6 +3065,22 @@ _ensure_argo_cron() {
             ;;
     esac
 
+    # 容器里 rc-service 可能存在，但没有真正运行 OpenRC。
+    if ! { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
+        if command -v crond &>/dev/null; then
+            crond >/dev/null 2>&1 || true
+        elif command -v busybox &>/dev/null; then
+            busybox crond >/dev/null 2>&1 || true
+        fi
+    fi
+    if command -v pgrep >/dev/null 2>&1 || command -v pidof >/dev/null 2>&1; then
+        if { pgrep -x crond >/dev/null 2>&1 || pidof crond >/dev/null 2>&1; }; then
+            started=true
+        else
+            started=false
+        fi
+    fi
+
     if [ "$started" != true ]; then
         _error "Cron 服务启动失败，无法启用 Argo 自动守护。"
         return 1
@@ -3221,10 +3241,26 @@ _sync_argo_early_data() {
     fi
 
     if [ -s "$ARGO_METADATA_FILE" ]; then
-        while IFS=$'\t' read -r tag protocol name domain uuid password path share_link; do
+        local entry tag protocol name domain uuid password path share_link expected_path
+        while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            tag=$(jq -r '.key // empty' <<< "$entry")
+            protocol=$(jq -r '.value.protocol // "vless-ws"' <<< "$entry")
+            name=$(jq -r '.value.name // ""' <<< "$entry")
+            domain=$(jq -r '.value.domain // ""' <<< "$entry")
+            uuid=$(jq -r '.value.uuid // ""' <<< "$entry")
+            password=$(jq -r '.value.password // ""' <<< "$entry")
+            path=$(jq -r '.value.path // "/"' <<< "$entry")
+            share_link=$(jq -r '.value.share_link // ""' <<< "$entry")
             [ -z "$tag" ] && continue
             [[ "$protocol" != "vless-ws" && "$protocol" != "trojan-ws" ]] && continue
             [[ -z "$domain" || "$domain" == "null" ]] && continue
+            # 旧同步逻辑写坏的是 share_link，元数据 path 通常仍是原始 WS 路径。
+            # 遇到异常 path 时不要再次生成嵌套链接。
+            if [[ "$path" == *"://"* ]]; then
+                _warn "Argo 节点 ${tag} 的路径异常，已跳过链接同步。"
+                continue
+            fi
 
             if [ -s "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ] && [ -n "$name" ] && [ "$name" != "null" ]; then
                 export PROXY_NAME="$name"
@@ -3235,7 +3271,9 @@ _sync_argo_early_data() {
                 fi
             fi
 
-            if [[ "$share_link" == *"ed%3D${WS_EARLY_DATA_SIZE}"* || "$share_link" == *"ed=${WS_EARLY_DATA_SIZE}"* ]]; then
+            # 比较真实 WS 路径，而非仅查 ed 字样：坏链接也可能包含 ed。
+            expected_path=$(_url_encode "$(_ws_path_with_early_data "$path")")
+            if [[ "$share_link" == *"@${domain}:443?"* && "$share_link" == *"&path=${expected_path}&"* ]]; then
                 continue
             fi
 
@@ -3246,7 +3284,7 @@ _sync_argo_early_data() {
                 _show_node_link "trojan-ws" "$name" "$domain" "443" "$tag" "$password" "$path" >/dev/null
                 links_updated=true
             fi
-        done < <(jq -r 'to_entries[] | [.key, (.value.protocol // "vless-ws"), (.value.name // ""), (.value.domain // ""), (.value.uuid // ""), (.value.password // ""), (.value.path // "/"), (.value.share_link // "")] | @tsv' "$ARGO_METADATA_FILE" 2>/dev/null)
+        done < <(jq -c 'to_entries[]' "$ARGO_METADATA_FILE" 2>/dev/null)
     fi
 
     if [ "$config_updated" = true ]; then
