@@ -33,10 +33,13 @@ jobs:
       - name: Bash 语法检查
         run: |
           set -euo pipefail
-          for f in singbox.sh advanced_relay.sh parser.sh xray_manager.sh tests/test_node_naming.sh; do
+          for f in singbox.sh advanced_relay.sh parser.sh xray_manager.sh tests/test_node_naming.sh tests/test_batch_sni.sh; do
             bash -n "$f"
             echo "bash -n $f ok"
           done
 
       - name: 节点命名规则测试
         run: bash tests/test_node_naming.sh
+
+      - name: 一键换 SNI 与聚合订阅测试
+        run: bash tests/test_batch_sni.sh

@@ -5772,22 +5772,379 @@ _view_nodes() {
     done <<< "$primary_nodes"
     echo "-------------------------------------"
     
-    # 生成聚合 Base64 选项
+    # 生成聚合 Base64 订阅：复用本次刚生成的链接，避免丢掉未持久化 share_link 的节点
     if [ -s "$links_tmp" ]; then
         echo ""
         read -p "是否生成聚合 Base64 订阅? (y/N): " gen_base64
         if [[ "$gen_base64" == "y" || "$gen_base64" == "Y" ]]; then
-            echo ""
-            _info "=== 聚合 Base64 订阅 ==="
-            local base64_result=$(base64 < "$links_tmp" | tr -d '\n')
-            echo -e "${CYAN}${base64_result}${NC}"
-            echo ""
-            _success "可直接复制上方内容导入 v2rayN 等客户端"
+            _output_base64_subscription "$links_tmp"
         fi
     fi
     rm -f -- "$links_tmp"
     VIEW_LINKS_TMP=""
 }
+
+# --- 一键换 SNI 与聚合订阅 ---
+# 一次性把所有可管理主节点的伪装域名/SNI 换成同一个值；脚本自管的 RSA
+# 自签证书随 SNI 重新签发，自定义证书节点整体跳过，避免换 SNI 后证书不匹配。
+
+# 输出节点现有的 "<cert>\t<key>"，无证书时两个字段均为空
+_batch_sni_cert_paths() {
+    local node="$1"
+    printf '%s\t%s\n' \
+        "$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')" \
+        "$(printf '%s' "$node" | jq -r '.tls.key_path // empty')"
+}
+
+# 判定是否脚本自管证书：SINGBOX_DIR 顶层的普通文件
+# acme.sh 续签的符号链接与外部路径都视为自定义证书。
+_batch_sni_is_script_cert() {
+    local path="$1"
+    [ -n "$path" ] && [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    case "$path" in
+        "${SINGBOX_DIR}"/*) ;;
+        *) return 1 ;;
+    esac
+    case "${path#"$SINGBOX_DIR"/}" in
+        */*) return 1 ;;
+    esac
+    return 0
+}
+
+# 生成可处理节点清单 (TSV)：tag, 变种, 端口, SNI 落点, 证书归属, 名称, 当前 SNI
+# SNI 落点: reality | shadowtls | tls | none
+# 证书归属: self_signed | custom | none
+_batch_sni_plan() {
+    [ -s "$CONFIG_FILE" ] || return 0
+    local node tag port variant sni_target cert_mode name current cert_path key_path
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        tag=$(printf '%s' "$node" | jq -r '.tag // empty')
+        port=$(printf '%s' "$node" | jq -r '.listen_port // empty')
+        [ -n "$tag" ] && [ -n "$port" ] || continue
+        case "$tag" in *-hop-*) continue ;; esac
+        variant=$(_detect_main_node_variant "$tag")
+        [ -n "$variant" ] && [ "$variant" != "unsupported" ] || continue
+        case "$variant" in
+            vless-reality|any-reality) sni_target="reality" ;;
+            shadowsocks-shadowtls) sni_target="shadowtls" ;;
+            vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic) sni_target="tls" ;;
+            *) sni_target="none" ;;
+        esac
+        cert_mode="none"
+        current=""
+        case "$sni_target" in
+            reality)
+                current=$(printf '%s' "$node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+                ;;
+            shadowtls)
+                current=$(printf '%s' "$node" | jq -r '.handshake.server // empty')
+                ;;
+            tls)
+                current=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
+                IFS=$'\t' read -r cert_path key_path <<< "$(_batch_sni_cert_paths "$node")"
+                if [ -z "$cert_path" ] && [ -z "$key_path" ]; then
+                    cert_mode="none"
+                elif _batch_sni_is_script_cert "$cert_path" && _batch_sni_is_script_cert "$key_path"; then
+                    cert_mode="self_signed"
+                else
+                    cert_mode="custom"
+                fi
+                ;;
+        esac
+        name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE" 2>/dev/null)
+        [ -n "$name" ] || name="$tag"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$variant" "$port" "$sni_target" "$cert_mode" "$name" "$current"
+    done <<< "$(_list_main_primary_inbounds)"
+}
+
+# 计划行的处理方式：apply / skip-no-sni / skip-custom-cert
+_batch_sni_plan_action() {
+    local sni_target="$1" cert_mode="$2"
+    if [ "$sni_target" = "none" ]; then
+        printf 'skip-no-sni'
+    elif [ "$cert_mode" = "custom" ]; then
+        printf 'skip-custom-cert'
+    else
+        printf 'apply'
+    fi
+}
+
+# 按计划改写 config.json 并重签自签证书，最后重建元数据、链接与 Clash 配置。
+# 必须在事务快照与状态锁内调用；任何一步失败由调用方回滚。
+_batch_sni_apply_config() {
+    local sni="$1" regen="$2" plan_file="$3"
+    [[ "$sni" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
+    [ -s "$plan_file" ] || { _error "SNI 变更计划缺失，已取消。"; return 1; }
+
+    # 重新计算计划并与确认时比对，防止确认后配置被其它操作改动。
+    local current_plan
+    current_plan=$(mktemp /tmp/.singbox-sni-plan.XXXXXX) || return 1
+    if ! _batch_sni_plan > "$current_plan"; then
+        rm -f -- "$current_plan"
+        _error "无法读取当前节点状态，已取消。"
+        return 1
+    fi
+    if ! cmp -s "$plan_file" "$current_plan"; then
+        rm -f -- "$current_plan"
+        _error "节点状态在确认后已变化，请重新进入本功能。"
+        return 1
+    fi
+    rm -f -- "$current_plan"
+
+    local tag variant port sni_target cert_mode name old_sni action type
+    local cert_path key_path changed_tags=() changed_ports=() changed_types=()
+    while IFS=$'\t' read -r tag variant port sni_target cert_mode name old_sni; do
+        [ -n "$tag" ] || continue
+        action=$(_batch_sni_plan_action "$sni_target" "$cert_mode")
+        [ "$action" = "apply" ] || continue
+        case "$sni_target" in
+            reality)
+                _atomic_modify_json "$CONFIG_FILE" '
+                    (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+                    | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = $sni
+                ' --arg tag "$tag" --arg sni "$sni" || return 1
+                ;;
+            shadowtls)
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .handshake.server) = $sni' \
+                    --arg tag "$tag" --arg sni "$sni" || return 1
+                ;;
+            tls)
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni' \
+                    --arg tag "$tag" --arg sni "$sni" || return 1
+                ;;
+        esac
+
+        if [ "$sni_target" = "tls" ] && [ "$regen" = "true" ] && [ "$cert_mode" = "self_signed" ]; then
+            # 复用节点原有的证书路径；缺少路径时才回退到脚本约定命名。
+            cert_path=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .tls.certificate_path // empty' "$CONFIG_FILE")
+            key_path=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .tls.key_path // empty' "$CONFIG_FILE")
+            [ -n "$cert_path" ] || cert_path="${SINGBOX_DIR}/${tag}.pem"
+            [ -n "$key_path" ] || key_path="${SINGBOX_DIR}/${tag}.key"
+            _generate_self_signed_cert "$sni" "$cert_path" "$key_path" || return 1
+            _atomic_modify_json "$CONFIG_FILE" '
+                (.inbounds[] | select(.tag == $tag) | .tls) |= (.certificate_path = $cert | .key_path = $key)
+            ' --arg tag "$tag" --arg cert "$cert_path" --arg key "$key_path" || return 1
+        fi
+
+        # HY2 原生跳跃的全部子入站必须跟随主节点的 SNI 与证书。
+        if [ "$variant" = "hysteria2" ]; then
+            local main_after hop_cert hop_key
+            main_after=$(jq -c --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE") || return 1
+            hop_cert=$(printf '%s' "$main_after" | jq -r '.tls.certificate_path // empty')
+            hop_key=$(printf '%s' "$main_after" | jq -r '.tls.key_path // empty')
+            _atomic_modify_json "$CONFIG_FILE" '
+                .inbounds |= map(
+                    if ((.tag // "") | startswith($prefix)) then
+                        .tls.server_name = $sni
+                        | if $cert != "" then .tls.certificate_path = $cert else . end
+                        | if $key != "" then .tls.key_path = $key else . end
+                    else . end)
+            ' --arg prefix "${tag}-hop-" --arg sni "$sni" --arg cert "$hop_cert" --arg key "$hop_key" || return 1
+        fi
+
+        type=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .type // empty' "$CONFIG_FILE") || return 1
+        changed_tags+=("$tag")
+        changed_ports+=("$port")
+        changed_types+=("$type")
+    done < "$plan_file"
+
+    [ "${#changed_tags[@]}" -gt 0 ] || { _error "没有需要变更的节点。"; return 1; }
+
+    local i proxy_name
+    for i in "${!changed_tags[@]}"; do
+        proxy_name=$(_find_proxy_name "${changed_ports[$i]}" "${changed_types[$i]}" "${changed_tags[$i]}")
+        _refresh_modified_node_artifacts "${changed_tags[$i]}" "$proxy_name" || return 1
+    done
+    return 0
+}
+
+# 收集全部分享链接（主节点 + Argo），输出 "总数<TAB>缺失数"
+_collect_share_links() {
+    local links_file="$1" node tag link total=0 missing=0
+    : > "$links_file" || return 1
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        tag=$(printf '%s' "$node" | jq -r '.tag // empty')
+        [ -n "$tag" ] || continue
+        total=$((total + 1))
+        link=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$METADATA_FILE" 2>/dev/null)
+        if [ -z "$link" ] || [ "$link" = "null" ]; then
+            missing=$((missing + 1))
+            continue
+        fi
+        printf '%s\n' "$link" >> "$links_file" || return 1
+    done <<< "$(_list_main_primary_inbounds)"
+    if [ -s "$ARGO_METADATA_FILE" ]; then
+        while IFS= read -r link; do
+            [ -n "$link" ] || continue
+            total=$((total + 1))
+            printf '%s\n' "$link" >> "$links_file" || return 1
+        done < <(jq -r 'to_entries[] | .value.share_link // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
+    fi
+    printf '%s\t%s\n' "$total" "$missing"
+}
+
+# 一键输出聚合 Base64 订阅
+_output_base64_subscription() {
+    # 可选参数 $1: 已有链接文件（例如 [3] 刚生成的当前链接），直接复用，
+    # 不再从元数据重建，避免丢掉未持久化 share_link 的节点。
+    local provided="${1:-}" links_tmp own_file=0 missing=0 count result stats
+    if [ -n "$provided" ] && [ -s "$provided" ]; then
+        links_tmp="$provided"
+    else
+        links_tmp=$(mktemp /tmp/singbox-sub.XXXXXX) || { _error "无法创建临时订阅文件。"; return 1; }
+        own_file=1
+        stats=$(_collect_share_links "$links_tmp") || { rm -f -- "$links_tmp"; _error "收集分享链接失败。"; return 1; }
+        missing=${stats##*$'\t'}
+    fi
+    count=$(awk 'NF {c++} END {print c+0}' "$links_tmp")
+    result=$(base64 < "$links_tmp" | tr -d '\n\r ')
+    echo ""
+    _info "=== 聚合 Base64 订阅 (共 ${count} 个节点) ==="
+    echo -e "${CYAN}${result}${NC}"
+    echo ""
+    if [ "$missing" -gt 0 ]; then
+        _warn "另有 ${missing} 个节点缺少持久化分享链接，已跳过；可先用 [5] 修改节点或 [3] 查看节点链接重建。"
+    fi
+    _success "可直接复制上方内容导入 v2rayN / v2rayNG / Shadowrocket 等客户端。"
+    [ "$own_file" -eq 1 ] && rm -f -- "$links_tmp"
+    return 0
+}
+
+# 在事务保护下执行批量换 SNI：状态锁 + 快照 + 组合校验 + 单次重启 + 失败回滚
+_batch_change_sni_apply() (
+    local sni="$1" regen="$2" plan_file="$3"
+    local lock_owned="false"
+    if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
+        command -v flock >/dev/null 2>&1 || { _error "缺少 flock，拒绝无锁修改节点。"; return 1; }
+        exec 8>"${SINGBOX_DIR}/.singboxlite.lock" || return 1
+        if ! _flock_wait 8 30; then exec 8>&-; _error "等待状态锁超时。"; return 1; fi
+        export SINGBOXLITE_LOCK_HELD=1
+        lock_owned="true"
+    fi
+
+    local backup_dir restart_attempted=0 committed=0 check_result
+    backup_dir=$(mktemp -d /tmp/.singbox-sni.XXXXXX) || return 1
+    if ! _main_create_tx_snapshot "$backup_dir"; then
+        _error "无法完整创建 SNI 变更事务快照，操作尚未开始。"
+        rm -rf -- "$backup_dir"
+        if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
+        return 1
+    fi
+    export MAIN_CREATE_TX_ACTIVE=1
+    if [ -f "${backup_dir}/nft.available" ]; then
+        export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=1
+    else
+        export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
+    fi
+    trap 'sni_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then if ! _restore_full_transaction_snapshot "$backup_dir" "$restart_attempted" "SNI 批量变更"; then sni_rc=1; fi; fi; export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0; if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi; exit "$sni_rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    _validate_protected_yaml_metadata || return 1
+    _batch_sni_apply_config "$sni" "$regen" "$plan_file" || return 1
+    if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
+        _error "SNI 变更后的组合配置校验失败："
+        echo "$check_result"
+        return 1
+    fi
+    restart_attempted=1
+    _manage_service restart || { _error "SNI 变更后服务重启失败。"; return 1; }
+
+    committed=1
+    trap - EXIT INT TERM
+    rm -rf -- "$backup_dir" || _warn "SNI 变更事务快照清理失败: $backup_dir"
+    export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
+    if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
+    _success "全部节点 SNI 已更新，配置校验通过，服务已重启。"
+)
+
+# 交互入口：预览 -> 输入新 SNI -> 确认 -> 应用 -> 聚合 Base64 订阅
+_batch_change_sni() {
+    if [ -z "$(_list_main_primary_inbounds)" ]; then
+        _warning "当前没有可由主节点菜单管理的节点（Argo 请在 Argo 菜单管理）。"
+        return
+    fi
+
+    echo ""
+    _info "--- 一键更换所有节点 SNI 并重签自签证书 ---"
+    local plan_file
+    plan_file=$(mktemp /tmp/.singbox-sni-preview.XXXXXX) || { _error "无法创建临时文件。"; return 1; }
+    if ! _batch_sni_plan > "$plan_file"; then
+        rm -f -- "$plan_file"
+        _error "无法读取现有节点信息。"
+        return 1
+    fi
+
+    local tag variant port sni_target cert_mode name current action
+    local apply_count=0 skip_count=0 cert_label=""
+    echo ""
+    while IFS=$'\t' read -r tag variant port sni_target cert_mode name current; do
+        [ -n "$tag" ] || continue
+        action=$(_batch_sni_plan_action "$sni_target" "$cert_mode")
+        case "$action" in
+            apply)
+                if [ "$sni_target" = "tls" ]; then
+                    if [ "$cert_mode" = "self_signed" ]; then cert_label="重签自签证书"; else cert_label="新建自签证书"; fi
+                else
+                    cert_label="仅换伪装域名"
+                fi
+                echo -e "  ${GREEN}可变更${NC} ${name} (${variant} @ ${port})"
+                echo -e "          ${current:-未设置} -> 待输入  [${cert_label}]"
+                apply_count=$((apply_count + 1))
+                ;;
+            skip-no-sni)
+                echo -e "  ${YELLOW}跳过${NC}   ${name} (${variant} @ ${port})：该协议没有 SNI 配置"
+                skip_count=$((skip_count + 1))
+                ;;
+            skip-custom-cert)
+                echo -e "  ${YELLOW}跳过${NC}   ${name} (${variant} @ ${port})：使用自定义证书，换 SNI 会导致证书不匹配"
+                skip_count=$((skip_count + 1))
+                ;;
+        esac
+    done < "$plan_file"
+
+    echo ""
+    if [ "$apply_count" -eq 0 ]; then
+        _warning "没有可变更 SNI 的节点（$skip_count 个节点被跳过）。"
+        rm -f -- "$plan_file"
+        return 1
+    fi
+    _info "共 ${apply_count} 个节点将变更，${skip_count} 个节点跳过。"
+    _warn "变更后旧客户端配置立即失效，需要重新导入新的分享链接。"
+    read -r -p "请输入新的统一 SNI/伪装域名: " new_sni
+    new_sni=$(printf '%s' "$new_sni" | xargs)
+    if [[ ! "$new_sni" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        _error "域名/SNI 格式无效。"
+        rm -f -- "$plan_file"
+        return 1
+    fi
+
+    local regen="true" regen_input
+    read -r -p "是否重新生成脚本管理的自签证书？[Y/n]: " regen_input
+    [[ "$regen_input" =~ ^[Nn]$ ]] && regen="false"
+
+    local confirm
+    read -r -p "确认把 ${apply_count} 个节点切换到 ${new_sni} 并重启服务？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        _info "已取消，未做任何变更。"
+        rm -f -- "$plan_file"
+        return 0
+    fi
+
+    _batch_change_sni_apply "$new_sni" "$regen" "$plan_file"
+    local apply_rc=$?
+    rm -f -- "$plan_file"
+    [ "$apply_rc" -eq 0 ] || return "$apply_rc"
+
+    echo ""
+    read -r -p "是否立即输出聚合 Base64 订阅？[Y/n]: " show_sub
+    if [[ ! "$show_sub" =~ ^[Nn]$ ]]; then
+        _output_base64_subscription
+    fi
+}
+# --- 一键换 SNI 与聚合订阅结束 ---
 
 _restore_full_transaction_snapshot() {
     local backup_dir="$1" restart_required="$2" context="$3"
@@ -8187,7 +8544,7 @@ _main_menu() {
         echo -e "  ${CYAN}【节点管理】${NC}"
         echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} Argo 隧道节点"
         echo -e "    ${GREEN}[3]${NC} 查看节点链接      ${GREEN}[4]${NC} 删除节点"
-        echo -e "    ${GREEN}[5]${NC} 修改节点"
+        echo -e "    ${GREEN}[5]${NC} 修改节点          ${GREEN}[20]${NC} 一键换 SNI/重签证书"
         echo ""
         
         # 服务控制
@@ -8221,7 +8578,7 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-19]: " choice
+        read -p "  请输入选项 [0-20]: " choice
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -8243,6 +8600,7 @@ _main_menu() {
             17) _uninstall ;; 
             18) _require_singbox && _advanced_features ;;
             19) _xray_features ;;
+            20) _require_singbox && _batch_change_sni ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
