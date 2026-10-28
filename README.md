@@ -77,6 +77,7 @@ sb
 |  | 3 | 查看节点链接 |
 |  | 4 | 删除节点 |
 |  | 5 | 修改节点（名称、地址、端口、认证、SNI/证书及协议专属参数） |
+|  | 20 | 一键更换所有节点 SNI、重签脚本自签证书并输出聚合 Base64 订阅 |
 | 服务控制 | 6 | 重启 sing-box |
 |  | 7 | 停止 sing-box |
 |  | 8 | 查看运行状态 |
@@ -94,6 +95,7 @@ sb
 | 退出 | 0 | 退出脚本 |
 
 `[5] 修改节点` 会按实际协议显示可用项目。所有主节点均可修改名称、客户端连接地址、端口和认证信息；Reality 可更新伪装域名并轮换密钥，TLS 类节点可更新 SNI、自签证书或自定义证书，WebSocket/gRPC 可修改传输路径，Hysteria2 还可调整混淆、端口跳跃和客户端带宽。保存时会统一校验 sing-box 配置并同步元数据、分享链接与 Clash/Mihomo 配置，失败则自动回滚。
+`[20] 一键更换所有节点 SNI` 把全部可管理主节点的伪装域名统一换成同一个值：Reality 同步 `tls.server_name` 与 `handshake.server`，ShadowTLS 更新 `handshake.server`，TLS 类节点更新 `server_name` 并按需重新签发脚本自管的 RSA 自签证书（`SINGBOX_DIR/<tag>.pem` / `.key`，含同名与泛域名 SAN），Hysteria2 的跳跃子入站会跟随主节点同步。使用自定义证书（含 acme.sh 符号链接与外部路径）的节点整体跳过，避免换 SNI 后证书不匹配；VLESS-TCP、Shadowsocks、SOCKS5 等无 SNI 的节点同样跳过。执行前会列出每个节点的处理方式，执行时持状态锁、创建事务快照、校验 `config.json + relay.json` 组合配置并在失败时自动回滚，成功后重启一次服务，可接着一键输出聚合 Base64 订阅。
 
 ## 节点命名规则
 
@@ -457,3 +459,10 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 中转入口新增客户端连接地址选择，支持 IPv4、IPv6 和域名；解决出口 IP 与入口 IP 不同或有多个入口地址时，分享链接和 Clash/Mihomo 配置写错地址的问题。
 - Argo 元数据同步改为逐条 JSON 读取，避免 VLESS 空密码字段造成错位；根据原始 WS 路径识别并重建已有的异常分享链接。
 - Alpine 的 cron 启动在 OpenRC 服务不可用时回退直接运行 `crond`，同时保留正常 OpenRC 环境下的开机启用设置。无 init 的容器仍需在容器启动流程中运行 cron，才能保证容器重启后持续守护。
+
+### 2026.10.29
+
+- 主菜单新增 `[20] 一键更换所有节点 SNI`：一次把全部可管理主节点的伪装域名换成同一个值，Reality 同步 `server_name` 与 `handshake.server`，ShadowTLS 更新 `handshake.server`，TLS 类节点更新 `server_name` 并按需重新签发脚本自管的 RSA 自签证书，Hysteria2 跳跃子入站跟随主节点同步。
+- 自定义证书节点（acme.sh 符号链接、外部路径）与无 SNI 的节点（VLESS-TCP、Shadowsocks、SOCKS5）在处理前明确列出并整体跳过，避免换 SNI 后证书不匹配。
+- 批量变更沿用状态锁、事务快照、`config.json + relay.json` 组合校验、单次重启和失败自动回滚；确认时会重新比对节点计划，避免确认后状态漂移。
+- 聚合 Base64 订阅输出统一为单一实现：主节点与 Argo 节点链接合并编码，`[3] 查看节点链接` 与 `[20]` 共用，并支持直接复用刚生成的链接文件。
