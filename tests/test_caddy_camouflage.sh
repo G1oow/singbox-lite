@@ -317,6 +317,33 @@ check_true "卸载路径会清理 Caddy 二进制" "$?"
 grep -q 'Caddy SHA-256 校验失败' "$ROOT/singbox.sh"
 check_true "Caddy 安装包含 SHA-256 校验" "$?"
 
+# 仅截取主菜单区域，避免匹配到 Argo 子菜单里的同名标题
+menu_section() { # 起始标题 结束标题
+    awk -v s="【$1】" -v e="【$2】" '
+        index($0, "sing-box 管理脚本 v") { inmenu=1 }
+        !inmenu { next }
+        index($0, s) { insec=1; next }
+        insec && index($0, e) { insec=0 }
+        insec { print }
+    ' "$ROOT/singbox.sh"
+}
+node_section=$(menu_section "节点管理" "服务控制")
+advanced_section=$(menu_section "进阶功能" "退出脚本")
+
+case "$node_section" in
+    *"[20]"*|*"[21]"*) echo "FAIL  【节点管理】仍残留 [20]/[21]"; fail=$((fail + 1)) ;;
+    *) echo "ok    【节点管理】只保留 [1]-[5]" ;;
+esac
+case "$advanced_section" in
+    *"[20]"*"[21]"*|*"[21]"*"[20]"*) echo "ok    【进阶功能】含 [20] 与 [21]" ;;
+    *) echo "FAIL  【进阶功能】缺少 [20] 或 [21]"; fail=$((fail + 1)) ;;
+esac
+# 编号与 case 分支必须保持一一对应，移动菜单不能漏改调度
+for opt in 20 21; do
+    grep -qE "^[[:space:]]+${opt}\\) " "$ROOT/singbox.sh"
+    check_true "case 分支 [${opt}] 仍然存在" "$?"
+done
+
 if [ "$fail" -eq 0 ]; then
     echo ""
     echo "全部通过。"
