@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# Reality 伪装域名（Caddy）回归测试
+# 依赖: bash、jq、sed、grep
+# 用法: bash tests/test_caddy_camouflage.sh
+set -uo pipefail
+# 任何交互式读取都直接失败而不是挂起 CI
+exec < /dev/null
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+for bin in jq sed grep; do
+    command -v "$bin" >/dev/null 2>&1 || { echo "缺少依赖: $bin" >&2; exit 1; }
+done
+
+export SINGBOX_DIR="$WORK/sing-box"
+mkdir -p "$SINGBOX_DIR"
+export CONFIG_FILE="$SINGBOX_DIR/config.json"
+export METADATA_FILE="$SINGBOX_DIR/metadata.json"
+export CLASH_YAML_FILE="$SINGBOX_DIR/clash.yaml"
+export ARGO_METADATA_FILE="$SINGBOX_DIR/argo_metadata.json"
+export RELAY_CONFIG_FILE="$SINGBOX_DIR/relay.json"
+export CADDY_STATE_FILE="$SINGBOX_DIR/caddy_camouflage.json"
+export CADDY_CONF_FILE="$SINGBOX_DIR/Caddyfile"
+export CADDY_WEB_ROOT="$SINGBOX_DIR/www"
+export CADDY_DATA_DIR="$SINGBOX_DIR/caddy"
+export CADDY_LOG_FILE="$WORK/caddy.log"
+export CADDY_BIN="$WORK/bin/caddy"
+export CADDY_FALLBACK_PORT="8443"
+export DEFAULT_SNI="www.amd.com"
+export GITHUB_RAW_BASE="https://example.invalid/singbox-lite/main"
+RED='' GREEN='' YELLOW='' CYAN='' NC='' ORANGE=''
+
+# singbox.sh 会直接执行主菜单，不能 source 整个文件，只能按注释锚点抽取被测块
+sed -n '/^# --- Reality 伪装域名（Caddy） ---$/,/^# --- Reality 伪装域名（Caddy）结束 ---$/p' \
+    "$ROOT/singbox.sh" > "$WORK/camouflage.sh"
+[ -s "$WORK/camouflage.sh" ] || { echo "抽取伪装域名功能块失败" >&2; exit 1; }
+sed -n '/^_reality_handshake_is_local() {$/,/^}$/p' "$ROOT/singbox.sh" > "$WORK/handshake-local.sh"
+[ -s "$WORK/handshake-local.sh" ] || { echo "抽取 handshake 判定函数失败" >&2; exit 1; }
+
+fail=0
+check() { # 描述 期望 实际
+    if [ "$2" = "$3" ]; then
+        printf 'ok    %s\n' "$1"
+    else
+        printf 'FAIL  %s\n      期望: %s\n      实际: %s\n' "$1" "$2" "$3"
+        fail=$((fail + 1))
+    fi
+}
+check_true() { # 描述 退出码
+    if [ "$2" = "0" ]; then
+        printf 'ok    %s\n' "$1"
+    else
+        printf 'FAIL  %s\n      期望成功，实际失败\n' "$1"
+        fail=$((fail + 1))
+    fi
+}
+check_false() { # 描述 退出码
+    if [ "$2" != "0" ]; then
+        printf 'ok    %s\n' "$1"
+    else
+        printf 'FAIL  %s\n      期望失败，实际成功\n' "$1"
+        fail=$((fail + 1))
+    fi
+}
+
+# --- 被测函数的轻量替身 -------------------------------------------------
+_info() { printf '[信息] %s\n' "$1" >&2; }
+_success() { printf '[成功] %s\n' "$1" >&2; }
+_warn() { printf '[注意] %s\n' "$1" >&2; }
+_warning() { _warn "$1"; }
+_error() { printf '[错误] %s\n' "$1" >&2; }
+_pkg_install() { return 0; }
+_conn_ipv4() { printf '%s' "${STUB_LOCAL_IPV4:-}"; }
+_conn_ipv6() { printf '%s' "${STUB_LOCAL_IPV6:-}"; }
+_atomic_modify_json() {
+    local file="$1" filter="$2"; shift 2
+    [ -f "$file" ] || return 1
+    jq "$@" "$filter" "$file" > "${file}.new" && mv "${file}.new" "$file"
+}
+_list_main_primary_inbounds() {
+    local node tag
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        tag=$(printf '%s' "$node" | jq -r '.tag // empty')
+        case "$tag" in *-hop-*) continue ;; esac
+        printf '%s\n' "$node"
+    done < <(jq -c '.inbounds[]?' "$CONFIG_FILE" 2>/dev/null)
+}
+_detect_main_node_variant() {
+    jq -r --arg tag "$1" '
+        .inbounds[]? | select(.tag == $tag) |
+        if (.tls.reality.enabled // false) and .type == "vless" then "vless-reality"
+        elif (.tls.reality.enabled // false) and .type == "anytls" then "any-reality"
+        else "unsupported" end
+    ' "$CONFIG_FILE" 2>/dev/null | head -n 1
+}
+# 用可控替身替代 DoH，测试不依赖外网
+_camouflage_doh_ips() {
+    case "${1}:${2}" in
+        vpn.example.com:A) printf '198.51.100.7\n' ;;
+        vpn.example.com:AAAA) printf '2001:db8::7\n' ;;
+        dual.example.com:A) printf '198.51.100.9\n' ;;
+        dual.example.com:AAAA) printf '2001:db8::99\n' ;;
+        proxied.example.com:A) printf '192.0.2.10\n' ;;
+        *) : ;;
+    esac
+}
+
+# shellcheck disable=SC1090
+. "$WORK/camouflage.sh"
+# shellcheck disable=SC1090
+. "$WORK/handshake-local.sh"
+
+# 源文件里定义了真实的 DoH 查询，必须在 source 之后覆盖为替身才生效
+_camouflage_doh_ips() {
+    case "${1}:${2}" in
+        vpn.example.com:A) printf '198.51.100.7\n' ;;
+        vpn.example.com:AAAA) printf '2001:db8::7\n' ;;
+        dual.example.com:A) printf '198.51.100.9\n' ;;
+        dual.example.com:AAAA) printf '2001:db8::99\n' ;;
+        proxied.example.com:A) printf '192.0.2.10\n' ;;
+        *) : ;;
+    esac
+}
+_camouflage_dns_ips() {
+    _camouflage_doh_ips "$1" A
+    _camouflage_doh_ips "$1" AAAA
+}
+
+# --- 域名格式校验 -------------------------------------------------------
+_camouflage_domain_valid "vpn.example.com";           check_true  "普通域名通过格式校验" "$?"
+_camouflage_domain_valid "a.b-c.example.co";          check_true  "多级与连字符域名通过" "$?"
+_camouflage_domain_valid "198.51.100.7";              check_false "IPv4 字面量被拒绝" "$?"
+_camouflage_domain_valid "2001:db8::1";               check_false "IPv6 字面量被拒绝" "$?"
+_camouflage_domain_valid "https://vpn.example.com/a"; check_false "带协议前缀的输入被拒绝" "$?"
+_camouflage_domain_valid "-bad.example.com";          check_false "以连字符开头的标签被拒绝" "$?"
+_camouflage_domain_valid "localhost";                 check_false "无点的单标签被拒绝" "$?"
+_camouflage_domain_valid "";                          check_false "空输入被拒绝" "$?"
+
+# --- 解析比对 -----------------------------------------------------------
+STUB_LOCAL_IPV4="198.51.100.7" STUB_LOCAL_IPV6=""
+_camouflage_domain_matches "vpn.example.com"
+check_true "A 记录命中本机 IPv4 时判定绑定成功" "$?"
+
+STUB_LOCAL_IPV4="203.0.113.1" STUB_LOCAL_IPV6="2001:db8::7"
+_camouflage_domain_matches "vpn.example.com"
+check_true "AAAA 记录命中本机 IPv6 时判定绑定成功" "$?"
+
+STUB_LOCAL_IPV4="203.0.113.1" STUB_LOCAL_IPV6=""
+_camouflage_domain_matches "proxied.example.com"
+check_false "解析到 CDN 边缘地址时判定绑定失败" "$?"
+
+STUB_LOCAL_IPV4="203.0.113.1" STUB_LOCAL_IPV6="2001:db8::99"
+_camouflage_domain_matches "dual.example.com"
+check_true "双栈仅 IPv6 命中时也判定成功" "$?"
+
+STUB_LOCAL_IPV4="" STUB_LOCAL_IPV6=""
+_camouflage_domain_matches "vpn.example.com"
+check_false "本机公网地址未知时判定失败" "$?"
+
+# --- 状态文件读写与幂等 -------------------------------------------------
+check "无状态文件时域名为空" "" "$(_camouflage_state_domain)"
+check "无状态文件时字段为空" "" "$(_camouflage_state_field '.fallbackPort')"
+
+_camouflage_state_write "vpn.example.com" 8443 "acme" "/tmp/cert.pem" "" "vless-in-443" "Dec  1 00:00:00 2027 GMT"
+check_true "状态文件写入成功" "$?"
+check "读取伪装域名" "vpn.example.com" "$(_camouflage_state_domain)"
+check "读取回落端口" "8443" "$(_camouflage_state_field '.fallbackPort')"
+check "读取 443 节点" "vless-in-443" "$(_camouflage_state_field '.port443Tag')"
+# Windows/MSYS 的 Git Bash 没有 POSIX 权限语义，只在 Linux 上断言
+if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+    check_true "状态文件权限为 600" \
+        "$([ "$(stat -c '%a' "$CADDY_STATE_FILE")" = "600" ] && echo 0 || echo 1)"
+fi
+
+# 端口迁移后 tag 会被重写，状态文件必须跟随
+_camouflage_state_rebind_tag "vless-in-443-renamed"
+check "443 节点 tag 跟随更新" "vless-in-443-renamed" "$(_camouflage_state_field '.port443Tag')"
+check "重绑定不影响域名" "vpn.example.com" "$(_camouflage_state_domain)"
+
+# 覆盖写入即为幂等
+_camouflage_state_write "new.example.com" 8443 "acme" "/tmp/c2.pem" "" "" ""
+check "重复写入覆盖为最新域名" "new.example.com" "$(_camouflage_state_domain)"
+check_true "没有残留的临时状态文件" \
+    "$([ "$(ls -1 "${CADDY_STATE_FILE}".tmp.* 2>/dev/null | wc -l)" -eq 0 ] && echo 0 || echo 1)"
+
+# --- Caddyfile 生成 -----------------------------------------------------
+_caddy_write_config "vpn.example.com" 8443 "acme"
+check_true "ACME 模式 Caddyfile 生成成功" "$?"
+conf="$(cat "$CADDY_CONF_FILE")"
+case "$conf" in
+    *"https://vpn.example.com:8443 {"*) echo "ok    Caddyfile 站点地址带回落端口" ;;
+    *) echo "FAIL  Caddyfile 站点地址缺少回落端口"; fail=$((fail + 1)) ;;
+esac
+case "$conf" in
+    *"disable_tlsalpn_challenge"*) echo "ok    禁用 TLS-ALPN-01（443 归 Reality）" ;;
+    *) echo "FAIL  未禁用 TLS-ALPN-01"; fail=$((fail + 1)) ;;
+esac
+case "$conf" in
+    *"admin off"*) echo "ok    关闭 Caddy admin API" ;;
+    *) echo "FAIL  未关闭 Caddy admin API"; fail=$((fail + 1)) ;;
+esac
+case "$conf" in
+    *"root * ${CADDY_WEB_ROOT}"*) echo "ok    站点根目录落在 SINGBOX_DIR" ;;
+    *) echo "FAIL  站点根目录路径不符"; fail=$((fail + 1)) ;;
+esac
+
+_caddy_write_config "vpn.example.com" 8443 "custom" "/tmp/fullchain.pem" "/tmp/privkey.pem"
+conf="$(cat "$CADDY_CONF_FILE")"
+case "$conf" in
+    *"tls /tmp/fullchain.pem /tmp/privkey.pem"*) echo "ok    自定义证书模式写入证书路径" ;;
+    *) echo "FAIL  自定义证书模式未写入证书路径"; fail=$((fail + 1)) ;;
+esac
+case "$conf" in
+    *"issuer acme"*) echo "FAIL  自定义证书模式不应启用 ACME"; fail=$((fail + 1)) ;;
+    *) echo "ok    自定义证书模式未启用 ACME" ;;
+esac
+
+# --- 443 候选选择 -------------------------------------------------------
+write_nodes() {
+    cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[
+ {"type":"vless","tag":"vless-in-8443","listen_port":8443,"users":[{"uuid":"11111111-1111-1111-1111-111111111111"}],
+  "tls":{"enabled":true,"server_name":"vpn.example.com","reality":{"enabled":true,"handshake":{"server":"127.0.0.1","server_port":8443},"private_key":"k","short_id":["a"]}}},
+ {"type":"vless","tag":"vless-in-9443","listen_port":9443,"users":[{"uuid":"22222222-2222-2222-2222-222222222222"}],
+  "tls":{"enabled":true,"server_name":"vpn.example.com","reality":{"enabled":true,"handshake":{"server":"127.0.0.1","server_port":8443},"private_key":"k","short_id":["b"]}}}
+]}
+JSON
+    cat > "$METADATA_FILE" <<'JSON'
+{"vless-in-8443":{"name":"A-Node","publicKey":"pk1"},
+ "vless-in-9443":{"name":"B-Node","publicKey":"pk2"}}
+JSON
+}
+
+# CI 里没有任何输入，选择函数必须回落到第一个节点而不是卡住
+write_nodes
+check "多节点且无 443 时默认选中第一个" "vless-in-8443" "$(_camouflage_pick_port443_tag 2>/dev/null)"
+
+# 已存在 443 节点时必须直接复用，不再抢第二个 443
+cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[
+ {"type":"anytls","tag":"any-in-9443","listen_port":9443,"users":[{"password":"p1"}],
+  "tls":{"enabled":true,"server_name":"vpn.example.com","reality":{"enabled":true,"handshake":{"server":"127.0.0.1","server_port":8443},"private_key":"k","short_id":["a"]}}},
+ {"type":"vless","tag":"vless-in-443","listen_port":443,"users":[{"uuid":"33333333-3333-3333-3333-333333333333"}],
+  "tls":{"enabled":true,"server_name":"vpn.example.com","reality":{"enabled":true,"handshake":{"server":"127.0.0.1","server_port":8443},"private_key":"k","short_id":["b"]}}}
+]}
+JSON
+check "已存在 443 节点时直接复用" "vless-in-443" "$(_camouflage_pick_port443_tag 2>/dev/null)"
+
+# 没有 reality 节点时不能凭空选出 443 候选
+cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[
+ {"type":"hysteria2","tag":"hy2-in-8443","listen_port":8443,"users":[{"password":"p"}],
+  "tls":{"enabled":true,"alpn":["h3"],"certificate_path":"/tmp/a.pem","key_path":"/tmp/a.key"}}
+]}
+JSON
+_camouflage_pick_port443_tag >/dev/null 2>&1
+check_false "没有 Reality 节点时选择失败" "$?"
+
+# --- handshake 本机判定 -------------------------------------------------
+write_nodes
+_reality_handshake_is_local "vless-in-8443"
+check_true "handshake 指向 127.0.0.1 时判定为本机回落" "$?"
+
+jq '.inbounds[0].tls.reality.handshake.server = "www.amd.com"' "$CONFIG_FILE" > "$CONFIG_FILE.new" \
+    && mv "$CONFIG_FILE.new" "$CONFIG_FILE"
+_reality_handshake_is_local "vless-in-8443"
+check_false "handshake 指向公网域名时不判定为本机回落" "$?"
+
+_reality_handshake_is_local "missing-tag"
+check_false "节点不存在时判定失败" "$?"
+
+# --- 伪装页兜底 ---------------------------------------------------------
+_caddy_write_index_page >/dev/null 2>&1
+check_true "仓库不可达时仍写入兜底页" "$?"
+check_true "兜底页是合法 HTML" \
+    "$(grep -qi '<html' "${CADDY_WEB_ROOT}/index.html" && echo 0 || echo 1)"
+
+# --- [20] 换 SNI 时必须保留本机 handshake -------------------------------
+cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[
+ {"type":"vless","tag":"vless-in-443","listen_port":443,"users":[{"uuid":"11111111-1111-1111-1111-111111111111"}],
+  "tls":{"enabled":true,"server_name":"vpn.example.com","reality":{"enabled":true,"handshake":{"server":"127.0.0.1","server_port":8443},"private_key":"k","short_id":["a"]}}}
+]}
+JSON
+# 与 _batch_sni_apply_config 的 reality 分支保持同一过滤器
+jq '
+    (.inbounds[] | select(.tag == "vless-in-443") | .tls.server_name) = "other.example.com"
+' "$CONFIG_FILE" > "$CONFIG_FILE.changed"
+check "SNI 变更改写 server_name" "other.example.com" \
+    "$(jq -r '.inbounds[0].tls.server_name' "$CONFIG_FILE.changed")"
+check "handshake 指向保持 127.0.0.1 不被改写" "127.0.0.1" \
+    "$(jq -r '.inbounds[0].tls.reality.handshake.server' "$CONFIG_FILE.changed")"
+check "handshake 端口保持 8443 不被改写" "8443" \
+    "$(jq -r '.inbounds[0].tls.reality.handshake.server_port' "$CONFIG_FILE.changed")"
+rm -f "$CONFIG_FILE.changed"
+
+# --- 主脚本接线 ---------------------------------------------------------
+grep -q '21) _require_singbox && _caddy_camouflage_menu ;;' "$ROOT/singbox.sh"
+check_true "主菜单 [21] 已接线" "$?"
+grep -q '请输入选项 \[0-21\]' "$ROOT/singbox.sh"
+check_true "主菜单提示范围已放宽到 21" "$?"
+grep -q '_batch_sni_camouflage_warning' "$ROOT/singbox.sh"
+check_true "[20] 已接入伪装域名冲突告警" "$?"
+grep -q '_reality_handshake_is_local' "$ROOT/singbox.sh"
+check_true "节点修改已接入 handshake 保持逻辑" "$?"
+grep -q '_caddy_cert_health_check' "$ROOT/singbox.sh"
+check_true "配置检查已接入证书健康检查" "$?"
+# 卸载脚本必须显式清理 Caddy 产物，否则会留下常驻进程
+grep -q '_caddy_service remove' "$ROOT/singbox.sh"
+check_true "卸载路径会停止 Caddy 服务" "$?"
+grep -q 'rm -f -- "${CADDY_BIN}"' "$ROOT/singbox.sh"
+check_true "卸载路径会清理 Caddy 二进制" "$?"
+# 安装必须校验官方 SHA-256，不允许无校验下载
+grep -q 'Caddy SHA-256 校验失败' "$ROOT/singbox.sh"
+check_true "Caddy 安装包含 SHA-256 校验" "$?"
+
+if [ "$fail" -eq 0 ]; then
+    echo ""
+    echo "全部通过。"
+    exit 0
+fi
+echo ""
+echo "失败 ${fail} 项。"
+exit 1
