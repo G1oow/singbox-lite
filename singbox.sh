@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="101"
+export SCRIPT_VERSION="102"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9430,8 +9430,7 @@ _main_menu() {
         echo -e "  ${CYAN}【节点管理】${NC}"
         echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} Argo 隧道节点"
         echo -e "    ${GREEN}[3]${NC} 查看节点链接      ${GREEN}[4]${NC} 删除节点"
-        echo -e "    ${GREEN}[5]${NC} 修改节点          ${GREEN}[20]${NC} 一键换 SNI/重签证书"
-        echo -e "    ${GREEN}[21]${NC} Reality 伪装域名（Caddy）"
+        echo -e "    ${GREEN}[5]${NC} 修改节点"
         echo ""
         
         # 服务控制
@@ -9459,6 +9458,8 @@ _main_menu() {
         echo -e "  ${CYAN}【进阶功能】${NC}"
         echo -e "    ${GREEN}[18]${NC} 落地/中转/第三方节点导入"
         echo -e "    ${GREEN}[19]${NC} Xray 节点管理"
+        echo -e "    ${GREEN}[20]${NC} 一键换 SNI/重签证书"
+        echo -e "    ${GREEN}[21]${NC} Reality 伪装域名（Caddy）"
         echo ""
         
         echo -e "  ─────────────────────────────────────────────────"
