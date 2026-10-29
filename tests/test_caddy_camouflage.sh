@@ -274,9 +274,20 @@ check_false "节点不存在时判定失败" "$?"
 
 # --- 伪装页兜底 ---------------------------------------------------------
 _caddy_write_index_page >/dev/null 2>&1
-check_true "仓库不可达时仍写入兜底页" "$?"
-check_true "兜底页是合法 HTML" \
-    "$(grep -qi '<html' "${CADDY_WEB_ROOT}/index.html" && echo 0 || echo 1)"
+ check_true "仓库不可达时仍写入兜底页" "$?"
+ check_true "兜底页是合法 HTML" \
+     "$(grep -qi '<html' "${CADDY_WEB_ROOT}/index.html" && echo 0 || echo 1)"
+
+ # 主页依赖 assets/ 下的样式与脚本；同步逻辑必须覆盖这些文件，
+ # 否则线上会变成没有样式的裸页。
+ check_true "同步清单包含样式表" \
+     "$(grep -q 'assets/site.css' "$ROOT/singbox.sh" && echo 0 || echo 1)"
+ check_true "同步清单包含站点脚本" \
+     "$(grep -q 'assets/site.js' "$ROOT/singbox.sh" && echo 0 || echo 1)"
+ check_true "同步清单包含测速脚本" \
+     "$(grep -q 'assets/speedtest.js' "$ROOT/singbox.sh" && echo 0 || echo 1)"
+ check_true "同步清单包含子页面" \
+     "$(grep -q 'status.html api.html about.html legal.html' "$ROOT/singbox.sh" && echo 0 || echo 1)"
 
 # --- [20] 换 SNI 时必须保留本机 handshake -------------------------------
 cat > "$CONFIG_FILE" <<'JSON'

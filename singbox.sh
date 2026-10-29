@@ -6439,8 +6439,24 @@ _caddy_write_config() {
     chmod 600 "$CADDY_CONF_FILE" 2>/dev/null || true
 }
 
-# 伪装页优先用仓库内的 web/index.html，失败时写入内置兜底页。
-_caddy_write_index_page() {
+ # 下载单个伪装站文件；失败时保留现有文件，不中断流程。
+ _caddy_fetch_web_file() {
+    local rel="$1" dest="${CADDY_WEB_ROOT}/$1" url="${GITHUB_RAW_BASE}/web/$1" tmp
+    mkdir -p "$(dirname "$dest")" || return 1
+    tmp=$(mktemp "${dest}.XXXXXX") || return 1
+    if command -v curl >/dev/null 2>&1 \
+        && curl -fsSL --connect-timeout 8 --max-time 30 -o "$tmp" "$url" 2>/dev/null \
+        && [ -s "$tmp" ]; then
+        chmod 644 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$dest" && return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+ }
+
+ # 伪装页优先用仓库内的 web/ 目录，失败时写入内置兜底页。
+ # 页面依赖 assets/ 下的样式与脚本，必须与 HTML 一起同步，否则线上会是无样式裸页。
+ _caddy_write_index_page() {
     local target="${CADDY_WEB_ROOT}/index.html"
     local url="${GITHUB_RAW_BASE}/web/index.html" tmp
     mkdir -p "$CADDY_WEB_ROOT" || return 1
@@ -6451,7 +6467,17 @@ _caddy_write_index_page() {
         && head -c 200 "$tmp" | grep -qi '<html\|<!doctype'; then
         chmod 644 "$tmp" 2>/dev/null || true
         if mv -f "$tmp" "$target"; then
-            _success "伪装页已从官方仓库同步。"
+            # 同步多页面站点与静态资源；任一失败只告警，不影响主页可用性。
+            local rel failed=0
+            for rel in status.html api.html about.html legal.html 404.html \
+                       robots.txt assets/site.css assets/site.js assets/speedtest.js; do
+                _caddy_fetch_web_file "$rel" || failed=$((failed + 1))
+            done
+            if [ "$failed" -eq 0 ]; then
+                _success "伪装页已从官方仓库同步（含子页面与静态资源）。"
+            else
+                _warn "伪装页已同步，但 ${failed} 个附属文件下载失败（子页面或样式可能缺失）。"
+            fi
             return 0
         fi
     fi

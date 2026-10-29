@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Measurement API — Netmeter</title>
+<meta name="description" content="HTTP endpoints for node metadata, latency probes and throughput sessions, with rate limits and result schemas.">
+<meta name="theme-color" content="#0f0f0f">
+<meta name="robots" content="index,follow">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f0f0f'/%3E%3Cpath d='M6.5 22a9.5 9.5 0 1 1 19 0' fill='none' stroke='%2300d4aa' stroke-width='2.6' stroke-linecap='round'/%3E%3Cpath d='M16 22l5.4-4.9' fill='none' stroke='%23f2f2f2' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/site.css">
+<style>
+  .doc-layout {
+    display: grid;
+    grid-template-columns: 190px minmax(0, 1fr);
+    gap: 44px;
+    align-items: start;
+    padding-top: 34px;
+  }
+
+  .toc {
+    position: sticky;
+    top: 82px;
+  }
+
+  .toc h2 {
+    margin-bottom: 12px;
+    color: var(--text-faint);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .toc ul { margin: 0; padding: 0; list-style: none; }
+
+  .toc li + li { margin-top: 2px; }
+
+  .toc a {
+    display: block;
+    padding: 5px 9px;
+    border-left: 1px solid var(--line);
+    color: var(--text-faint);
+    font-size: 13px;
+    text-decoration: none;
+    transition: color var(--dur-fast) var(--ease),
+                border-color var(--dur) var(--ease),
+                background var(--dur-fast) var(--ease);
+  }
+
+  .toc a:hover { color: var(--text); background: var(--bg-hover); }
+
+  .toc a[aria-current="true"] {
+    border-left-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .doc-section { padding-bottom: 40px; }
+  .doc-section + .doc-section { border-top: 1px solid var(--line-soft); padding-top: 34px; }
+  .doc-section h2 { font-size: 19px; }
+  .doc-section > p { margin-top: 10px; color: var(--text-dim); font-size: 14px; max-width: 62ch; }
+
+  /* endpoint block */
+
+  .endpoint { margin-top: 22px; }
+
+  .endpoint-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+
+  .method {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border: 1px solid var(--accent-line);
+    border-radius: 4px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.02em;
+  }
+
+  .method.post { border-color: rgba(240, 161, 60, 0.34); background: var(--amber-soft); color: var(--amber); }
+
+  .path { color: var(--text); font-family: var(--mono); font-size: 13.5px; }
+
+  .endpoint p { margin-top: 8px; color: var(--text-dim); font-size: 13.5px; max-width: 66ch; }
+
+  .endpoint pre { margin-top: 12px; }
+
+  .params { margin-top: 12px; }
+  .params th, .params td { font-size: 12.5px; }
+  .params td { white-space: normal; }
+  .params td:last-child { text-align: left; padding-left: 12px; color: var(--text-dim); }
+  .params th:last-child { text-align: left; padding-left: 12px; }
+
+  .callout {
+    margin-top: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-left: 2px solid var(--accent);
+    border-radius: var(--r-sm);
+    background: var(--bg-elev);
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  .callout strong { color: var(--text); font-weight: 600; }
+
+  @media (max-width: 860px) {
+    .doc-layout { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+    .toc { position: static; }
+    .toc ul { display: flex; flex-wrap: wrap; gap: 6px; }
+    .toc li + li { margin-top: 0; }
+    .toc a { border: 1px solid var(--line); border-radius: 999px; padding: 4px 11px; font-size: 12.5px; }
+    .toc a[aria-current="true"] { border-color: var(--accent-line); }
+  }
+</style>
+</head>
+<body class="page">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="inner">
+    <a class="brand" href="index.html" aria-label="Netmeter home">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+      <span>Netmeter</span>
+    </a>
+    <nav class="topnav" id="primary-nav" aria-label="Primary">
+      <a class="navlink" href="index.html">Speed test</a>
+      <a class="navlink" href="status.html">Status</a>
+      <a class="navlink" href="api.html" aria-current="page">API</a>
+      <a class="navlink" href="about.html">About</a>
+    </nav>
+    <div class="topbar-actions">
+      <button type="button" class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false" aria-controls="primary-nav">
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" width="15" height="15">
+          <path d="M2 4.5h12M2 8h12M2 11.5h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="main" id="main">
+  <div class="shell">
+
+    <header class="page-head" data-reveal>
+      <span class="eyebrow">Reference</span>
+      <h1>Measurement API</h1>
+      <p class="lede">Node metadata, latency probes and throughput sessions. All endpoints return JSON and are safe to call from a browser.</p>
+    </header>
+
+    <div class="doc-layout">
+
+      <nav class="toc" id="api-toc" aria-label="On this page" data-toc>
+        <h2>On this page</h2>
+        <ul>
+          <li><a href="#auth">Authentication</a></li>
+          <li><a href="#nodes">Node metadata</a></li>
+          <li><a href="#latency">Latency probe</a></li>
+          <li><a href="#session">Throughput session</a></li>
+          <li><a href="#result">Result object</a></li>
+          <li><a href="#limits">Rate limits</a></li>
+          <li><a href="#errors">Errors</a></li>
+        </ul>
+      </nav>
+
+      <div>
+
+        <section class="doc-section" id="auth" data-reveal>
+          <h2>Authentication</h2>
+          <p>Public reads need no credentials. Bulk access and result exports require an operator key, sent as a bearer token.</p>
+          <pre><code><span class="c"># public read</span>
+curl -s https://netmeter.example/api/v1/nodes
+
+<span class="c"># operator call</span>
+curl -s -H <span class="s">"Authorization: Bearer $NETMETER_KEY"</span> \
+  https://netmeter.example/api/v1/sessions?limit=50</code></pre>
+          <div class="callout"><strong>Keys are scoped per account.</strong> A key issued for exports cannot start measurement sessions.</div>
+        </section>
+
+        <section class="doc-section" id="nodes" data-reveal>
+          <h2>Node metadata</h2>
+          <div class="endpoint">
+            <div class="endpoint-head">
+              <span class="method">GET</span>
+              <span class="path">/api/v1/nodes</span>
+            </div>
+            <p>Returns every node with its exchange, operator and advertised capacity. Capacities are the ceiling the node is provisioned for, not a guarantee of your measured rate.</p>
+            <pre><code>{
+  <span class="k">"nodes"</span>: [
+    {
+      <span class="k">"id"</span>: <span class="s">"hkg"</span>,
+      <span class="k">"city"</span>: <span class="s">"Hong Kong"</span>,
+      <span class="k">"exchange"</span>: <span class="s">"HKIX"</span>,
+      <span class="k">"operator"</span>: <span class="s">"Netmeter APAC"</span>,
+      <span class="k">"capacity_mbps"</span>: 940,
+      <span class="k">"status"</span>: <span class="s">"online"</span>
+    }
+  ]
+}</code></pre>
+          </div>
+        </section>
+
+        <section class="doc-section" id="latency" data-reveal>
+          <h2>Latency probe</h2>
+          <div class="endpoint">
+            <div class="endpoint-head">
+              <span class="method">GET</span>
+              <span class="path">/api/v1/latency?node=hkg&amp;probes=8</span>
+            </div>
+            <p>Runs sequential probes against one node and reports mean round-trip time, jitter and packet loss. The browser test uses the same routine with eight probes.</p>
+            <table class="params">
+              <thead>
+                <tr><th scope="col">Parameter</th><th scope="col">Notes</th></tr>
+              </thead>
+              <tbody>
+                <tr><td class="mono">node</td><td>Node id from <code>/nodes</code>. Required.</td></tr>
+                <tr><td class="mono">probes</td><td>1–16, default 5. Higher counts cost proportionally more of your rate budget.</td></tr>
+              </tbody>
+            </table>
+            <pre><code>{
+  <span class="k">"node"</span>: <span class="s">"hkg"</span>,
+  <span class="k">"probes"</span>: 8,
+  <span class="k">"rtt_ms"</span>: 11.2,
+  <span class="k">"jitter_ms"</span>: 0.8,
+  <span class="k">"loss_pct"</span>: 0
+}</code></pre>
+          </div>
+        </section>
+
+        <section class="doc-section" id="session" data-reveal>
+          <h2>Throughput session</h2>
+          <div class="endpoint">
+            <div class="endpoint-head">
+              <span class="method post">POST</span>
+              <span class="path">/api/v1/sessions</span>
+            </div>
+            <p>Opens a measurement session and returns the stream URLs to run against. Sessions expire after 120 seconds if no streams are started.</p>
+            <pre><code>{
+  <span class="k">"session_id"</span>: <span class="s">"s_7f3ac1"</span>,
+  <span class="k">"node"</span>: <span class="s">"hkg"</span>,
+  <span class="k">"expires_in"</span>: 120,
+  <span class="k">"streams"</span>: {
+    <span class="k">"download"</span>: <span class="s">"/api/v1/sessions/s_7f3ac1/down"</span>,
+    <span class="k">"upload"</span>: <span class="s">"/api/v1/sessions/s_7f3ac1/up"</span>
+  }
+}</code></pre>
+            <div class="callout"><strong>Upload is capped at 100 Mbps per session.</strong> The cap protects shared capacity on the node; it is not a limit of your link.</div>
+          </div>
+        </section>
+
+        <section class="doc-section" id="result" data-reveal>
+          <h2>Result object</h2>
+          <p>Once a session closes, <code>GET /api/v1/sessions/{id}</code> returns the settled figures. Values are the mean of the second half of each transfer, which keeps slow start out of the average.</p>
+          <pre><code>{
+  <span class="k">"session_id"</span>: <span class="s">"s_7f3ac1"</span>,
+  <span class="k">"finished_at"</span>: <span class="s">"2025-03-11T09:41:22Z"</span>,
+  <span class="k">"ping_ms"</span>: 11.2,
+  <span class="k">"jitter_ms"</span>: 0.8,
+  <span class="k">"download_mbps"</span>: 872.46,
+  <span class="k">"upload_mbps"</span>: 91.48,
+  <span class="k">"bytes_download"</span>: 1374389534,
+  <span class="k">"bytes_upload"</span>: 143327232
+}</code></pre>
+        </section>
+
+        <section class="doc-section" id="limits" data-reveal>
+          <h2>Rate limits</h2>
+          <table>
+            <thead>
+              <tr><th scope="col">Scope</th><th scope="col">Limit</th><th scope="col">Window</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Public reads</td><td class="num">60</td><td>per minute, per address</td></tr>
+              <tr><td>Latency probes</td><td class="num">20</td><td>per minute, per address</td></tr>
+              <tr><td>Sessions</td><td class="num">6</td><td>per minute, per address</td></tr>
+              <tr><td>Operator exports</td><td class="num">600</td><td>per hour, per key</td></tr>
+            </tbody>
+          </table>
+          <div class="callout">Every response carries <code>X-RateLimit-Remaining</code>. A <code>429</code> includes <code>Retry-After</code> in seconds.</div>
+        </section>
+
+        <section class="doc-section" id="errors" data-reveal>
+          <h2>Errors</h2>
+          <p>Errors use a stable shape so clients can branch on <code>code</code> rather than parsing prose.</p>
+          <pre><code>{
+  <span class="k">"error"</span>: {
+    <span class="k">"code"</span>: <span class="s">"node_offline"</span>,
+    <span class="k">"message"</span>: <span class="s">"Requested node is not accepting sessions."</span>,
+    <span class="k">"request_id"</span>: <span class="s">"req_91b2"</span>
+  }
+}</code></pre>
+          <table class="params" style="margin-top: 16px;">
+            <thead>
+              <tr><th scope="col">Status</th><th scope="col">Code</th></tr>
+            </thead>
+            <tbody>
+              <tr><td class="num">400</td><td><code>invalid_parameter</code></td></tr>
+              <tr><td class="num">401</td><td><code>missing_key</code></td></tr>
+              <tr><td class="num">404</td><td><code>unknown_node</code></td></tr>
+              <tr><td class="num">409</td><td><code>node_offline</code></td></tr>
+              <tr><td class="num">429</td><td><code>rate_limited</code></td></tr>
+            </tbody>
+          </table>
+        </section>
+
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer class="site-foot">
+  <div class="inner">
+    <div class="foot-brand">
+      <a class="brand" href="index.html">
+        <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <span>Netmeter</span>
+      </a>
+      <p>Browser-based throughput and latency measurement against a network of exchange-hosted nodes.</p>
+    </div>
+    <div class="foot-col">
+      <h3>Product</h3>
+      <ul>
+        <li><a href="index.html">Speed test</a></li>
+        <li><a href="status.html">Node status</a></li>
+        <li><a href="api.html">Measurement API</a></li>
+      </ul>
+    </div>
+    <div class="foot-col">
+      <h3>Company</h3>
+      <ul>
+        <li><a href="about.html">About</a></li>
+        <li><a href="about.html#method">Methodology</a></li>
+        <li><a href="about.html#contact">Contact</a></li>
+      </ul>
+    </div>
+    <div class="foot-col">
+      <h3>Legal</h3>
+      <ul>
+        <li><a href="legal.html">Terms of use</a></li>
+        <li><a href="legal.html#privacy">Privacy</a></li>
+        <li><a href="legal.html#cookies">Cookies</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="foot-base">
+    <span>© <span data-year>2025</span> Netmeter. All rights reserved.</span>
+    <span class="meta">
+      <span class="mono">build 2.6.0</span>
+      <span class="sep">·</span>
+      <span>API v1</span>
+    </span>
+  </div>
+</footer>
+
+<script src="assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Page not found — Netmeter</title>
+<meta name="description" content="The requested page could not be found on Netmeter.">
+<meta name="theme-color" content="#0f0f0f">
+<meta name="robots" content="noindex,follow">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f0f0f'/%3E%3Cpath d='M6.5 22a9.5 9.5 0 1 1 19 0' fill='none' stroke='%2300d4aa' stroke-width='2.6' stroke-linecap='round'/%3E%3Cpath d='M16 22l5.4-4.9' fill='none' stroke='%23f2f2f2' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/site.css">
+<style>
+  .notfound {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 84px 0 40px;
+    max-width: 56ch;
+  }
+
+  .code {
+    font-family: var(--mono);
+    font-size: clamp(52px, 11vw, 84px);
+    font-weight: 500;
+    line-height: 1;
+    letter-spacing: -0.05em;
+    color: var(--text);
+  }
+
+  .notfound h1 { margin-top: 18px; font-size: 24px; }
+
+  .notfound p { margin-top: 10px; color: var(--text-dim); font-size: 14.5px; }
+
+  .notfound .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+
+  .suggest { margin-top: 48px; padding-top: 28px; border-top: 1px solid var(--line-soft); }
+
+  .suggest h2 { font-size: 13.5px; color: var(--text-faint); font-weight: 500; }
+
+  .suggest ul { margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+
+  .suggest a {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 11px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    color: var(--text);
+    font-size: 13.5px;
+    text-decoration: none;
+    transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+  }
+
+  .suggest a:hover { border-color: var(--line-strong); background: var(--bg-hover); text-decoration: none; }
+  .suggest a span.hint { color: var(--text-faint); font-size: 12.5px; }
+</style>
+</head>
+<body class="page">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="inner">
+    <a class="brand" href="index.html" aria-label="Netmeter home">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+      <span>Netmeter</span>
+    </a>
+    <nav class="topnav" id="primary-nav" aria-label="Primary">
+      <a class="navlink" href="index.html">Speed test</a>
+      <a class="navlink" href="status.html">Status</a>
+      <a class="navlink" href="api.html">API</a>
+      <a class="navlink" href="about.html">About</a>
+    </nav>
+    <div class="topbar-actions">
+      <button type="button" class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false" aria-controls="primary-nav">
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" width="15" height="15">
+          <path d="M2 4.5h12M2 8h12M2 11.5h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="main" id="main">
+  <div class="shell">
+    <div class="notfound">
+      <span class="code">404</span>
+      <h1>That page is not here</h1>
+      <p>The address may have moved, or the link that brought you here may be out of date. Everything the service offers is reachable from the test page.</p>
+
+      <div class="actions">
+        <a class="btn btn-accent" href="index.html">
+          Run a test
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 3.5L10.5 8 6 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </a>
+        <a class="btn btn-outline" href="status.html">Check node status</a>
+      </div>
+
+      <div class="suggest">
+        <h2>Common destinations</h2>
+        <ul>
+          <li><a href="index.html"><span>Speed test</span><span class="hint">Measure this connection</span></a></li>
+          <li><a href="status.html"><span>Node status</span><span class="hint">Availability and incidents</span></a></li>
+          <li><a href="api.html"><span>Measurement API</span><span class="hint">Endpoints and rate limits</span></a></li>
+          <li><a href="legal.html"><span>Terms &amp; privacy</span><span class="hint">What a run records</span></a></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer class="site-foot">
+  <div class="inner">
+    <div class="foot-brand">
+      <a class="brand" href="index.html">
+        <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <span>Netmeter</span>
+      </a>
+      <p>Browser-based throughput and latency measurement against a network of exchange-hosted nodes.</p>
+    </div>
+    <div class="foot-col">
+      <h3>Product</h3>
+      <ul>
+        <li><a href="index.html">Speed test</a></li>
+        <li><a href="status.html">Node status</a></li>
+        <li><a href="api.html">Measurement API</a></li>
+      </ul>
+    </div>
+    <div class="foot-col">
+      <h3>Company</h3>
+      <ul>
+        <li><a href="about.html">About</a></li>
+        <li><a href="about.html#method">Methodology</a></li>
+        <li><a href="about.html#contact">Contact</a></li>
+      </ul>
+    </div>
+    <div class="foot-col">
+      <h3>Legal</h3>
+      <ul>
+        <li><a href="legal.html">Terms of use</a></li>
+        <li><a href="legal.html#privacy">Privacy</a></li>
+        <li><a href="legal.html#cookies">Cookies</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="foot-base">
+    <span>© <span data-year>2025</span> Netmeter. All rights reserved.</span>
+    <span class="meta">
+      <span class="mono">build 2.6.0</span>
+      <span class="sep">·</span>
+      <span>Error 404</span>
+    </span>
+  </div>
+</footer>
+
+<script src="assets/site.js" defer></script>
+</body>
+</html>

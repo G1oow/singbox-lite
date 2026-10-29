@@ -11,97 +11,18 @@
 <meta property="og:title" content="Netmeter — Internet Speed Test">
 <meta property="og:description" content="Measure download speed, upload speed, latency and jitter to a nearby test node.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f0f0f'/%3E%3Cpath d='M6.5 22a9.5 9.5 0 1 1 19 0' fill='none' stroke='%2300d4aa' stroke-width='2.6' stroke-linecap='round'/%3E%3Cpath d='M16 22l5.4-4.9' fill='none' stroke='%23f2f2f2' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/site.css">
 <style>
-  *, *::before, *::after { box-sizing: border-box; }
+  /* ---------- hero / bench ---------- */
 
-  :root {
-    --bg: #0f0f0f;
-    --bg-elev: #161616;
-    --bg-hover: #1e1e1e;
-    --line: #262626;
-    --line-soft: #1d1d1d;
-    --text: #f2f2f2;
-    --text-dim: #9c9c9c;
-    --text-faint: #8f8f8f;
-    --accent: #00d4aa;
-    --accent-ink: #06261f;
-    --font: "Helvetica Neue", "Nimbus Sans", "Liberation Sans", "DejaVu Sans", system-ui, sans-serif;
-    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "DejaVu Sans Mono", "Liberation Mono", monospace;
-    --shell: 960px;
-  }
-
-  html { -webkit-text-size-adjust: 100%; }
-
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--font);
-    font-size: 15px;
-    line-height: 1.5;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-  }
-
-  button { font: inherit; }
-
-  /* ---------- top bar ---------- */
-
-  .topbar {
-    position: sticky;
-    top: 0;
-    z-index: 20;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    height: 56px;
-    padding: 0 24px;
-    border-bottom: 1px solid var(--line);
-    background: var(--bg);
-  }
-
-  .brand {
-    display: inline-flex;
-    align-items: center;
-    gap: 9px;
-    color: var(--text);
-    text-decoration: none;
-    font-size: 15px;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-  }
-
-  .brand svg { width: 20px; height: 20px; color: var(--accent); }
-
-  .topnav { display: flex; align-items: center; gap: 2px; }
-
-  .navlink {
-    appearance: none;
-    background: none;
-    border: 0;
-    border-radius: 6px;
-    padding: 6px 10px;
-    color: var(--text-dim);
-    font-size: 13.5px;
-    cursor: pointer;
-  }
-
-  .navlink:hover { color: var(--text); background: var(--bg-hover); }
-
-  /* ---------- layout ---------- */
-
-  .shell {
-    max-width: var(--shell);
-    margin: 0 auto;
-    padding: 28px 24px 64px;
-  }
+  .bench-wrap { padding: 34px 0 8px; }
 
   .meta-row {
     display: flex;
     align-items: flex-end;
     justify-content: space-between;
     gap: 16px;
-    padding-bottom: 18px;
+    padding-bottom: 16px;
     border-bottom: 1px solid var(--line-soft);
     flex-wrap: wrap;
   }
@@ -125,26 +46,29 @@
   }
 
   .server-pick:hover { color: #fff; }
-  .server-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+  .server-pick .caret { width: 13px; height: 13px; color: var(--text-faint); transition: color var(--dur-fast) var(--ease), transform var(--dur) var(--ease); }
+  .server-pick:hover .caret { color: var(--accent); transform: translateY(1px); }
 
-  .server-pick .caret {
-    width: 13px;
-    height: 13px;
-    color: var(--text-faint);
-    transition: color 140ms ease;
-  }
-
-  .server-pick:hover .caret { color: var(--accent); }
-
+  .meta-cell { min-width: 0; }
   .meta-row .meta-cell:last-child { text-align: right; }
 
-  /* ---------- gauge ---------- */
+  .client-line {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    flex-wrap: wrap;
+    color: var(--text-dim);
+    font-size: 13.5px;
+  }
+
+  .client-sep { color: #4a4a4a; }
+  #clientIp { font-family: var(--mono); font-size: 12.5px; }
 
   .bench {
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: 34px 0 30px;
+    padding: 30px 0 26px;
   }
 
   .gauge {
@@ -155,30 +79,36 @@
 
   .gauge svg { display: block; width: 100%; height: 100%; overflow: visible; }
 
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    border: 0;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
-
-  .track {
-    fill: none;
-    stroke: #232323;
-    stroke-width: 9;
-    stroke-linecap: round;
-  }
+  .track { fill: none; stroke: #232323; stroke-width: 9; stroke-linecap: round; }
 
   .prog {
     fill: none;
     stroke: var(--accent);
     stroke-width: 9;
     stroke-linecap: round;
-    transition: stroke 260ms ease;
+    transition: stroke 260ms var(--ease);
+  }
+
+  /* Soft halo behind the arc: only visible while a transfer is running. */
+  .glow {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 18;
+    stroke-linecap: round;
+    opacity: 0;
+    filter: blur(9px);
+    transition: opacity var(--dur-slow) var(--ease), stroke 260ms var(--ease);
+  }
+
+  .bench-wrap[data-phase="download"] .glow,
+  .bench-wrap[data-phase="upload"] .glow { opacity: 0.26; }
+
+  .bench-wrap[data-phase="download"] .prog,
+  .bench-wrap[data-phase="upload"] .prog { animation: arc-breathe 2.6s var(--ease) infinite; }
+
+  @keyframes arc-breathe {
+    0%, 100% { stroke-width: 9; }
+    50% { stroke-width: 10.2; }
   }
 
   .readout {
@@ -202,11 +132,7 @@
     min-width: 4.6ch;
   }
 
-  .unit {
-    margin-top: 7px;
-    color: var(--text-dim);
-    font-size: 12.5px;
-  }
+  .unit { margin-top: 7px; color: var(--text-dim); font-size: 12.5px; }
 
   .phase {
     position: absolute;
@@ -216,7 +142,10 @@
     color: var(--text-faint);
     font-size: 12.5px;
     text-align: center;
+    transition: color var(--dur) var(--ease);
   }
+
+  .bench-wrap[data-phase="done"] .phase { color: var(--accent); }
 
   .primary {
     display: inline-flex;
@@ -224,24 +153,27 @@
     justify-content: center;
     gap: 8px;
     min-width: 152px;
-    margin-top: 22px;
+    margin-top: 20px;
     padding: 11px 22px;
     border: 1px solid transparent;
-    border-radius: 8px;
+    border-radius: var(--r-md);
     background: var(--accent);
     color: var(--accent-ink);
     font-size: 14.5px;
     font-weight: 600;
     cursor: pointer;
-    transition: background 140ms ease, border-color 140ms ease;
+    transition: background var(--dur-fast) var(--ease),
+                border-color var(--dur-fast) var(--ease),
+                color var(--dur-fast) var(--ease),
+                transform var(--dur-fast) var(--ease);
   }
 
-  .primary:hover { background: #12e2b7; }
-  .primary:focus-visible { outline: 2px solid #bafff0; outline-offset: 2px; }
+  .primary:hover { background: var(--accent-bright); }
+  .primary:active { transform: translateY(1px); }
 
   .primary[data-mode="running"] {
     background: transparent;
-    border-color: var(--line);
+    border-color: var(--line-strong);
     color: var(--text-dim);
   }
 
@@ -266,9 +198,10 @@
     margin-bottom: 7px;
     color: var(--text-faint);
     font-size: 12.5px;
+    transition: color var(--dur) var(--ease);
   }
 
-  .result .k svg { width: 13px; height: 13px; flex: none; }
+  .result .k svg { width: 13px; height: 13px; }
 
   .result .v {
     font-family: var(--mono);
@@ -279,9 +212,19 @@
 
   .result .u { margin-left: 4px; color: var(--text-faint); font-size: 11.5px; }
 
+  /* A figure "lands" when it changes: brief tint plus a 1px rise. */
+  .result.is-set .v { animation: figure-land 420ms var(--ease-out); }
+  .result.is-set .k { color: var(--text-dim); }
+
+  @keyframes figure-land {
+    0% { color: var(--accent); transform: translateY(2px); opacity: 0.6; }
+    60% { color: var(--accent); }
+    100% { color: inherit; transform: none; opacity: 1; }
+  }
+
   /* ---------- chart ---------- */
 
-  .chart-block { margin-top: 30px; }
+  .chart-block { margin-top: 28px; }
 
   .chart-head {
     display: flex;
@@ -294,12 +237,7 @@
 
   .chart-title { color: var(--text-dim); }
 
-  .chart-legend {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-faint);
-  }
+  .chart-legend { display: inline-flex; align-items: center; gap: 6px; }
 
   .chart-legend::before {
     content: "";
@@ -310,13 +248,13 @@
     opacity: 0.85;
   }
 
-  .chart-axis { margin-left: auto; color: var(--text-faint); }
+  .chart-axis { margin-left: auto; }
 
   #wave { display: block; width: 100%; height: 172px; }
 
   /* ---------- history ---------- */
 
-  .history { margin-top: 40px; }
+  .history { margin-top: 34px; }
 
   .history-head {
     display: flex;
@@ -326,93 +264,110 @@
     margin-bottom: 14px;
   }
 
-  .history h2 {
-    margin: 0;
-    font-size: 13.5px;
-    font-weight: 600;
-    color: var(--text);
-  }
+  .history h2 { font-size: 13.5px; }
 
   .copy-wrap { display: inline-flex; align-items: center; gap: 8px; }
-
   .copy-note { color: var(--text-faint); font-size: 12px; }
 
-  .ghost-btn {
-    padding: 5px 10px;
+  .history tbody tr { animation: row-in 320ms var(--ease-out) both; animation-delay: calc(var(--i, 0) * 45ms); }
+
+  @keyframes row-in {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  /* ---------- feature strip ---------- */
+
+  .feature-strip {
+    margin-top: 60px;
+    padding-top: 34px;
+    border-top: 1px solid var(--line-soft);
+  }
+
+  .feature {
+    padding: 18px 20px 20px;
+  }
+
+  .feature .icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    margin-bottom: 13px;
     border: 1px solid var(--line);
-    border-radius: 6px;
-    background: none;
-    color: var(--text-dim);
-    font-size: 12.5px;
-    cursor: pointer;
+    border-radius: var(--r-sm);
+    color: var(--accent);
   }
 
-  .ghost-btn:hover { border-color: #3a3a3a; background: var(--bg-hover); color: var(--text); }
-  .ghost-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .feature .icon svg { width: 15px; height: 15px; }
 
-  /* ---------- client meta ---------- */
+  .feature h3 { font-size: 14px; }
+  .feature p { margin-top: 7px; color: var(--text-dim); font-size: 13.5px; }
 
-  .meta-cell { min-width: 0; }
+  /* ---------- node table ---------- */
 
-  .client-line {
-    display: flex;
-    align-items: baseline;
-    gap: 7px;
-    flex-wrap: wrap;
-    color: var(--text-dim);
-    font-size: 13.5px;
-  }
+  .nodes { margin-top: 56px; }
 
-  .client-sep { color: #4a4a4a; }
+  .node-row:hover td { color: var(--text); }
 
-  #clientIp { font-family: var(--mono); font-size: 12.5px; letter-spacing: -0.01em; }
+  /* ---------- faq ---------- */
 
-  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .faq { margin-top: 56px; max-width: var(--shell-narrow); }
 
-  th {
-    padding: 0 12px 9px 0;
-    border-bottom: 1px solid var(--line);
-    color: var(--text-faint);
-    font-size: 12.5px;
-    font-weight: 500;
-    text-align: left;
-    white-space: nowrap;
-  }
-
-  td {
-    padding: 10px 12px 10px 0;
+  .faq details {
     border-bottom: 1px solid var(--line-soft);
-    color: var(--text-dim);
-    white-space: nowrap;
   }
 
-  th:last-child, td:last-child { padding-right: 0; text-align: right; }
-  td:first-child { color: var(--text); }
-  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-  .empty td { color: var(--text-faint); }
-
-  /* ---------- footer ---------- */
-
-  .site-foot {
-    border-top: 1px solid var(--line);
-  }
-
-  .site-foot .inner {
+  .faq summary {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 12px 20px;
-    flex-wrap: wrap;
-    max-width: var(--shell);
-    margin: 0 auto;
-    padding: 18px 24px;
-    color: var(--text-faint);
-    font-size: 12.5px;
+    gap: 14px;
+    padding: 15px 0;
+    color: var(--text);
+    font-size: 14px;
+    cursor: pointer;
+    list-style: none;
   }
 
-  .foot-links { display: flex; align-items: center; gap: 4px; }
+  .faq summary::-webkit-details-marker { display: none; }
 
-  .foot-links .navlink { font-size: 12.5px; padding: 4px 8px; }
+  .faq summary .sign {
+    position: relative;
+    width: 13px;
+    height: 13px;
+    flex: none;
+    color: var(--text-faint);
+  }
+
+  .faq summary .sign::before,
+  .faq summary .sign::after {
+    content: "";
+    position: absolute;
+    background: currentColor;
+    transition: transform var(--dur) var(--ease);
+  }
+
+  .faq summary .sign::before { left: 0; right: 0; top: 6px; height: 1.5px; }
+  .faq summary .sign::after { top: 0; bottom: 0; left: 6px; width: 1.5px; }
+
+  .faq details[open] summary .sign::after { transform: scaleY(0); }
+  .faq details[open] summary .sign { color: var(--accent); }
+
+  .faq details p {
+    padding: 0 0 16px;
+    color: var(--text-dim);
+    font-size: 13.5px;
+    max-width: 62ch;
+  }
+
+  .faq details > *:not(summary) { animation: faq-in 260ms var(--ease-out); }
+
+  @keyframes faq-in {
+    from { opacity: 0; transform: translateY(-3px); }
+    to { opacity: 1; transform: none; }
+  }
 
   /* ---------- dialogs ---------- */
 
@@ -421,12 +376,19 @@
     max-width: 520px;
     padding: 0;
     border: 1px solid var(--line);
-    border-radius: 10px;
+    border-radius: var(--r-lg);
     background: var(--bg-elev);
     color: var(--text);
   }
 
   dialog::backdrop { background: rgba(0, 0, 0, 0.62); }
+
+  dialog[open] { animation: dlg-in 220ms var(--ease-out); }
+
+  @keyframes dlg-in {
+    from { opacity: 0; transform: translateY(6px) scale(0.995); }
+    to { opacity: 1; transform: none; }
+  }
 
   .dlg-head {
     display: flex;
@@ -437,7 +399,7 @@
     border-bottom: 1px solid var(--line-soft);
   }
 
-  .dlg-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+  .dlg-head h2 { font-size: 14px; }
 
   .icon-btn {
     display: inline-flex;
@@ -447,37 +409,15 @@
     height: 28px;
     padding: 0;
     border: 0;
-    border-radius: 6px;
+    border-radius: var(--r-sm);
     background: none;
     color: var(--text-faint);
     cursor: pointer;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
   }
 
   .icon-btn:hover { background: var(--bg-hover); color: var(--text); }
   .icon-btn svg { width: 15px; height: 15px; }
-
-  .dlg-body { padding: 16px; color: var(--text-dim); font-size: 13.5px; }
-  .dlg-body p { margin: 0 0 12px; }
-  .dlg-body p:last-child { margin-bottom: 0; }
-  .dlg-body strong { color: var(--text); font-weight: 600; }
-  .dlg-body code {
-    padding: 1px 5px;
-    border-radius: 4px;
-    background: #202020;
-    color: #d6d6d6;
-    font-family: var(--mono);
-    font-size: 12.5px;
-  }
-
-  .status-line { display: flex; align-items: center; gap: 9px; margin-bottom: 14px; color: var(--text); }
-  .status-line .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
-
-  .status-table { width: 100%; font-size: 13px; }
-  .status-table td { border-bottom: 1px solid var(--line-soft); }
-  .status-table tr:last-child td { border-bottom: 0; }
-  .status-table td:last-child { text-align: right; color: var(--accent); }
-
-  /* server list */
 
   .srv-list { padding: 4px 0; max-height: 62vh; overflow: auto; }
 
@@ -495,6 +435,7 @@
     font-size: 13.5px;
     text-align: left;
     cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
   }
 
   .srv:last-child { border-bottom: 0; }
@@ -510,8 +451,7 @@
 
   /* ---------- responsive ---------- */
 
-  @media (max-width: 640px) {
-    .shell { padding: 20px 18px 52px; }
+  @media (max-width: 720px) {
     .results { grid-template-columns: repeat(2, 1fr); }
     .result { padding: 14px 12px 14px 0; }
     .result + .result { padding-left: 0; border-left: 0; }
@@ -520,148 +460,298 @@
     #wave { height: 140px; }
     .meta-row { align-items: flex-start; }
     .meta-row .meta-cell:last-child { text-align: left; }
-    .client-line { font-size: 13px; }
-    .history-head { flex-wrap: wrap; }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .prog, .primary, .server-pick .caret { transition: none; }
+    .feature-strip { margin-top: 44px; }
+    .nodes, .faq { margin-top: 40px; }
   }
 </style>
 </head>
-<body>
+<body class="page">
+
+<a class="skip-link" href="#main">Skip to content</a>
 
 <header class="topbar">
-  <a class="brand" href="/" aria-label="Netmeter home">
-    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-      <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-    </svg>
-    <span>Netmeter</span>
-  </a>
-  <nav class="topnav" aria-label="Primary">
-    <button type="button" class="navlink" data-dialog="dlg-status">Status</button>
-    <button type="button" class="navlink" data-dialog="dlg-api">API</button>
-    <button type="button" class="navlink" data-dialog="dlg-about">About</button>
-  </nav>
-</header>
-
-<main class="shell">
-
-  <h1 class="sr-only">Netmeter internet speed test</h1>
-
-  <div class="meta-row">
-    <div class="meta-cell">
-      <div class="field-label">Test server</div>
-      <button type="button" class="server-pick" id="serverPick" aria-haspopup="dialog">
-        <span id="serverName">Hong Kong — HKIX</span>
-        <svg class="caret" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path d="M4 6.5L8 10.5l4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <div class="inner">
+    <a class="brand" href="index.html" aria-label="Netmeter home">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+      <span>Netmeter</span>
+    </a>
+    <nav class="topnav" id="primary-nav" aria-label="Primary">
+      <a class="navlink" href="index.html" aria-current="page">Speed test</a>
+      <a class="navlink" href="status.html">Status</a>
+      <a class="navlink" href="api.html">API</a>
+      <a class="navlink" href="about.html">About</a>
+    </nav>
+    <div class="topbar-actions">
+      <button type="button" class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false" aria-controls="primary-nav">
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" width="15" height="15">
+          <path d="M2 4.5h12M2 8h12M2 11.5h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
         </svg>
       </button>
     </div>
-    <div class="meta-cell meta-client">
-      <div class="field-label">Your connection</div>
-      <div class="client-line">
-        <span id="clientIsp">City Telecom</span>
-        <span class="client-sep">·</span>
-        <span id="clientAsn">AS64500</span>
-        <span class="client-sep">·</span>
-        <span id="clientIp">203.0.113.42</span>
-      </div>
-    </div>
   </div>
+</header>
 
-  <section class="bench" aria-label="Speed test">
-    <div class="gauge">
-      <div class="sr-only" aria-live="polite" id="gaugeLive">Ready</div>
-      <svg viewBox="0 0 300 300" aria-hidden="true">
-        <g id="ticks"></g>
-        <path class="track" d="M59.5 240.5A128 128 0 1 1 240.5 240.5" pathLength="100"/>
-        <path class="prog" id="prog" d="M59.5 240.5A128 128 0 1 1 240.5 240.5" pathLength="100" stroke-dasharray="0 100"/>
-      </svg>
-      <div class="readout">
-        <div class="value" id="value">0.00</div>
-        <div class="unit" id="unit">Mbps</div>
-      </div>
-      <div class="phase" id="phase">Ready</div>
-    </div>
-    <button type="button" class="primary" id="goBtn" data-mode="idle">Start test</button>
-  </section>
+<main class="main" id="main">
 
-  <section class="results" aria-label="Latest results" aria-live="polite">
-    <div class="result">
-      <div class="k">
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M1.5 8h2.2l1.6-4.4L8 12.4l1.8-4.9 1.3 2.2h3.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Ping
-      </div>
-      <div class="v"><span id="rPing">—</span><span class="u">ms</span></div>
-    </div>
-    <div class="result">
-      <div class="k">
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.2v11.6M4 6.2L8 2.2l4 4M4 9.8l4 4 4-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Jitter
-      </div>
-      <div class="v"><span id="rJitter">—</span><span class="u">ms</span></div>
-    </div>
-    <div class="result">
-      <div class="k">
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.5v11M3.8 9.3L8 13.5l4.2-4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Download
-      </div>
-      <div class="v"><span id="rDown">—</span><span class="u">Mbps</span></div>
-    </div>
-    <div class="result">
-      <div class="k">
-        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 13.5v-11M3.8 6.7L8 2.5l4.2 4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Upload
-      </div>
-      <div class="v"><span id="rUp">—</span><span class="u">Mbps</span></div>
-    </div>
-  </section>
+  <div class="shell">
 
-  <section class="chart-block" aria-label="Throughput">
-    <div class="chart-head">
-      <span class="chart-title" id="chartLabel">Throughput</span>
-      <span class="chart-legend" id="chartLegend">Idle</span>
-      <span class="chart-axis">Mbps</span>
-    </div>
-    <canvas id="wave"></canvas>
-  </section>
+    <h1 class="sr-only">Netmeter internet speed test</h1>
+    <div class="bench-wrap" data-speedtest data-phase="idle">
 
-  <section class="history" aria-label="Recent tests">
-    <div class="history-head">
-      <h2>Recent tests</h2>
-      <span class="copy-wrap">
-        <span class="copy-note" id="copyNote" aria-live="polite"></span>
-        <button type="button" class="ghost-btn" id="copyBtn">Copy result</button>
-      </span>
+      <div class="meta-row">
+        <div class="meta-cell">
+          <div class="field-label">Test server</div>
+          <button type="button" class="server-pick" id="serverPick" aria-haspopup="dialog">
+            <span id="serverName">Hong Kong — HKIX</span>
+            <svg class="caret" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M4 6.5L8 10.5l4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="meta-cell">
+          <div class="field-label">Your connection</div>
+          <div class="client-line">
+            <span id="clientIsp">City Telecom</span>
+            <span class="client-sep">·</span>
+            <span id="clientAsn">AS64500</span>
+            <span class="client-sep">·</span>
+            <span id="clientIp">203.0.113.42</span>
+          </div>
+        </div>
+      </div>
+
+      <section class="bench" aria-label="Speed test">
+        <div class="gauge">
+          <div class="sr-only" aria-live="polite" id="gaugeLive">Ready</div>
+          <svg viewBox="0 0 300 300" aria-hidden="true">
+            <g id="ticks"></g>
+            <path class="track" d="M59.5 240.5A128 128 0 1 1 240.5 240.5" pathLength="100"/>
+            <path class="glow" id="progGlow" d="M59.5 240.5A128 128 0 1 1 240.5 240.5" pathLength="100" stroke-dasharray="0 100"/>
+            <path class="prog" id="prog" d="M59.5 240.5A128 128 0 1 1 240.5 240.5" pathLength="100" stroke-dasharray="0 100"/>
+          </svg>
+          <div class="readout">
+            <div class="value" id="value">0.00</div>
+            <div class="unit" id="unit">Mbps</div>
+          </div>
+          <div class="phase" id="phase">Ready</div>
+        </div>
+        <button type="button" class="primary" id="goBtn" data-mode="idle">Start test</button>
+      </section>
+
+      <section class="results" aria-label="Latest results" aria-live="polite">
+        <div class="result">
+          <div class="k">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M1.5 8h2.2l1.6-4.4L8 12.4l1.8-4.9 1.3 2.2h3.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Ping
+          </div>
+          <div class="v"><span id="rPing">—</span><span class="u">ms</span></div>
+        </div>
+        <div class="result">
+          <div class="k">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.2v11.6M4 6.2L8 2.2l4 4M4 9.8l4 4 4-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Jitter
+          </div>
+          <div class="v"><span id="rJitter">—</span><span class="u">ms</span></div>
+        </div>
+        <div class="result">
+          <div class="k">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.5v11M3.8 9.3L8 13.5l4.2-4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Download
+          </div>
+          <div class="v"><span id="rDown">—</span><span class="u">Mbps</span></div>
+        </div>
+        <div class="result">
+          <div class="k">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 13.5v-11M3.8 6.7L8 2.5l4.2 4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Upload
+          </div>
+          <div class="v"><span id="rUp">—</span><span class="u">Mbps</span></div>
+        </div>
+      </section>
+
+      <section class="chart-block" aria-label="Throughput">
+        <div class="chart-head">
+          <span class="chart-title" id="chartLabel">Throughput</span>
+          <span class="chart-legend" id="chartLegend">Idle</span>
+          <span class="chart-axis">Mbps</span>
+        </div>
+        <canvas id="wave"></canvas>
+      </section>
+
+      <section class="history" aria-label="Recent tests">
+        <div class="history-head">
+          <h2>Recent tests</h2>
+          <span class="copy-wrap">
+            <span class="copy-note" id="copyNote" aria-live="polite"></span>
+            <button type="button" class="btn btn-outline btn-sm" id="copyBtn">Copy result</button>
+          </span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Time</th>
+              <th scope="col">Server</th>
+              <th scope="col">Ping</th>
+              <th scope="col">Download</th>
+              <th scope="col">Upload</th>
+            </tr>
+          </thead>
+          <tbody id="historyBody">
+            <tr class="empty"><td colspan="5">No tests yet.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
     </div>
-    <table>
-      <thead>
-        <tr>
-          <th scope="col">Time</th>
-          <th scope="col">Server</th>
-          <th scope="col">Ping</th>
-          <th scope="col">Download</th>
-          <th scope="col">Upload</th>
-        </tr>
-      </thead>
-      <tbody id="historyBody">
-        <tr class="empty"><td colspan="5">No tests yet.</td></tr>
-      </tbody>
-    </table>
-  </section>
+
+    <section class="feature-strip" aria-label="How it works">
+      <div class="section-head" data-reveal>
+        <div>
+          <h2>What the numbers mean</h2>
+          <p>Every run reports four figures from the same measurement window.</p>
+        </div>
+        <a class="btn btn-ghost btn-sm" href="about.html">
+          Measurement notes
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 3.5L10.5 8 6 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </a>
+      </div>
+
+      <div class="grid grid-3" data-reveal-group>
+        <article class="card feature lift">
+          <span class="icon">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.5v11M3.8 9.3L8 13.5l4.2-4.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <h3>Download</h3>
+          <p>Throughput from the node to this browser, measured once the slow-start ramp settles.</p>
+        </article>
+        <article class="card feature lift">
+          <span class="icon">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 13.5v-11M3.8 6.7L8 2.5l4.2 4.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <h3>Upload</h3>
+          <p>Throughput from this browser back to the node. Most consumer links cap this far below the download figure.</p>
+        </article>
+        <article class="card feature lift">
+          <span class="icon">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M1.5 8h2.2l1.6-4.4L8 12.4l1.8-4.9 1.3 2.2h3.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <h3>Ping &amp; jitter</h3>
+          <p>Eight sequential probes give the mean round-trip time; jitter is the deviation between them.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="nodes" aria-label="Test nodes">
+      <div class="section-head" data-reveal>
+        <div>
+          <h2>Test node network</h2>
+          <p>Nodes are hosted at public internet exchange points.</p>
+        </div>
+        <a class="btn btn-ghost btn-sm" href="status.html">
+          Live status
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 3.5L10.5 8 6 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </a>
+      </div>
+
+      <div class="card" data-reveal>
+        <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Location</th>
+              <th scope="col">Exchange</th>
+              <th scope="col">Operator</th>
+              <th scope="col">Capacity</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="node-row"><td>Hong Kong</td><td class="mono">HKIX</td><td>Netmeter APAC</td><td class="num">940 Mbps</td><td><span class="pill pill-ok"><span class="dot"></span>Online</span></td></tr>
+            <tr class="node-row"><td>Singapore</td><td class="mono">SGIX</td><td>Netmeter APAC</td><td class="num">880 Mbps</td><td><span class="pill pill-ok"><span class="dot"></span>Online</span></td></tr>
+            <tr class="node-row"><td>Tokyo</td><td class="mono">JPIX</td><td>Netmeter Japan</td><td class="num">790 Mbps</td><td><span class="pill pill-ok"><span class="dot"></span>Online</span></td></tr>
+            <tr class="node-row"><td>Los Angeles</td><td class="mono">Any2 West</td><td>Netmeter US</td><td class="num">640 Mbps</td><td><span class="pill pill-ok"><span class="dot"></span>Online</span></td></tr>
+            <tr class="node-row"><td>Frankfurt</td><td class="mono">DE-CIX</td><td>Netmeter EU</td><td class="num">560 Mbps</td><td><span class="pill pill-ok"><span class="dot"></span>Online</span></td></tr>
+            <tr class="node-row"><td>Sydney</td><td class="mono">Equinix SY1</td><td>Netmeter Oceania</td><td class="num">480 Mbps</td><td><span class="pill pill-ok"><span class="dot"></span>Online</span></td></tr>
+          </tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="faq" aria-label="Frequently asked questions">
+      <div class="section-head" data-reveal>
+        <div><h2>Questions</h2></div>
+      </div>
+
+      <div data-reveal>
+        <details open>
+          <summary>Why is my upload figure so much lower?<span class="sign" aria-hidden="true"></span></summary>
+          <p>Most residential and mobile plans are asymmetric. The upload reading reflects the link you actually have, not the node capacity.</p>
+        </details>
+        <details>
+          <summary>Does the result use all of my bandwidth?<span class="sign" aria-hidden="true"></span></summary>
+          <p>A run opens a small number of parallel streams for about twenty seconds. Other traffic on the same link will compete with it, so close large downloads first for a clean figure.</p>
+        </details>
+        <details>
+          <summary>Is any of this stored?<span class="sign" aria-hidden="true"></span></summary>
+          <p>Recent results stay in this browser's local storage only. Nothing is uploaded and no account is created. See <a href="legal.html">terms &amp; privacy</a>.</p>
+        </details>
+        <details>
+          <summary>Can I automate a test?<span class="sign" aria-hidden="true"></span></summary>
+          <p>Yes — the measurement endpoints are documented on the <a href="api.html">API page</a>, with rate limits noted there.</p>
+        </details>
+      </div>
+    </section>
+  </div>
 
 </main>
 
 <footer class="site-foot">
   <div class="inner">
-    <span>© 2025 Netmeter. All rights reserved.</span>
-    <span class="foot-links">
-      <button type="button" class="navlink" data-dialog="dlg-legal">Terms</button>
-      <button type="button" class="navlink" data-dialog="dlg-legal">Privacy</button>
-      <button type="button" class="navlink" data-dialog="dlg-about">Contact</button>
+    <div class="foot-brand">
+      <a class="brand" href="index.html">
+        <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <span>Netmeter</span>
+      </a>
+      <p>Browser-based throughput and latency measurement against a network of exchange-hosted nodes.</p>
+    </div>
+    <div class="foot-col">
+      <h3>Product</h3>
+      <ul>
+        <li><a href="index.html">Speed test</a></li>
+        <li><a href="status.html">Node status</a></li>
+        <li><a href="api.html">Measurement API</a></li>
+      </ul>
+    </div>
+    <div class="foot-col">
+      <h3>Company</h3>
+      <ul>
+        <li><a href="about.html">About</a></li>
+        <li><a href="about.html#method">Methodology</a></li>
+        <li><a href="about.html#contact">Contact</a></li>
+      </ul>
+    </div>
+    <div class="foot-col">
+      <h3>Legal</h3>
+      <ul>
+        <li><a href="legal.html">Terms of use</a></li>
+        <li><a href="legal.html#privacy">Privacy</a></li>
+        <li><a href="legal.html#cookies">Cookies</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="foot-base">
+    <span>© <span data-year>2025</span> Netmeter. All rights reserved.</span>
+    <span class="meta">
+      <span class="mono">build 2.6.0</span>
+      <span class="sep">·</span>
+      <span>No account required</span>
     </span>
   </div>
 </footer>
@@ -676,822 +766,26 @@
   <div class="srv-list" id="srvList" role="listbox" aria-label="Available test servers"></div>
 </dialog>
 
-<dialog id="dlg-status" aria-labelledby="dlg-status-title">
-  <div class="dlg-head">
-    <h2 id="dlg-status-title">Service status</h2>
-    <button type="button" class="icon-btn dlg-close" aria-label="Close">
-      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-    </button>
-  </div>
-  <div class="dlg-body">
-    <div class="status-line"><span class="dot"></span>All systems operational</div>
-    <table class="status-table">
-      <tbody>
-        <tr><td>Web frontend</td><td>Operational</td></tr>
-        <tr><td>Test nodes</td><td>Operational</td></tr>
-        <tr><td>Measurement API</td><td>Operational</td></tr>
-        <tr><td>Result storage</td><td>Operational</td></tr>
-      </tbody>
-    </table>
-  </div>
-</dialog>
-
-<dialog id="dlg-api" aria-labelledby="dlg-api-title">
-  <div class="dlg-head">
-    <h2 id="dlg-api-title">Measurement API</h2>
-    <button type="button" class="icon-btn dlg-close" aria-label="Close">
-      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-    </button>
-  </div>
-  <div class="dlg-body">
-    <p><strong>Node metadata</strong><br><code>GET /api/v1/nodes</code> — returns the node list with location, provider and advertised capacity.</p>
-    <p><strong>Latency probe</strong><br><code>GET /api/v1/latency?node=…</code> — issues five sequential probes and reports round-trip time with jitter and packet loss.</p>
-    <p>Access is rate limited to 60 requests per minute per address. Bulk access requires an API key issued to registered operators.</p>
-  </div>
-</dialog>
-
-<dialog id="dlg-about" aria-labelledby="dlg-about-title">
-  <div class="dlg-head">
-    <h2 id="dlg-about-title">About Netmeter</h2>
-    <button type="button" class="icon-btn dlg-close" aria-label="Close">
-      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-    </button>
-  </div>
-  <div class="dlg-body">
-    <p>Netmeter measures the throughput and responsiveness of your connection against a network of test nodes hosted at internet exchange points.</p>
-    <p>Each test sends eight latency probes, ramps up a small number of parallel streams, then reports the mean of the settled second half of the run so slow start does not distort the figure.</p>
-    <p>No account is required. Tests run in the browser and results stay on this device unless you choose to export them.</p>
-    <p>Support: <code>support@netmeter.example</code></p>
-  </div>
-</dialog>
-
-<dialog id="dlg-legal" aria-labelledby="dlg-legal-title">
-  <div class="dlg-head">
-    <h2 id="dlg-legal-title">Terms &amp; privacy</h2>
-    <button type="button" class="icon-btn dlg-close" aria-label="Close">
-      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-    </button>
-  </div>
-  <div class="dlg-body">
-    <p><strong>Terms of use</strong><br>The service is provided as-is for personal and internal diagnostics. Automated or excessive use of the measurement endpoints may be throttled.</p>
-    <p><strong>Privacy</strong><br>We do not require an account and do not sell measurement data. Aggregate statistics may be retained to operate the node network.</p>
-    <p><strong>Cookies</strong><br>This site does not set advertising or tracking cookies.</p>
-  </div>
-</dialog>
-
+<script src="assets/site.js" defer></script>
+<script src="assets/speedtest.js" defer></script>
 <script>
-(function () {
-  "use strict";
-
-  var $ = function (sel, root) { return (root || document).querySelector(sel); };
-
-  var COLOR = { download: "#00d4aa", upload: "#f0a13c", ping: "#d6d6d6", idle: "#00d4aa" };
-  var PHASE_TEXT = {
-    idle: "Ready",
-    ping: "Measuring latency",
-    download: "Testing download",
-    upload: "Testing upload",
-    done: "Test complete",
-    stopped: "Stopped"
-  };
-  var SAMPLE_CAP = 120;
-  var PING_SAMPLES = 8;
-  var HISTORY_KEY = "nm.recent";
-  var HISTORY_MAX = 6;
-  var UPLOAD_CEILING = 100;
-  var SAMPLE_INTERVAL = 0.22;  // seconds of wall clock between chart samples
-
-  /* down = advertised node capacity in Mbps; upload is always capped by UPLOAD_CEILING. */
-  var servers = [
-    { id: "hkg", city: "Hong Kong", site: "HKIX", sponsor: "Netmeter APAC", down: 940, ping: 11, spread: 1.2 },
-    { id: "sin", city: "Singapore", site: "SGIX", sponsor: "Netmeter APAC", down: 880, ping: 34, spread: 2.4 },
-    { id: "nrt", city: "Tokyo", site: "JPIX", sponsor: "Netmeter Japan", down: 790, ping: 47, spread: 3.1 },
-    { id: "lax", city: "Los Angeles", site: "Any2 West", sponsor: "Netmeter US", down: 640, ping: 148, spread: 6.8 },
-    { id: "fra", city: "Frankfurt", site: "DE-CIX", sponsor: "Netmeter EU", down: 560, ping: 196, spread: 9.4 },
-    { id: "syd", city: "Sydney", site: "Equinix SY1", sponsor: "Netmeter Oceania", down: 480, ping: 172, spread: 8.2 }
-  ];
-
-  var ISP_POOL = [
-    { isp: "City Telecom", asn: "AS64500" },
-    { isp: "Harbour Broadband", asn: "AS64501" },
-    { isp: "Meridian Networks", asn: "AS64510" },
-    { isp: "Northline Cable", asn: "AS64522" }
-  ];
-
-  var state = {
-    server: servers[0],
-    isp: ISP_POOL[0],
-    running: false,
-    cancelled: false,
-    phase: "idle",
-    result: { down: null, up: null, ping: null, jitter: null },
-    history: []
-  };
-
-  var el = {
-    value: $("#value"),
-    unit: $("#unit"),
-    phase: $("#phase"),
-    live: $("#gaugeLive"),
-    prog: $("#prog"),
-    ticks: $("#ticks"),
-    goBtn: $("#goBtn"),
-    serverName: $("#serverName"),
-    serverPick: $("#serverPick"),
-    srvList: $("#srvList"),
-    rPing: $("#rPing"),
-    rJitter: $("#rJitter"),
-    rDown: $("#rDown"),
-    rUp: $("#rUp"),
-    historyBody: $("#historyBody"),
-    chartLabel: $("#chartLabel"),
-    chartLegend: $("#chartLegend"),
-    canvas: $("#wave"),
-    clientIsp: $("#clientIsp"),
-    clientAsn: $("#clientAsn"),
-    clientIp: $("#clientIp"),
-    copyBtn: $("#copyBtn"),
-    copyNote: $("#copyNote")
-  };
-
-  var ctx = el.canvas.getContext("2d");
-  var samples = [];
-  var chartDirty = true;
-
-  /* ---------- helpers ---------- */
-
-  function rand(min, max) { return min + Math.random() * (max - min); }
-
-  function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
-
-  function fixed(n, d) { return n.toFixed(d); }
-
-  function hexToRgba(hex, alpha) {
-    var v = parseInt(hex.slice(1), 16);
-    return "rgba(" + ((v >> 16) & 255) + "," + ((v >> 8) & 255) + "," + (v & 255) + "," + alpha + ")";
-  }
-
-  function niceMax(v) {
-    if (v <= 10) return 10;
-    var step = Math.pow(10, Math.floor(Math.log10(v)));
-    var n = Math.ceil(v / step) * step;
-    return n;
-  }
-
-  function fmtAxis(v) {
-    if (v >= 1000) return (v / 1000).toFixed(1).replace(/\.0$/, "") + "G";
-    if (v >= 100) return String(Math.round(v));
-    if (v >= 10) return String(Math.round(v));
-    return v.toFixed(1).replace(/\.0$/, "");
-  }
-
-  /* ---------- gauge ---------- */
-
-  function buildTicks() {
-    var svgNs = "http://www.w3.org/2000/svg";
-    var frag = document.createDocumentFragment();
-    for (var i = 0; i <= 44; i++) {
-      var major = i % 5 === 0;
-      var angle = (135 + (270 * i) / 44) * Math.PI / 180;
-      var r1 = major ? 133 : 136;
-      var r2 = 141;
-      var line = document.createElementNS(svgNs, "line");
-      line.setAttribute("x1", (150 + r1 * Math.cos(angle)).toFixed(2));
-      line.setAttribute("y1", (150 + r1 * Math.sin(angle)).toFixed(2));
-      line.setAttribute("x2", (150 + r2 * Math.cos(angle)).toFixed(2));
-      line.setAttribute("y2", (150 + r2 * Math.sin(angle)).toFixed(2));
-      line.setAttribute("stroke", major ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.12)");
-      line.setAttribute("stroke-width", "1");
-      frag.appendChild(line);
-    }
-    el.ticks.appendChild(frag);
-  }
-
-  /* ---------- gauge + readout ---------- */
-
-  var gauge = {
-    value: 0,        // displayed value
-    target: 0,       // value we are easing toward
-    progress: 0,     // smoothed arc fraction
-    progressTarget: 0,
-    color: COLOR.idle
-  };
-
-  /* Compresses a linear rate onto the arc: 1000 Mbps fills the dial. */
-  function rateToArc(v) {
-    if (v <= 0) return 0;
-    return Math.min(1, Math.log10(1 + v) / Math.log10(1 + 1000));
-  }
-
-  /* Latency uses only the first fifth of the arc, so a slow node stays readable. */
-  function latencyToArc(v) {
-    if (v <= 0) return 0;
-    return 0.03 + Math.min(0.22, Math.log10(1 + v) / Math.log10(1 + 500) * 0.22);
-  }
-
-  function setArc(p, color) {
-    if (color && color !== gauge.color) {
-      gauge.color = color;
-      el.prog.style.stroke = color;
-    }
-    el.prog.setAttribute("stroke-dasharray", (p * 100).toFixed(2) + " 100");
-  }
-
-  var liveText = "";
-  function announce(text) {
-    if (text === liveText) return;
-    liveText = text;
-    el.live.textContent = text;
-  }
-
-  function setPhase(name) {
-    state.phase = name;
-    el.phase.textContent = PHASE_TEXT[name] || "Ready";
-    el.live.textContent = el.phase.textContent;
-    liveText = el.phase.textContent;
-  }
-
-  function setButton(mode) {
-    el.goBtn.dataset.mode = mode;
-    el.goBtn.textContent = mode === "running" ? "Stop test" : mode === "again" ? "Test again" : "Start test";
-  }
-
-  function setResultCell(key, value, digits) {
-    var target = { ping: el.rPing, jitter: el.rJitter, down: el.rDown, up: el.rUp }[key];
-    if (!target) return;
-    target.textContent = value == null ? "—" : fixed(value, digits);
-  }
-
-  /* ---------- chart ---------- */
-
-  var chart = { w: 0, h: 0 };
-
-  function sizeCanvas() {
-    var rect = el.canvas.getBoundingClientRect();
-    var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    chart.w = Math.max(1, rect.width);
-    chart.h = Math.max(1, rect.height);
-    el.canvas.width = Math.round(chart.w * dpr);
-    el.canvas.height = Math.round(chart.h * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }
-
-  function strokeCurve(pts) {
-    ctx.beginPath();
-    ctx.moveTo(pts[0].x, pts[0].y);
-    if (pts.length === 2) {
-      ctx.lineTo(pts[1].x, pts[1].y);
-      return;
-    }
-    for (var i = 1; i < pts.length - 1; i++) {
-      var xc = (pts[i].x + pts[i + 1].x) / 2;
-      var yc = (pts[i].y + pts[i + 1].y) / 2;
-      ctx.quadraticCurveTo(pts[i].x, pts[i].y, xc, yc);
-    }
-    var last = pts[pts.length - 1];
-    ctx.lineTo(last.x, last.y);
-  }
-
-  function drawChart() {
-    var w = chart.w;
-    var h = chart.h;
-    if (!w || !h) return;
-    ctx.clearRect(0, 0, w, h);
-
-    var padTop = 10;
-    var padBottom = 10;
-    var padRight = 38;
-    var plotH = h - padTop - padBottom;
-    var plotW = Math.max(10, w - padRight);
-
-    var peak = 0;
-    for (var i = 0; i < samples.length; i++) if (samples[i] > peak) peak = samples[i];
-    var vmax = niceMax(Math.max(peak * 1.16, 8));
-
-    var mono = 'ui-monospace, "SF Mono", "Cascadia Mono", "DejaVu Sans Mono", monospace';
-    ctx.font = '11px ' + mono;
-    ctx.textBaseline = "middle";
-    ctx.textAlign = "left";
-
-    for (var g = 0; g <= 3; g++) {
-      var y = padTop + (plotH * g) / 3;
-      ctx.beginPath();
-      ctx.moveTo(0, Math.round(y) + 0.5);
-      ctx.lineTo(plotW, Math.round(y) + 0.5);
-      ctx.strokeStyle = g === 0 ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.055)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-      ctx.fillStyle = "rgba(255,255,255,0.46)";
-      ctx.fillText(fmtAxis(vmax * (1 - g / 3)), plotW + 8, y);
-    }
-
-    if (samples.length < 2) return;
-
-    var offset = SAMPLE_CAP - samples.length;
-    var pts = [];
-    for (var s = 0; s < samples.length; s++) {
-      var ratio = Math.min(1, samples[s] / vmax);
-      var px = (plotW * (offset + s)) / (SAMPLE_CAP - 1);
-      pts.push({
-        x: Math.min(plotW, Math.max(0, px)),
-        y: padTop + plotH - ratio * plotH
-      });
-    }
-
-    var color = COLOR[state.phase === "upload" ? "upload" : "download"];
-
-    var grad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
-    grad.addColorStop(0, hexToRgba(color, 0.2));
-    grad.addColorStop(1, hexToRgba(color, 0));
-    strokeCurve(pts);
-    ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
-    ctx.lineTo(pts[0].x, padTop + plotH);
-    ctx.closePath();
-    ctx.fillStyle = grad;
-    ctx.fill();
-
-    strokeCurve(pts);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.8;
-    ctx.lineJoin = "round";
-    ctx.lineCap = "round";
-    ctx.stroke();
-
-    var head = pts[pts.length - 1];
-    ctx.beginPath();
-    ctx.arc(head.x, head.y, 4.6, 0, Math.PI * 2);
-    ctx.fillStyle = hexToRgba(color, 0.16);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(head.x, head.y, 2.4, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
-  }
-
-  /* Replaces the newest sample so the head dot moves every frame. */
-  function pushSample(v, thin) {
-    if (thin && samples.length) {
-      samples[samples.length - 1] = v;
-      return;
-    }
-    samples.push(v);
-    if (samples.length > SAMPLE_CAP) samples.shift();
-  }
-
-  /* ---------- framing ---------- */
-
-  /*
-   * One loop drives the whole page: the gauge eases toward its target, the
-   * readout follows the gauge, the chart redraws. Deltas are time based so
-   * 30 Hz and 120 Hz panels behave the same.
-   */
-  var lastFrame = 0;
-  var sampleClock = 0;
-  var drift = { value: 0, target: 0, timer: 0 };
-
-  function frame(now) {
-    var dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 0.016;
-    lastFrame = now;
-
-    // Slow drift term: a new normalised offset every 260-560 ms, eased between
-    // them, so the readout keeps moving during the steady part of a transfer.
-    // Amplitude is proportional to the current rate, so an upload swings as
-    // visibly as a download.
-    if (state.running && state.phase !== "ping") {
-      drift.timer -= dt;
-      if (drift.timer <= 0) {
-        drift.timer = 0.26 + Math.random() * 0.3;
-        drift.target = (Math.random() - 0.5) * 2;
-      }
-    } else {
-      drift.target = 0;
-    }
-    drift.value += (drift.target - drift.value) * (1 - Math.pow(0.02, dt));
-
-    var driftAmp = state.phase === "upload" ? 0.035 : 0.014;
-    var aim = gauge.target * (1 + drift.value * driftAmp);
-    var gap = aim - gauge.value;
-    if (Math.abs(gap) > 0.001) {
-      gauge.value += gap * (1 - Math.pow(0.0035, dt));
-    } else {
-      gauge.value = aim;
-    }
-    gauge.progress += (gauge.progressTarget - gauge.progress) * (1 - Math.pow(0.0016, dt));
-
-    if (state.phase === "ping") {
-      el.value.textContent = fixed(gauge.value, 1);
-      el.unit.textContent = "ms";
-    } else if (gauge.value >= 1000) {
-      el.value.textContent = fixed(gauge.value / 1000, 2);
-      el.unit.textContent = "Gbps";
-    } else {
-      el.value.textContent = fixed(gauge.value, 2);
-      el.unit.textContent = "Mbps";
-    }
-    setArc(Math.max(0, Math.min(1, gauge.progress)));
-
-    if (state.running && state.phase !== "ping") {
-      sampleClock += dt;
-      if (sampleClock >= SAMPLE_INTERVAL) {
-        sampleClock = 0;
-        pushSample(gauge.target);
-      } else {
-        pushSample(gauge.target, true);
-      }
-    }
-
-    drawChart();
-    window.requestAnimationFrame(frame);
-  }
-
-  /* ---------- servers ---------- */
-
-  function serverLabel(s) { return s.city + " — " + s.site; }
-
-  function renderServerList() {
-    el.srvList.innerHTML = "";
-    servers.forEach(function (s) {
-      var btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "srv";
-      btn.disabled = state.running;
-      btn.setAttribute("role", "option");
-      btn.setAttribute("aria-current", String(s.id === state.server.id));
-      btn.innerHTML =
-        '<span><span class="srv-name">' + s.city + '</span>' +
-        '<span class="srv-sub">' + s.sponsor + ' · ' + s.down + ' Mbps down</span></span>' +
-        '<span class="srv-rtt">' + s.ping + ' ms</span>';
+  (function () {
+    "use strict";
+    // Dialog helpers are page-level concerns, so they live here rather than in
+    // the engine or the shared script.
+    Array.prototype.forEach.call(document.querySelectorAll(".dlg-close"), function (btn) {
       btn.addEventListener("click", function () {
-        if (state.running) return;
-        state.server = s;
-        el.serverName.textContent = serverLabel(s);
-        renderServerList();
-        var dlg = $("#dlg-servers");
-        if (dlg && dlg.open) dlg.close();
+        var dlg = btn.closest("dialog");
+        if (dlg) dlg.close();
       });
-      el.srvList.appendChild(btn);
     });
-  }
 
-  /* ---------- client info ---------- */
-
-  /* Reserve-range address with a random last octet; a frozen address looks staged. */
-  function fakeClientIp() {
-    var prefixes = ["203.0.113.", "198.51.100.", "192.0.2."];
-    return prefixes[Math.floor(Math.random() * prefixes.length)] + (10 + Math.floor(Math.random() * 230));
-  }
-
-  function renderClient() {
-    el.clientIsp.textContent = state.isp.isp;
-    el.clientAsn.textContent = state.isp.asn;
-    el.clientIp.textContent = fakeClientIp();
-  }
-
-  /* ---------- history ---------- */
-
-  function loadHistory() {
-    try {
-      var raw = window.localStorage.getItem(HISTORY_KEY);
-      var parsed = raw ? JSON.parse(raw) : [];
-      return Array.isArray(parsed) ? parsed.slice(0, HISTORY_MAX) : [];
-    } catch (err) {
-      return [];
-    }
-  }
-
-  function saveHistory() {
-    try {
-      window.localStorage.setItem(HISTORY_KEY, JSON.stringify(state.history));
-    } catch (err) { /* storage unavailable */ }
-  }
-
-  function fmtTime(ts) {
-    var d = new Date(ts);
-    var now = new Date();
-    var sameDay = d.toDateString() === now.toDateString();
-    var opts = sameDay
-      ? { hour: "2-digit", minute: "2-digit", hour12: false }
-      : { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false };
-    return d.toLocaleString("en-GB", opts);
-  }
-
-  function renderHistory() {
-    if (!state.history.length) {
-      el.historyBody.innerHTML = '<tr class="empty"><td colspan="5">No tests yet.</td></tr>';
-      return;
-    }
-    el.historyBody.innerHTML = state.history.map(function (row) {
-      return "<tr>" +
-        "<td>" + fmtTime(row.t) + "</td>" +
-        "<td>" + row.server + "</td>" +
-        '<td class="num">' + fixed(row.ping, 1) + "</td>" +
-        '<td class="num">' + fixed(row.down, 2) + "</td>" +
-        '<td class="num">' + fixed(row.up, 2) + "</td>" +
-        "</tr>";
-    }).join("");
-  }
-
-  /* ---------- test phases ---------- */
-
-  function sleep(ms) {
-    return new Promise(function (resolve) { window.setTimeout(resolve, ms); });
-  }
-
-  /*
-   * Latency: eight probes spaced 110-150 ms apart. Each drifts around the node
-   * baseline so jitter is derived from actual variance rather than invented.
-   */
-  function pingPhase() {
-    return new Promise(function (resolve) {
-      var server = state.server;
-      var vals = [];
-      var index = 0;
-
-      setPhase("ping");
-      gauge.color = COLOR.ping;
-      el.prog.style.stroke = COLOR.ping;
-      gauge.value = 0;
-      gauge.target = 0;
-      gauge.progress = 0;
-      gauge.progressTarget = 0;
-
-      function probe() {
-        if (state.cancelled) { resolve(null); return; }
-        var v = Math.max(0.8, server.ping + (Math.random() - 0.5) * server.spread * 2.2);
-        vals.push(v);
-        index++;
-        gauge.value = v;
-        gauge.target = v;
-        gauge.progress = latencyToArc(v);
-        gauge.progressTarget = gauge.progress;
-        setResultCell("ping", v, 1);
-        announce("Probe " + index + " of " + PING_SAMPLES);
-
-        if (index >= PING_SAMPLES) {
-          var sum = 0;
-          for (var i = 0; i < vals.length; i++) sum += vals[i];
-          var avg = sum / vals.length;
-          var acc = 0;
-          for (var j = 0; j < vals.length; j++) acc += Math.pow(vals[j] - avg, 2);
-          var jitter = Math.sqrt(acc / vals.length);
-
-          state.result.ping = avg;
-          state.result.jitter = jitter;
-          setResultCell("ping", avg, 1);
-          setResultCell("jitter", jitter, 1);
-          gauge.value = avg;
-          gauge.target = avg;
-          gauge.progress = latencyToArc(avg);
-          gauge.progressTarget = gauge.progress;
-          window.setTimeout(function () { resolve(avg); }, 240);
-          return;
-        }
-        window.setTimeout(probe, 110 + Math.random() * 40);
-      }
-
-      window.setTimeout(probe, 140);
-    });
-  }
-
-  /*
-   * Throughput: slow-start ramp plus per-frame noise, so the number never sits
-   * still. Upload is hard-capped by UPLOAD_CEILING.
-   */
-  function transferPhase(kind) {
-    return new Promise(function (resolve) {
-      var server = state.server;
-      var ceiling = kind === "upload" ? UPLOAD_CEILING : server.down;
-      var target = ceiling * rand(0.72, 0.94);
-      var noiseAmp = ceiling * (kind === "upload" ? 0.024 : 0.016);
-      var settleAmp = ceiling * (kind === "upload" ? 0.014 : 0.009);
-      var duration = kind === "upload" ? 9000 : 12000;
-      var start = 0;
-      var elapsed = 0;
-      var tail = [];
-      var tailFrom = duration * 0.55;
-      var lastAnnounce = 0;
-      var seed = Math.random() * 100;
-
-      setPhase(kind);
-      el.chartLabel.textContent = kind === "download" ? "Download" : "Upload";
-      el.chartLegend.textContent = kind === "download" ? "Download" : "Upload";
-      gauge.color = COLOR[kind];
-      el.prog.style.stroke = COLOR[kind];
-      // A real tester drops to zero between phases and ramps up again, so the
-      // upload reading can never inherit the download peak.
-      gauge.value = 0;
-      gauge.target = 0;
-      gauge.progress = 0;
-      gauge.progressTarget = 0;
-      // Paint the zero immediately: the shared frame loop may be throttled, and
-      // stale DOM text would otherwise show the previous phase's peak.
-      el.value.textContent = "0.00";
-      el.unit.textContent = "Mbps";
-      setArc(0);
-      samples = [];
-      sampleClock = 0;
-
-      function tick(now) {
-        if (state.cancelled) { resolve(null); return; }
-        if (!start) start = now;
-        elapsed = now - start;
-        var t = Math.min(1, elapsed / duration);
-
-        // Slow start eases in, then holds with a slow breathing term.
-        var ramp = easeOutCubic(Math.min(1, t / 0.3));
-        var breath = Math.sin(t * Math.PI * 2.1 + seed) * 0.008;
-        var wobble =
-          Math.sin(elapsed / 137 + seed) * 0.55 +
-          Math.sin(elapsed / 61 + seed * 1.7) * 0.3 +
-          (Math.random() - 0.5) * 0.9;
-        // Noise amplitude follows the ramp so the first moments stay clean.
-        var amp = (t < 0.75 ? noiseAmp : settleAmp) * Math.min(1, ramp * 1.4);
-        var value = target * ramp * (1 + breath) + wobble * amp;
-
-        // Pull the value back toward the ramp instead of hard-clamping it: a
-        // hard floor would freeze the readout during slow start.
-        var expected = target * ramp;
-        var lowBound = expected * 0.74;
-        var highBound = ceiling * 0.985;
-        value = Math.max(lowBound, Math.min(highBound, value));
-
-        gauge.target = value;
-        gauge.progressTarget = rateToArc(value);
-        if (elapsed >= tailFrom) tail.push(value);
-
-        if (elapsed - lastAnnounce >= 1500) {
-          lastAnnounce = elapsed;
-          announce((kind === "upload" ? "Upload" : "Download") + " " + Math.round(t * 100) + "%");
-        }
-
-        if (elapsed >= duration) {
-          var sum = 0;
-          for (var i = 0; i < tail.length; i++) sum += tail[i];
-          var result = tail.length ? sum / tail.length : gauge.target;
-          var cap = kind === "upload" ? UPLOAD_CEILING * 0.98 : ceiling * 0.985;
-          resolve(Math.min(cap, result));
-          return;
-        }
-        window.requestAnimationFrame(tick);
-      }
-
-      window.requestAnimationFrame(tick);
-    });
-  }
-
-  function finishTest() {
-    state.running = false;
-    setButton("again");
-    setPhase("done");
-    gauge.target = state.result.down;
-    gauge.progressTarget = rateToArc(state.result.down);
-    setResultCell("down", state.result.down, 2);
-    setResultCell("up", state.result.up, 2);
-    el.chartLabel.textContent = "Throughput";
-    el.chartLegend.textContent = "Last run";
-    renderServerList();
-    announce("Test complete");
-
-    state.history.unshift({
-      t: Date.now(),
-      server: state.server.city,
-      ping: state.result.ping,
-      down: state.result.down,
-      up: state.result.up
-    });
-    state.history = state.history.slice(0, HISTORY_MAX);
-    saveHistory();
-    renderHistory();
-  }
-
-  function abortTest() {
-    state.running = false;
-    setButton(state.result.down == null ? "idle" : "again");
-    setPhase("stopped");
-    el.chartLabel.textContent = "Throughput";
-    el.chartLegend.textContent = "Last run";
-    renderServerList();
-  }
-
-  function runTest() {
-    state.running = true;
-    state.cancelled = false;
-    samples = [];
-    sampleClock = 0;
-    state.result = { down: null, up: null, ping: null, jitter: null };
-    setButton("running");
-    renderServerList();
-
-    pingPhase().then(function (ping) {
-      if (state.cancelled || ping == null) return null;
-      return sleep(420).then(function () {
-        if (state.cancelled) return null;
-        return transferPhase("download");
+    Array.prototype.forEach.call(document.querySelectorAll("dialog"), function (dlg) {
+      dlg.addEventListener("click", function (e) {
+        if (e.target === dlg) dlg.close();
       });
-    }).then(function (down) {
-      if (state.cancelled || down == null) return null;
-      state.result.down = down;
-      setResultCell("down", down, 2);
-      return sleep(700).then(function () {
-        if (state.cancelled) return null;
-        return transferPhase("upload");
-      });
-    }).then(function (up) {
-      if (state.cancelled || up == null) return null;
-      state.result.up = Math.min(UPLOAD_CEILING, up);
-      setResultCell("up", state.result.up, 2);
-      finishTest();
-    }).catch(function () {
-      abortTest();
     });
-  }
-
-  /* ---------- wiring ---------- */
-
-  el.goBtn.addEventListener("click", function () {
-    if (state.running) {
-      state.cancelled = true;
-      abortTest();
-      return;
-    }
-    runTest();
-  });
-
-  el.serverPick.addEventListener("click", function () {
-    if (state.running) return;
-    var dlg = $("#dlg-servers");
-    if (dlg && typeof dlg.showModal === "function") dlg.showModal();
-  });
-
-  document.querySelectorAll("[data-dialog]").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      var dlg = document.getElementById(btn.dataset.dialog);
-      if (dlg && typeof dlg.showModal === "function") dlg.showModal();
-    });
-  });
-
-  document.querySelectorAll("dialog").forEach(function (dlg) {
-    dlg.addEventListener("click", function (e) {
-      if (e.target === dlg) dlg.close();
-    });
-  });
-
-  document.querySelectorAll(".dlg-close").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      var dlg = btn.closest("dialog");
-      if (dlg) dlg.close();
-    });
-  });
-
-  /* Result copy, mirroring what a real results panel offers. */
-  el.copyBtn.addEventListener("click", function () {
-    if (state.result.down == null) {
-      el.copyNote.textContent = "Run a test first";
-      window.setTimeout(function () { el.copyNote.textContent = ""; }, 1800);
-      return;
-    }
-    var text = [
-      "Netmeter result",
-      "Server: " + serverLabel(state.server),
-      "Ping: " + fixed(state.result.ping, 1) + " ms (jitter " + fixed(state.result.jitter, 1) + " ms)",
-      "Download: " + fixed(state.result.down, 2) + " Mbps",
-      "Upload: " + fixed(state.result.up, 2) + " Mbps"
-    ].join("\n");
-    var done = function () {
-      el.copyNote.textContent = "Copied";
-      window.setTimeout(function () { el.copyNote.textContent = ""; }, 1800);
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done, function () { el.copyNote.textContent = "Copy failed"; });
-    } else {
-      el.copyNote.textContent = "Copy unavailable";
-    }
-  });
-
-  var resizeTimer = 0;
-  window.addEventListener("resize", function () {
-    window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(sizeCanvas, 120);
-  });
-
-  document.addEventListener("visibilitychange", function () {
-    lastFrame = 0;
-  });
-
-  /* ---------- boot ---------- */
-
-  buildTicks();
-  el.serverName.textContent = serverLabel(state.server);
-  state.isp = ISP_POOL[Math.floor(Math.random() * ISP_POOL.length)];
-  renderClient();
-  renderServerList();
-  state.history = loadHistory();
-  renderHistory();
-  setPhase("idle");
-  setButton("idle");
-  sizeCanvas();
-  window.requestAnimationFrame(frame);
-})();
+  })();
 </script>
 
 </body>

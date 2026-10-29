@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About &amp; methodology — Netmeter</title>
+<meta name="description" content="How Netmeter measures throughput and latency, where the nodes live, and how to reach the team.">
+<meta name="theme-color" content="#0f0f0f">
+<meta name="robots" content="index,follow">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f0f0f'/%3E%3Cpath d='M6.5 22a9.5 9.5 0 1 1 19 0' fill='none' stroke='%2300d4aa' stroke-width='2.6' stroke-linecap='round'/%3E%3Cpath d='M16 22l5.4-4.9' fill='none' stroke='%23f2f2f2' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/site.css">
+<style>
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1px;
+    margin-top: 28px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    background: var(--line);
+    overflow: hidden;
+  }
+
+  .stat {
+    padding: 20px;
+    background: var(--bg-elev);
+  }
+
+  .stat .figure {
+    font-family: var(--mono);
+    font-size: 26px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.025em;
+  }
+
+  .stat .figure .suffix { margin-left: 3px; color: var(--text-faint); font-size: 13px; }
+  .stat .label { margin-top: 4px; color: var(--text-faint); font-size: 12.5px; }
+
+  .article { padding-top: 40px; }
+
+  .article .prose { max-width: 68ch; }
+
+  .article section + section { margin-top: 40px; padding-top: 36px; border-top: 1px solid var(--line-soft); }
+
+  .article h2 { font-size: 20px; }
+
+  /* method steps */
+
+  .steps { margin-top: 22px; counter-reset: step; }
+
+  .step {
+    position: relative;
+    padding: 0 0 22px 44px;
+    border-left: 1px solid var(--line);
+    margin-left: 12px;
+  }
+
+  .step:last-child { border-left-color: transparent; padding-bottom: 0; }
+
+  .step::before {
+    counter-increment: step;
+    content: counter(step);
+    position: absolute;
+    left: -13px;
+    top: -2px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border: 1px solid var(--line);
+    border-radius: 50%;
+    background: var(--bg);
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .step h3 { font-size: 14.5px; }
+  .step p { margin-top: 6px; color: var(--text-dim); font-size: 13.5px; max-width: 60ch; }
+
+  /* contact */
+
+  .contact-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 22px; }
+
+  .contact-card { padding: 18px 20px; }
+  .contact-card h3 { font-size: 13.5px; }
+  .contact-card p { margin-top: 6px; color: var(--text-dim); font-size: 13px; }
+  .contact-card a { font-size: 13px; }
+
+  .contact-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 12px;
+  }
+
+  @media (max-width: 860px) {
+    .stat-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .stat { padding: 16px; }
+    .stat .figure { font-size: 21px; }
+  }
+
+  @media (max-width: 720px) {
+    .stat-row { grid-template-columns: minmax(0, 1fr); }
+    .contact-grid { grid-template-columns: minmax(0, 1fr); }
+    .article { padding-top: 28px; }
+  }
+</style>
+</head>
+<body class="page">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="inner">
+    <a class="brand" href="index.html" aria-label="Netmeter home">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+      <span>Netmeter</span>
+    </a>
+    <nav class="topnav" id="primary-nav" aria-label="Primary">
+      <a class="navlink" href="index.html">Speed test</a>
+      <a class="navlink" href="status.html">Status</a>
+      <a class="navlink" href="api.html">API</a>
+      <a class="navlink" href="about.html" aria-current="page">About</a>
+    </nav>
+    <div class="topbar-actions">
+      <button type="button" class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false" aria-controls="primary-nav">
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" width="15" height="15">
+          <path d="M2 4.5h12M2 8h12M2 11.5h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="main" id="main">
+  <div class="shell">
+
+    <header class="page-head" data-reveal>
+      <span class="eyebrow">About</span>
+      <h1>Measurement you can reason about</h1>
+      <p class="lede">Netmeter exists to answer one question honestly: what does this connection actually deliver right now, to a known point on the internet?</p>
+    </header>
+
+    <div class="stat-row" data-reveal>
+      <div class="stat">
+        <div class="figure"><span class="count-up" data-count-to="6">0</span></div>
+        <div class="label">Measurement nodes</div>
+      </div>
+      <div class="stat">
+        <div class="figure"><span class="count-up" data-count-to="9">0</span><span class="suffix">countries</span></div>
+        <div class="label">Exchange presence</div>
+      </div>
+      <div class="stat">
+        <div class="figure"><span class="count-up" data-count-to="20" data-suffix="">0</span><span class="suffix">s</span></div>
+        <div class="label">Typical full run</div>
+      </div>
+    </div>
+
+    <div class="article">
+
+      <section data-reveal>
+        <h2>Why the figures differ from your provider's</h2>
+        <div class="prose">
+          <p>A plan advertises a provisioning ceiling, not a moment-to-moment rate. What you measure depends on the path to a specific node, how congested the exchange is at that hour, and what else is using the link.</p>
+          <p>We report what the transfer did, not what it should have done. If a run lands at 72% of your plan, that is the honest number for that minute against that node.</p>
+        </div>
+      </section>
+
+      <section id="method" data-reveal>
+        <h2>Methodology</h2>
+        <div class="prose">
+          <p>Every run follows the same four steps. Nothing is cached between runs, so a retest is a genuinely new measurement.</p>
+        </div>
+
+        <div class="steps">
+          <div class="step">
+            <h3>Latency probes</h3>
+            <p>Eight sequential probes to the selected node. The mean becomes the ping figure; jitter is the squared deviation across those eight.</p>
+          </div>
+          <div class="step">
+            <h3>Download ramp</h3>
+            <p>A small number of parallel streams start at once and run for twelve seconds. The first three seconds are slow start and are excluded from the average.</p>
+          </div>
+          <div class="step">
+            <h3>Upload ramp</h3>
+            <p>The same stream count in reverse for nine seconds. Upload sessions are capped at 100 Mbps per session to keep shared node capacity available.</p>
+          </div>
+          <div class="step">
+            <h3>Settled average</h3>
+            <p>The reported figure is the mean of the second half of each transfer. Peaks are never reported, because a peak is not a rate you can sustain.</p>
+          </div>
+        </div>
+      </section>
+
+      <section data-reveal>
+        <h2>Where the nodes are</h2>
+        <div class="prose">
+          <p>Nodes sit inside public internet exchange points rather than single-homed data centres, which keeps the path between you and the measurement point short and predictable.</p>
+          <ul>
+            <li>HKIX — Hong Kong</li>
+            <li>SGIX — Singapore</li>
+            <li>JPIX — Tokyo</li>
+            <li>Any2 West — Los Angeles</li>
+            <li>DE-CIX — Frankfurt</li>
+            <li>Equinix SY1 — Sydney</li>
+          </ul>
+          <p>Capacity per node is listed on the <a href="status.html">status page</a>, along with any incident that touched a measurement window.</p>
+        </div>
+      </section>
+
+      <section id="contact" data-reveal>
+        <h2>Contact</h2>
+        <div class="prose">
+          <p>Support is handled by the same people who run the nodes. Include the server name and the time of your run if you are reporting an odd result.</p>
+        </div>
+
+        <div class="contact-grid">
+          <div class="card contact-card">
+            <h3>General support</h3>
+            <p>Result disputes, node requests, anything unclear about a figure.</p>
+            <div class="contact-row">
+              <a href="mailto:support@netmeter.example">support@netmeter.example</a>
+              <span class="pill"><span class="dot"></span>~1 day</span>
+            </div>
+          </div>
+          <div class="card contact-card">
+            <h3>Operator access</h3>
+            <p>Keys for bulk measurement and result export.</p>
+            <div class="contact-row">
+              <a href="mailto:operators@netmeter.example">operators@netmeter.example</a>
+              <span class="pill"><span class="dot"></span>~3 days</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section data-reveal>
+        <h2>Build</h2>
+        <div class="prose">
+          <p>Frontend build <code class="mono">2.6.0</code>. Measurement backend and node images are versioned separately and roll out node by node, which is why a fresh figure can differ slightly from one taken a minute earlier.</p>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</main>
+
+<footer class="site-foot">
+  <div class="inner">
+    <div class="foot-brand">
+      <a class="brand" href="index.html">
+        <svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M3.8 17.2a8.2 8.2 0 1 1 16.4 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M12 17.2l4.2-3.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <span>Netmeter</span>
+      </a>
+      <p>Browser-based throughput and latency measurement against a network of exchange-hosted nodes.</p>
+    </div>
+    <div class="foot-col">
+      <h3>Product</h3>
+      <ul>
+        <li><a href="index.html">Speed test</a></li>
+        <li><a href="status.html">Node status</a></li>
+        <li><a href="api.html">Measurement API</a></li>
+      </ul>
+    </div>
+    <div class="foot-col">
+      <h3>Company</h3>
+      <ul>
+        <li><a href="about.html">About</a></li>
+        <li><a href="about.html#method">Methodology</a></li>
+        <li><a href="about.html#contact">Contact</a></li>
+      </ul>
+    </div>
+    <div class="foot-col">
+      <h3>Legal</h3>
+      <ul>
+        <li><a href="legal.html">Terms of use</a></li>
+        <li><a href="legal.html#privacy">Privacy</a></li>
+        <li><a href="legal.html#cookies">Cookies</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="foot-base">
+    <span>© <span data-year>2025</span> Netmeter. All rights reserved.</span>
+    <span class="meta">
+      <span class="mono">build 2.6.0</span>
+      <span class="sep">·</span>
+      <span>No account required</span>
+    </span>
+  </div>
+</footer>
+
+<script src="assets/site.js" defer></script>
+</body>
+</html>
