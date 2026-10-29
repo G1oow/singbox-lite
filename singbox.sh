@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="100"
+export SCRIPT_VERSION="101"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -1599,6 +1599,15 @@ export ARGO_LOG_FILE="/var/log/singbox_argo.log"
 export RUNTIME_DIR="/run/singboxlite"
 export PID_FILE="${RUNTIME_DIR}/sing-box.pid"
 export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
+export CADDY_BIN="/usr/local/bin/caddy"
+export CADDY_SERVICE_NAME="singboxlite-caddy"
+export CADDY_CONF_FILE="${SINGBOX_DIR}/Caddyfile"
+export CADDY_STATE_FILE="${SINGBOX_DIR}/caddy_camouflage.json"
+export CADDY_WEB_ROOT="${SINGBOX_DIR}/www"
+export CADDY_DATA_DIR="${SINGBOX_DIR}/caddy"
+export CADDY_LOG_FILE="/var/log/singboxlite-caddy.log"
+export CADDY_PID_FILE="${RUNTIME_DIR}/caddy.pid"
+export CADDY_FALLBACK_PORT="8443"
 export XRAY_RUNTIME_DIR="${RUNTIME_DIR}"
 export XRAY_PID_FILE="${XRAY_RUNTIME_DIR}/xray.pid"
 export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
@@ -3513,6 +3522,7 @@ _uninstall() {
     echo -e "  ${RED}-${NC} sing-box 二进制: ${SINGBOX_BIN}"
     echo -e "  ${RED}-${NC} yq 二进制: ${YQ_BINARY}"
     [ -f "${CLOUDFLARED_BIN}" ] && echo -e "  ${RED}-${NC} cloudflared 二进制: ${CLOUDFLARED_BIN}"
+    [ -f "${CADDY_BIN}" ] && echo -e "  ${RED}-${NC} Caddy 二进制与伪装站点: ${CADDY_BIN}"
     [ -f "/usr/local/bin/xray" ] && echo -e "  ${RED}-${NC} Xray 核心及配置: /usr/local/etc/xray/"
     echo -e "  ${RED}-${NC} 系统别名: /usr/local/bin/sb"
     echo -e "  ${RED}-${NC} 管理脚本: ${SELF_SCRIPT_PATH}"
@@ -3520,6 +3530,12 @@ _uninstall() {
     
     read -p "$(echo -e ${YELLOW}"确定要执行卸载吗? (y/N): "${NC})" confirm_main
     [[ "$confirm_main" != "y" && "$confirm_main" != "Y" ]] && _info "卸载已取消。" && return
+
+    # Caddy 伪装站必须在删除配置目录前停止，否则会留下无配置文件的常驻进程。
+    if [ -f "${CADDY_BIN}" ] || [ -f "${CADDY_CONF_FILE}" ]; then
+        _caddy_service remove >/dev/null 2>&1 || true
+        rm -f -- "${CADDY_BIN}" "${CADDY_LOG_FILE}" "${CADDY_PID_FILE}" 2>/dev/null || true
+    fi
 
     # 1. Argo 必须在删除元数据前停止，否则会失去受控 PID 到端口的映射，
     # 留下仍在运行的 cloudflared 进程。
@@ -5835,7 +5851,7 @@ _batch_sni_plan() {
         current=""
         case "$sni_target" in
             reality)
-                current=$(printf '%s' "$node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+                current=$(printf '%s' "$node" | jq -r '.tls.server_name // .tls.reality.handshake.server // empty')
                 ;;
             shadowtls)
                 current=$(printf '%s' "$node" | jq -r '.handshake.server // empty')
@@ -5870,6 +5886,19 @@ _batch_sni_plan_action() {
     fi
 }
 
+# Reality 的 handshake 指向本机回落站时，网络行为依赖 Caddy 伪装站，
+# 任何改变 SNI 的操作都必须保持 handshake 指向不变。
+_reality_handshake_is_local() {
+    local tag="$1" server
+    server=$(jq -r --arg tag "$tag" '
+        .inbounds[]? | select(.tag == $tag) | .tls.reality.handshake.server // empty
+    ' "${CONFIG_FILE:-}" 2>/dev/null | head -n 1)
+    case "$server" in
+        127.0.0.1|localhost|::1|"[::1]") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 按计划改写 config.json 并重签自签证书，最后重建元数据、链接与 Clash 配置。
 # 必须在事务快照与状态锁内调用；任何一步失败由调用方回滚。
 _batch_sni_apply_config() {
@@ -5900,10 +5929,18 @@ _batch_sni_apply_config() {
         [ "$action" = "apply" ] || continue
         case "$sni_target" in
             reality)
-                _atomic_modify_json "$CONFIG_FILE" '
-                    (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
-                    | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = $sni
-                ' --arg tag "$tag" --arg sni "$sni" || return 1
+                # 若 handshake 已指向本机回落站（Caddy 伪装站），必须保持指向，
+                # 否则 Reality 会回头连接自己的 443 形成自环并暴露伪装。
+                if _reality_handshake_is_local "$tag"; then
+                    _atomic_modify_json "$CONFIG_FILE" '
+                        (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+                    ' --arg tag "$tag" --arg sni "$sni" || return 1
+                else
+                    _atomic_modify_json "$CONFIG_FILE" '
+                        (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+                        | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = $sni
+                    ' --arg tag "$tag" --arg sni "$sni" || return 1
+                fi
                 ;;
             shadowtls)
                 _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .handshake.server) = $sni' \
@@ -6029,6 +6066,23 @@ _batch_change_sni_apply() (
     if ! _main_create_tx_snapshot "$backup_dir"; then
         _error "无法完整创建 SNI 变更事务快照，操作尚未开始。"
         rm -rf -- "$backup_dir"
+
+# SNI 与 Caddy 伪装域名不一致时，回落站点会因证书不匹配而暴露。
+_batch_sni_camouflage_warning() {
+    local new_sni="$1" domain
+    [ -n "${CADDY_STATE_FILE:-}" ] && [ -s "$CADDY_STATE_FILE" ] || return 0
+    domain=$(_camouflage_state_field '.domain')
+    [ -n "$domain" ] || return 0
+    _info "当前 Caddy 伪装域名：${domain}"
+    [ "$new_sni" = "$domain" ] && return 0
+    _warn "该域名属于 Caddy 伪装站的回落证书。"
+    _warn "把 Reality 切换到 ${new_sni} 后，回落站点会因证书不匹配而暴露。"
+    _warn "如需更换域名，请通过 [21] 的“更换伪装域名”执行。"
+    local confirm
+    read -r -p "仍要继续？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    return 0
+}
         if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
         return 1
     fi
@@ -6133,6 +6187,8 @@ _batch_change_sni() {
         return 0
     fi
 
+    _batch_sni_camouflage_warning "$new_sni" || { rm -f -- "$plan_file"; return 0; }
+
     _batch_change_sni_apply "$new_sni" "$regen" "$plan_file"
     local apply_rc=$?
     rm -f -- "$plan_file"
@@ -6145,6 +6201,824 @@ _batch_change_sni() {
     fi
 }
 # --- 一键换 SNI 与聚合订阅结束 ---
+
+# --- Reality 伪装域名（Caddy） ---
+#
+# Reality 独占 443 端口；未通过认证的探针连接会被 Reality 原样转发到
+# Caddy 的 127.0.0.1 回环站点。Caddy 用 ACME HTTP-01 签发的真证书对外
+# 呈现一个正常的 HTTPS 网站，使伪装域名在浏览器里"真的存在"。
+# Caddy 仅在首次使用本功能时按需安装，卸载脚本时一并清理。
+
+# 读取 Caddy 伪装站状态文件的字段（无状态文件时输出空）
+_camouflage_state_domain() {
+    _camouflage_state_field '.domain'
+}
+
+_camouflage_state_field() {
+    local expr="$1"
+    [ -n "${CADDY_STATE_FILE:-}" ] && [ -s "$CADDY_STATE_FILE" ] || return 0
+    jq -r "$expr // empty" "$CADDY_STATE_FILE" 2>/dev/null | head -n 1
+}
+
+_camouflage_state_write() {
+    local domain="$1" port="$2" cert_mode="$3" cert_path="$4" key_path="$5" tag443="$6" not_after="$7"
+    local tmp
+    tmp=$(mktemp "${CADDY_STATE_FILE}.tmp.XXXXXX") || return 1
+    if ! jq -n \
+        --arg domain "$domain" --arg port "$port" --arg certMode "$cert_mode" \
+        --arg cert "$cert_path" --arg key "$key_path" --arg tag443 "$tag443" \
+        --arg notAfter "$not_after" \
+        '{domain:$domain, fallbackPort:($port|tonumber), certMode:$certMode,
+          certificatePath:$cert, keyPath:$key, port443Tag:$tag443,
+          certNotAfter:$notAfter, updatedAt:(now|todate)}' > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$CADDY_STATE_FILE"
+}
+
+_camouflage_state_rebind_tag() {
+    local tag="$1"
+    [ -n "${CADDY_STATE_FILE:-}" ] && [ -s "$CADDY_STATE_FILE" ] || return 0
+    _atomic_modify_json "$CADDY_STATE_FILE" '.port443Tag = $tag' --arg tag "$tag" >/dev/null 2>&1 || true
+}
+
+_caddy_installed() {
+    [ -n "${CADDY_BIN:-}" ] && [ -x "$CADDY_BIN" ] && "$CADDY_BIN" version >/dev/null 2>&1
+}
+
+_caddy_arch_tag() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'amd64' ;;
+        aarch64|arm64) printf 'arm64' ;;
+        armv7l|armv7) printf 'armv7' ;;
+        armv6l|armv6) printf 'armv6' ;;
+        *) return 1 ;;
+    esac
+}
+
+# 与 cloudflared 相同的供应链把关：GitHub API 官方 digest -> sha256 校验 ->
+# 可执行性验证 -> 原子替换。
+_caddy_install() {
+    if _caddy_installed; then
+        _info "Caddy 已安装: $("$CADDY_BIN" version 2>&1 | head -n1)"
+        return 0
+    fi
+    local arch_tag
+    arch_tag=$(_caddy_arch_tag) || { _error "不支持的架构: $(uname -m)"; return 1; }
+    _pkg_install ca-certificates
+    _info "正在读取 Caddy 官方发布信息..."
+    local info count url digest name
+    if ! info=$(curl -fsSL --retry 3 --connect-timeout 10 \
+        https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r --arg arch "$arch_tag" '
+            [.assets[] | select(.name | test("^caddy_[0-9.]+_linux_" + $arch + "\\.tar\\.gz$"))] as $m
+            | [($m | length), ($m[0].browser_download_url // ""), ($m[0].digest // ""), ($m[0].name // "")]
+            | @tsv
+        ' 2>/dev/null); then
+        _error "无法读取 Caddy 官方发布信息。"
+        return 1
+    fi
+    IFS=$'\t' read -r count url digest name <<< "$info"
+    if [ "$count" != "1" ] \
+        || [[ "$url" != https://github.com/caddyserver/caddy/releases/download/* ]] \
+        || [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        _error "Caddy 官方资产信息异常（匹配数量: ${count:-0}），已拒绝安装。"
+        return 1
+    fi
+
+    local work tmp_tar actual
+    work=$(mktemp -d /tmp/.caddy-install.XXXXXX) || return 1
+    tmp_tar="${work}/${name}"
+    if ! wget -qO "$tmp_tar" "$url" 2>/dev/null \
+        && ! curl -fsSL --connect-timeout 10 --max-time 300 -o "$tmp_tar" "$url" 2>/dev/null; then
+        rm -rf -- "$work"
+        _error "Caddy 下载失败。"
+        return 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$tmp_tar" | awk '{print $1}')
+    else
+        actual=$(openssl dgst -sha256 "$tmp_tar" 2>/dev/null | awk '{print $NF}')
+    fi
+    if [ -z "$actual" ] || [ "${actual,,}" != "${digest#sha256:}" ]; then
+        rm -rf -- "$work"
+        _error "Caddy SHA-256 校验失败，已拒绝安装。"
+        return 1
+    fi
+    if ! tar -xzf "$tmp_tar" -C "$work" caddy 2>/dev/null || [ ! -f "${work}/caddy" ]; then
+        rm -rf -- "$work"
+        _error "Caddy 解压失败。"
+        return 1
+    fi
+    if ! "${work}/caddy" version >/dev/null 2>&1; then
+        rm -rf -- "$work"
+        _error "下载的 Caddy 无法执行，已拒绝安装。"
+        return 1
+    fi
+    chmod 755 "${work}/caddy" || { rm -rf -- "$work"; return 1; }
+    mkdir -p "$(dirname "$CADDY_BIN")" || { rm -rf -- "$work"; return 1; }
+    mv -f "${work}/caddy" "$CADDY_BIN" || { rm -rf -- "$work"; return 1; }
+    rm -rf -- "$work"
+    _success "Caddy 安装成功: $("$CADDY_BIN" version 2>&1 | head -n1)"
+}
+
+# 伪装域名必须是可解析的公网域名，不能是 IP 字面量。
+_camouflage_domain_valid() {
+    local domain="$1" label tld
+    [ -n "$domain" ] && [ "${#domain}" -le 253 ] || return 1
+    [[ "$domain" == *.* ]] || return 1
+    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+    [[ "$domain" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 1
+    local IFS='.'
+    for label in $domain; do
+        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+    unset IFS
+    tld="${domain##*.}"
+    [[ "$tld" =~ ^[A-Za-z]{2,}$ ]] || return 1
+    return 0
+}
+
+# 用 Cloudflare DoH 查询记录，绕开本机负缓存与精简容器缺少 getent/nslookup。
+_camouflage_doh_ips() {
+    local domain="$1" rrtype="$2" numeric json
+    command -v curl >/dev/null 2>&1 || return 0
+    if [ "$rrtype" = "AAAA" ]; then numeric=28; else numeric=1; fi
+    json=$(curl -fsS --connect-timeout 5 --max-time 12 -H 'accept: application/dns-json' \
+        --get --data-urlencode "name=${domain}" --data-urlencode "type=${rrtype}" \
+        'https://1.1.1.1/dns-query' 2>/dev/null) || return 0
+    printf '%s' "$json" | jq -r --argjson t "$numeric" \
+        '[.Answer[]? | select(.type == $t) | .data] | .[]' 2>/dev/null
+}
+
+_camouflage_dns_ips() {
+    local domain="$1" ips
+    ips=$(_camouflage_doh_ips "$domain" A; _camouflage_doh_ips "$domain" AAAA)
+    ips=$(printf '%s\n' "$ips" | awk 'NF')
+    if [ -z "$ips" ] && command -v getent >/dev/null 2>&1; then
+        ips=$(getent ahosts "$domain" 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$ips" ] && command -v nslookup >/dev/null 2>&1; then
+        ips=$(nslookup "$domain" 2>/dev/null | awk '/^Address: /{print $2}')
+    fi
+    printf '%s\n' "$ips" | awk 'NF' | sort -u
+}
+
+_camouflage_local_ips() {
+    local ips=""
+    if declare -F _conn_ipv4 >/dev/null 2>&1; then
+        ips=$(_conn_ipv4 2>/dev/null || true)
+    fi
+    if declare -F _conn_ipv6 >/dev/null 2>&1; then
+        ips="${ips}"$'\n'"$(_conn_ipv6 2>/dev/null || true)"
+    fi
+    [ -n "${server_ip:-}" ] && ips="${ips}"$'\n'"${server_ip}"
+    printf '%s\n' "$ips" | awk 'NF' | sort -u
+}
+
+# 解析结果与本机任一公网地址相同即视为绑定成功。
+_camouflage_domain_matches() {
+    local domain="$1" dns_ips local_ips ip
+    dns_ips=$(_camouflage_dns_ips "$domain" | awk 'NF')
+    [ -n "$dns_ips" ] || return 1
+    local_ips=$(_camouflage_local_ips | awk 'NF')
+    [ -n "$local_ips" ] || return 1
+    while IFS= read -r ip; do
+        [ -n "$ip" ] || continue
+        if printf '%s\n' "$local_ips" | grep -Fxq "$ip"; then
+            return 0
+        fi
+    done <<< "$dns_ips"
+    return 1
+}
+
+_camouflage_verify_domain_loop() {
+    local domain="$1" attempt choice dns_ips local_ips
+    for attempt in 1 2 3; do
+        if _camouflage_domain_matches "$domain"; then
+            _success "域名 ${domain} 已指向本机。"
+            return 0
+        fi
+        dns_ips=$(_camouflage_dns_ips "$domain" | awk 'NF' | tr '\n' ' ')
+        local_ips=$(_camouflage_local_ips | awk 'NF' | tr '\n' ' ')
+        _warn "域名 ${domain} 尚未指向本机（第 ${attempt}/3 次检查）。"
+        _info "  解析结果: ${dns_ips:-无}"
+        _info "  本机公网: ${local_ips:-未探测到}"
+        _info "  请确认已添加 A/AAAA 记录；若使用了 CDN 加速（如 Cloudflare 橙云），"
+        _info "  解析会指向 CDN 边缘而无法通过 ACME 校验，请临时关闭加速。"
+        read -r -p "  [r] 重新检查 / [q] 放弃: " choice
+        if [[ "$choice" =~ ^[Qq]$ ]]; then
+            _info "已取消，未做任何改动。"
+            return 1
+        fi
+    done
+    _error "连续 3 次未通过域名解析校验，已退出。"
+    return 1
+}
+
+_caddy_write_config() {
+    local domain="$1" site_port="$2" cert_mode="${3:-acme}" cert_path="${4:-}" key_path="${5:-}"
+    mkdir -p "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" || return 1
+    chmod 700 "$CADDY_DATA_DIR" 2>/dev/null || true
+    {
+        printf '{\n\tadmin off\n\tskip_install_trust\n\tauto_https disable_redirects\n}\n\n'
+        printf 'https://%s:%s {\n' "$domain" "$site_port"
+        printf '\troot * %s\n' "$CADDY_WEB_ROOT"
+        printf '\tencode gzip\n\tfile_server\n'
+        if [ "$cert_mode" = "custom" ]; then
+            printf '\ttls %s %s\n' "$cert_path" "$key_path"
+        else
+            # TLS-ALPN-01 需要占用 443，而 443 归 Reality，必须禁用改用 HTTP-01。
+            printf '\ttls {\n\t\tissuer acme {\n\t\t\tdisable_tlsalpn_challenge\n\t\t}\n\t}\n'
+        fi
+        printf '\tlog {\n\t\tlevel ERROR\n\t\toutput file %s\n\t}\n' "$CADDY_LOG_FILE"
+        printf '}\n'
+    } > "$CADDY_CONF_FILE" || return 1
+    chmod 600 "$CADDY_CONF_FILE" 2>/dev/null || true
+}
+
+# 伪装页优先用仓库内的 web/index.html，失败时写入内置兜底页。
+_caddy_write_index_page() {
+    local target="${CADDY_WEB_ROOT}/index.html"
+    local url="${GITHUB_RAW_BASE}/web/index.html" tmp
+    mkdir -p "$CADDY_WEB_ROOT" || return 1
+    tmp=$(mktemp "${CADDY_WEB_ROOT}/.index.XXXXXX") || return 1
+    if command -v curl >/dev/null 2>&1 \
+        && curl -fsSL --connect-timeout 8 --max-time 30 -o "$tmp" "$url" 2>/dev/null \
+        && [ -s "$tmp" ] \
+        && head -c 200 "$tmp" | grep -qi '<html\|<!doctype'; then
+        chmod 644 "$tmp" 2>/dev/null || true
+        if mv -f "$tmp" "$target"; then
+            _success "伪装页已从官方仓库同步。"
+            return 0
+        fi
+    fi
+    rm -f -- "$tmp"
+    cat > "$target" <<'HTMLEOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service Status</title>
+<style>
+body{margin:0;background:#fff;color:#1b1b1b;font:15px/1.7 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:640px;margin:14vh auto;padding:0 24px}
+h1{font-size:20px;font-weight:600;margin:0 0 10px}
+p{margin:0 0 12px;color:#555}
+code{font:13px ui-monospace,monospace;background:#f4f4f4;padding:1px 5px;border-radius:4px}
+</style>
+</head>
+<body>
+<main>
+<h1>Service Status</h1>
+<p>This endpoint is operational. No account or configuration is required.</p>
+<p>Status: <code>200 OK</code></p>
+</main>
+</body>
+</html>
+HTMLEOF
+    chmod 644 "$target" 2>/dev/null || true
+    _warn "未能从仓库同步伪装页，已写入内置兜底页。"
+    return 0
+}
+
+_caddy_cert_file() {
+    local domain="$1" f
+    for f in "${CADDY_DATA_DIR}"/caddy/certificates/*/"${domain}"/"${domain}".crt; do
+        [ -f "$f" ] || continue
+        printf '%s' "$f"
+        return 0
+    done
+    return 1
+}
+
+_caddy_wait_cert() {
+    local domain="$1" timeout="${2:-180}" waited=0
+    while [ "$waited" -lt "$timeout" ]; do
+        _caddy_cert_file "$domain" >/dev/null 2>&1 && return 0
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 1
+}
+
+_caddy_verify_site() {
+    local domain="$1" port="$2" code
+    command -v curl >/dev/null 2>&1 || return 0
+    code=$(curl -fsS --max-time 20 --resolve "${domain}:${port}:127.0.0.1" \
+        -o /dev/null -w '%{http_code}' "https://${domain}:${port}/" 2>/dev/null) || return 1
+    [ "$code" = "200" ]
+}
+
+_caddy_log_tail() {
+    [ -s "${CADDY_LOG_FILE:-}" ] || return 0
+    _warn "Caddy 日志（末尾 15 行）："
+    tail -n 15 "$CADDY_LOG_FILE" 2>/dev/null
+}
+
+_caddy_service() {
+    local action="$1"
+    [ -z "${INIT_SYSTEM:-}" ] && _detect_init_system
+    local unit="/etc/systemd/system/${CADDY_SERVICE_NAME}.service"
+    local initd="/etc/init.d/${CADDY_SERVICE_NAME}"
+    case "$INIT_SYSTEM" in
+        systemd)
+            case "$action" in
+                install)
+                    cat > "$unit" <<EOF
+[Unit]
+Description=Caddy camouflage site for sing-box REALITY
+After=network.target
+
+[Service]
+Environment="XDG_DATA_HOME=${CADDY_DATA_DIR}" "XDG_CONFIG_HOME=${CADDY_DATA_DIR}/config"
+ExecStart=${CADDY_BIN} run --config ${CADDY_CONF_FILE} --adapter caddyfile
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                    chmod 644 "$unit" || return 1
+                    systemctl daemon-reload || return 1
+                    systemctl enable "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || return 1
+                    ;;
+                start|restart)
+                    systemctl reset-failed "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || true
+                    systemctl "$action" "$CADDY_SERVICE_NAME"
+                    ;;
+                stop)
+                    systemctl stop "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || true
+                    ;;
+                remove)
+                    systemctl stop "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || true
+                    systemctl disable "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || true
+                    rm -f -- "$unit"
+                    systemctl daemon-reload >/dev/null 2>&1 || true
+                    systemctl reset-failed "${CADDY_SERVICE_NAME}.service" >/dev/null 2>&1 || true
+                    ;;
+                *) _error "未知服务操作: $action"; return 1 ;;
+            esac
+            ;;
+        openrc)
+            case "$action" in
+                install)
+                    mkdir -p "$RUNTIME_DIR" || return 1
+                    touch "$CADDY_LOG_FILE" 2>/dev/null || true
+                    cat > "$initd" <<EOF
+#!/sbin/openrc-run
+
+description="Caddy camouflage site for sing-box REALITY"
+export XDG_DATA_HOME="${CADDY_DATA_DIR}"
+export XDG_CONFIG_HOME="${CADDY_DATA_DIR}/config"
+command="${CADDY_BIN}"
+command_args="run --config ${CADDY_CONF_FILE} --adapter caddyfile"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+
+pidfile="${CADDY_PID_FILE}"
+output_log="${CADDY_LOG_FILE}"
+error_log="${CADDY_LOG_FILE}"
+
+start_pre() {
+    checkpath -d -m 0700 ${RUNTIME_DIR}
+}
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+                    chmod +x "$initd" || return 1
+                    rc-update add "$CADDY_SERVICE_NAME" default >/dev/null 2>&1 || return 1
+                    ;;
+                start|restart|stop)
+                    rc-service "$CADDY_SERVICE_NAME" "$action"
+                    ;;
+                remove)
+                    rc-service "$CADDY_SERVICE_NAME" stop >/dev/null 2>&1 || true
+                    rc-update del "$CADDY_SERVICE_NAME" default >/dev/null 2>&1 || true
+                    rm -f -- "$initd" "$CADDY_PID_FILE"
+                    ;;
+                *) _error "未知服务操作: $action"; return 1 ;;
+            esac
+            ;;
+        direct)
+            case "$action" in
+                install) return 0 ;;
+                start)
+                    if _is_pid_file_running_cmd "$CADDY_PID_FILE" "$CADDY_BIN"; then
+                        _success "Caddy 已在 direct 模式运行。"
+                        return 0
+                    fi
+                    mkdir -p "$RUNTIME_DIR" || return 1
+                    chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+                    rm -f -- "$CADDY_PID_FILE"
+                    touch "$CADDY_LOG_FILE" 2>/dev/null || true
+                    nohup env XDG_DATA_HOME="$CADDY_DATA_DIR" XDG_CONFIG_HOME="${CADDY_DATA_DIR}/config" \
+                        "$CADDY_BIN" run --config "$CADDY_CONF_FILE" --adapter caddyfile \
+                        >> "$CADDY_LOG_FILE" 2>&1 8>&- 9>&- 219>&- &
+                    echo $! > "$CADDY_PID_FILE"
+                    chmod 600 "$CADDY_PID_FILE" 2>/dev/null || true
+                    sleep 1
+                    if ! _is_pid_file_running_cmd "$CADDY_PID_FILE" "$CADDY_BIN"; then
+                        rm -f -- "$CADDY_PID_FILE"
+                        _error "Caddy 启动后立即退出，请检查日志: $CADDY_LOG_FILE"
+                        return 1
+                    fi
+                    _success "Caddy 已以 direct 后台模式启动。"
+                    ;;
+                stop)
+                    if [ -s "$CADDY_PID_FILE" ]; then
+                        local pid
+                        pid=$(cat "$CADDY_PID_FILE" 2>/dev/null)
+                        _is_pid_running_cmd "$pid" "$CADDY_BIN" && kill "$pid" 2>/dev/null
+                    fi
+                    rm -f -- "$CADDY_PID_FILE"
+                    ;;
+                restart)
+                    _caddy_service stop
+                    sleep 1
+                    _caddy_service start
+                    ;;
+                remove)
+                    _caddy_service stop >/dev/null 2>&1 || true
+                    rm -f -- "$CADDY_PID_FILE"
+                    ;;
+                *) _error "未知服务操作: $action"; return 1 ;;
+            esac
+            ;;
+        *)
+            _error "不支持的服务管理系统"
+            return 1
+            ;;
+    esac
+}
+
+# 站点就绪后仍需要确认证书可用；续期同样依赖 80 端口长期空闲。
+_caddy_cert_health_check() {
+    local cert
+    [ -n "${CADDY_STATE_FILE:-}" ] && [ -s "$CADDY_STATE_FILE" ] || return 0
+    cert=$(_camouflage_state_field '.certificatePath')
+    if [ -z "$cert" ] || [ ! -f "$cert" ]; then
+        _warn "Caddy 伪装站证书文件缺失，Reality 回落站点可能已失效（[21] 可重新部署）。"
+        return 0
+    fi
+    if ! openssl x509 -checkend 1296000 -noout -in "$cert" >/dev/null 2>&1; then
+        _warn "Caddy 伪装站证书将在 15 天内到期或已过期。"
+        _warn "ACME 续期依赖 80 端口空闲且公网可达，请检查端口占用与云厂商安全组。"
+    fi
+    return 0
+}
+
+_caddy_cleanup_partial() {
+    _caddy_service remove >/dev/null 2>&1 || true
+    rm -rf -- "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" 2>/dev/null || true
+    rm -f -- "$CADDY_CONF_FILE" 2>/dev/null || true
+    _warn "已回滚 Caddy 部署产物，sing-box 配置未做任何改动。"
+}
+
+_camouflage_list_reality_nodes() {
+    local node tag port variant
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        tag=$(printf '%s' "$node" | jq -r '.tag // empty')
+        port=$(printf '%s' "$node" | jq -r '.listen_port // empty')
+        [ -n "$tag" ] && [ -n "$port" ] || continue
+        variant=$(_detect_main_node_variant "$tag")
+        case "$variant" in
+            vless-reality|any-reality) printf '%s\t%s\t%s\n' "$tag" "$port" "$variant" ;;
+        esac
+    done <<< "$(_list_main_primary_inbounds)"
+}
+
+# 443 只能给一个 Reality 节点；已有 443 就复用，只有单节点则直接选中。
+_camouflage_pick_port443_tag() {
+    local list count=0 tag port variant on443="" first="" choice num
+    local tags=()
+    list=$(_camouflage_list_reality_nodes)
+    [ -n "$list" ] || return 1
+    while IFS=$'\t' read -r tag port variant; do
+        [ -n "$tag" ] || continue
+        count=$((count + 1))
+        tags+=("$tag")
+        [ -n "$first" ] || first="$tag"
+        [ "$port" = "443" ] && on443="$tag"
+        echo -e "  ${CYAN}${count})${NC} ${tag} (${variant}) @ ${GREEN}${port}${NC}" >&2
+    done <<< "$list"
+    if [ -n "$on443" ]; then
+        printf '%s' "$on443"
+        return 0
+    fi
+    if [ "$count" -eq 1 ]; then
+        printf '%s' "$first"
+        return 0
+    fi
+    read -r -p "  请选择使用 443 端口的 Reality 节点编号 (默认 1): " choice
+    num=${choice:-1}
+    if [[ ! "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "$count" ]; then
+        _error "节点编号无效。"
+        return 1
+    fi
+    printf '%s' "${tags[$((num - 1))]}"
+}
+
+# 事务保护下切换 Reality：状态锁 + 快照 + 组合校验 + 单次重启 + 失败回滚。
+_camouflage_apply_reality() (
+    local mode="$1" domain="$2" port443_tag="${3:-}"
+    [[ "$domain" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名格式无效。"; return 1; }
+
+    local lock_owned="false"
+    if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
+        command -v flock >/dev/null 2>&1 || { _error "缺少 flock，拒绝无锁修改节点。"; return 1; }
+        exec 8>"${SINGBOX_DIR}/.singboxlite.lock" || return 1
+        if ! _flock_wait 8 30; then exec 8>&-; _error "等待状态锁超时。"; return 1; fi
+        export SINGBOXLITE_LOCK_HELD=1
+        lock_owned="true"
+    fi
+
+    local backup_dir restart_attempted=0 committed=0 check_result
+    backup_dir=$(mktemp -d /tmp/.singbox-camouflage.XXXXXX) || return 1
+    if ! _main_create_tx_snapshot "$backup_dir"; then
+        _error "无法完整创建伪装域名事务快照，操作尚未开始。"
+        rm -rf -- "$backup_dir"
+        if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
+        return 1
+    fi
+    export MAIN_CREATE_TX_ACTIVE=1
+    if [ -f "${backup_dir}/nft.available" ]; then
+        export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=1
+    else
+        export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
+    fi
+    trap 'camouflage_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then if ! _restore_full_transaction_snapshot "$backup_dir" "$restart_attempted" "Reality 伪装域名切换"; then camouflage_rc=1; fi; fi; export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0; if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi; exit "$camouflage_rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    _validate_protected_yaml_metadata || return 1
+
+    local list
+    list=$(_camouflage_list_reality_nodes)
+    [ -n "$list" ] || { _error "当前没有可切换的 Reality 节点。"; return 1; }
+
+    if [ "$mode" = "apply" ] && [ -n "$port443_tag" ]; then
+        local cur_port
+        cur_port=$(jq -r --arg tag "$port443_tag" '.inbounds[]? | select(.tag == $tag) | .listen_port // empty' "$CONFIG_FILE")
+        [ -n "$cur_port" ] || { _error "选定的 Reality 节点已不存在，请重新进入菜单。"; return 1; }
+        if [ "$cur_port" != "443" ] && _check_port_conflict "443" "tcp" "false" "$port443_tag"; then
+            _error "443 端口已被占用，无法把 Reality 迁移到 443。"
+            return 1
+        fi
+    fi
+
+    local tags=() names=() types=() ports=() tag port variant type i
+    while IFS=$'\t' read -r tag port variant; do
+        [ -n "$tag" ] || continue
+        type=$(jq -r --arg tag "$tag" '.inbounds[]? | select(.tag == $tag) | .type' "$CONFIG_FILE")
+        tags+=("$tag")
+        ports+=("$port")
+        types+=("$type")
+        names+=("$(_find_proxy_name "$port" "$type" "$tag")")
+    done <<< "$list"
+    [ "${#tags[@]}" -gt 0 ] || { _error "没有可切换的 Reality 节点。"; return 1; }
+
+    for i in "${!tags[@]}"; do
+        if [ "$mode" = "revert" ]; then
+            _atomic_modify_json "$CONFIG_FILE" '
+                (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+                | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = $sni
+                | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server_port) = 443
+            ' --arg tag "${tags[$i]}" --arg sni "$domain" || return 1
+        else
+            _atomic_modify_json "$CONFIG_FILE" '
+                (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+                | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = "127.0.0.1"
+                | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server_port) = ($port | tonumber)
+            ' --arg tag "${tags[$i]}" --arg sni "$domain" --arg port "$CADDY_FALLBACK_PORT" || return 1
+        fi
+    done
+
+    if [ "$mode" = "apply" ] && [ -n "$port443_tag" ]; then
+        _atomic_modify_json "$CONFIG_FILE" \
+            '(.inbounds[] | select(.tag == $tag) | .listen_port) = 443' --arg tag "$port443_tag" || return 1
+    fi
+
+    for i in "${!tags[@]}"; do
+        _refresh_modified_node_artifacts "${tags[$i]}" "${names[$i]}" || return 1
+    done
+
+    if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
+        _error "伪装域名切换后的组合配置校验失败："
+        echo "$check_result"
+        return 1
+    fi
+    restart_attempted=1
+    _manage_service restart || { _error "伪装域名切换后服务重启失败。"; return 1; }
+
+    committed=1
+    trap - EXIT INT TERM
+    rm -rf -- "$backup_dir" || _warn "事务快照清理失败: $backup_dir"
+    export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
+    if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
+    _success "Reality 节点已更新：SNI=${domain}。"
+)
+
+_caddy_camouflage_status() {
+    local domain port mode cert tag443 not_after
+    domain=$(_camouflage_state_field '.domain')
+    port=$(_camouflage_state_field '.fallbackPort')
+    mode=$(_camouflage_state_field '.certMode')
+    cert=$(_camouflage_state_field '.certificatePath')
+    tag443=$(_camouflage_state_field '.port443Tag')
+    echo ""
+    _info "--- Caddy 伪装站状态 ---"
+    echo "  域名: ${domain:-未部署}"
+    echo "  回落地址: 127.0.0.1:${port:-$CADDY_FALLBACK_PORT}"
+    echo "  证书方式: ${mode:-未部署}"
+    [ -n "$tag443" ] && echo "  443 端口节点: ${tag443}"
+    if [ -n "$cert" ] && [ -f "$cert" ]; then
+        not_after=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+        echo "  证书到期: ${not_after:-未知}"
+    fi
+    if _caddy_installed; then
+        echo "  Caddy: $("$CADDY_BIN" version 2>&1 | head -n1)"
+    else
+        echo "  Caddy: 未安装"
+    fi
+}
+
+_caddy_camouflage_deploy() {
+    local domain site_port="${CADDY_FALLBACK_PORT:-8443}"
+
+    if ! _caddy_installed; then
+        echo ""
+        _warn "伪装域名功能需要按需安装 Caddy（官方二进制，约 15 MB）。"
+        _info "Caddy 只在本机回环端口托管伪装站点，不会占用 443。"
+        local agree
+        read -r -p "是否同意安装 Caddy？[y/N]: " agree
+        if [[ ! "$agree" =~ ^[Yy]$ ]]; then
+            _info "已取消，未做任何改动。"
+            return 0
+        fi
+        _caddy_install || return 1
+    fi
+
+    while :; do
+        read -r -p "请输入已完成 A/AAAA 解析的伪装域名: " domain
+        domain=$(printf '%s' "$domain" | tr 'A-Z' 'a-z' | xargs)
+        _camouflage_domain_valid "$domain" && break
+        _error "域名格式无效（不要带 http:// 或路径，不能是 IP 地址）。"
+    done
+
+    if _check_port_conflict "$site_port" "tcp" "true" ""; then
+        _error "回环端口 ${site_port} 已被占用，无法部署伪装站点。"
+        return 1
+    fi
+
+    _camouflage_verify_domain_loop "$domain" || return 1
+
+    local cert_mode="acme" cert_path="" key_path=""
+    if _check_port_conflict "80" "tcp" "true" ""; then
+        _warn "80 端口被占用，Caddy 无法通过 ACME HTTP-01 签发与续期证书。"
+        echo "  1) 使用已有的公网可信证书（fullchain.pem + privkey.pem）"
+        echo "  2) 取消"
+        local cert_choice
+        read -r -p "请选择 [1-2] (默认: 2): " cert_choice
+        if [ "$cert_choice" != "1" ]; then
+            _info "已取消，未做任何改动。"
+            return 0
+        fi
+        read -r -p "证书路径 (fullchain.pem): " cert_path
+        read -r -p "私钥路径 (privkey.pem): " key_path
+        _validate_tls_key_pair "$cert_path" "$key_path" || return 1
+        cert_mode="custom"
+    fi
+
+    _caddy_write_config "$domain" "$site_port" "$cert_mode" "$cert_path" "$key_path" || return 1
+    _caddy_write_index_page || _warn "伪装页写入异常，继续使用现有页面。"
+
+    local validate_err
+    if ! validate_err=$("$CADDY_BIN" validate --config "$CADDY_CONF_FILE" --adapter caddyfile 2>&1); then
+        _error "Caddyfile 校验失败："
+        echo "$validate_err"
+        _caddy_cleanup_partial
+        return 1
+    fi
+    if ! _caddy_service install || ! _caddy_service restart; then
+        _error "Caddy 服务启动失败。"
+        _caddy_log_tail
+        _caddy_cleanup_partial
+        return 1
+    fi
+
+    if [ "$cert_mode" = "acme" ]; then
+        _info "正在等待 ACME 签发证书（最长 180 秒）..."
+        if ! _caddy_wait_cert "$domain" 180; then
+            _error "证书签发失败或超时。"
+            _caddy_log_tail
+            _caddy_cleanup_partial
+            return 1
+        fi
+    fi
+    if ! _caddy_verify_site "$domain" "$site_port"; then
+        _error "伪装站点自检失败：https://${domain}:${site_port}/ 未返回 200。"
+        _caddy_log_tail
+        _caddy_cleanup_partial
+        return 1
+    fi
+
+    local final_cert final_key not_after
+    final_cert=$(_caddy_cert_file "$domain" || true)
+    [ -n "$final_cert" ] || final_cert="$cert_path"
+    final_key="$key_path"
+    not_after=""
+    if [ -n "$final_cert" ] && [ -f "$final_cert" ]; then
+        not_after=$(openssl x509 -in "$final_cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+    fi
+    _camouflage_state_write "$domain" "$site_port" "$cert_mode" "$final_cert" "$final_key" "" "$not_after" \
+        || _warn "伪装站状态文件写入失败，下次进入可能需要重新部署。"
+    _success "伪装站点已就绪：https://${domain}/ （由 Reality 回落提供）"
+
+    echo ""
+    _warn "下一步会把所有 Reality 节点的 SNI 改为 ${domain}，并把其中一个迁移到 443 端口。"
+    local apply_choice tag443
+    read -r -p "是否现在执行？[Y/n]: " apply_choice
+    if [[ "$apply_choice" =~ ^[Nn]$ ]]; then
+        _info "已跳过。可稍后在 [21] 中单独执行。"
+        return 0
+    fi
+    _info "可用的 Reality 节点："
+    tag443=$(_camouflage_pick_port443_tag) || return 1
+    _camouflage_apply_reality apply "$domain" "$tag443" || return 1
+    _camouflage_state_rebind_tag "$tag443"
+    echo ""
+    _output_base64_subscription
+}
+
+_caddy_camouflage_teardown() {
+    local confirm revert remove_bin
+    read -r -p "确认停止并移除 Caddy 伪装站点？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        _info "已取消。"
+        return 1
+    fi
+    read -r -p "是否把 Reality 节点恢复为默认伪装域名 ${DEFAULT_SNI}？[Y/n]: " revert
+    if [[ ! "$revert" =~ ^[Nn]$ ]]; then
+        _camouflage_apply_reality revert "$DEFAULT_SNI" "" || _warn "Reality 节点恢复失败，请手动检查节点配置。"
+    fi
+    _caddy_service remove >/dev/null 2>&1 || true
+    rm -rf -- "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" 2>/dev/null || true
+    rm -f -- "$CADDY_CONF_FILE" "$CADDY_STATE_FILE" 2>/dev/null || true
+    read -r -p "是否同时删除 Caddy 二进制 ${CADDY_BIN}？[y/N]: " remove_bin
+    if [[ "$remove_bin" =~ ^[Yy]$ ]]; then
+        rm -f -- "$CADDY_BIN"
+    fi
+    _success "Caddy 伪装站点已移除。"
+    return 0
+}
+
+_caddy_camouflage_menu() {
+    local domain
+    domain=$(_camouflage_state_domain)
+    if [ -n "$domain" ]; then
+        _caddy_camouflage_status
+        echo ""
+        echo "  1) 重新部署 / 修复伪装站点"
+        echo "  2) 同步 Reality 节点到该域名（含 443 端口）"
+        echo "  3) 输出聚合 Base64 订阅"
+        echo "  4) 更换伪装域名"
+        echo "  5) 卸载伪装站点"
+        echo "  0) 返回"
+        local choice tag443
+        read -r -p "请选择 [0-5]: " choice
+        case "$choice" in
+            1) _caddy_camouflage_deploy ;;
+            2)
+                _info "可用的 Reality 节点："
+                tag443=$(_camouflage_pick_port443_tag) || return 1
+                _camouflage_apply_reality apply "$domain" "$tag443" || return 1
+                _camouflage_state_rebind_tag "$tag443"
+                echo ""
+                _output_base64_subscription
+                ;;
+            3) _output_base64_subscription ;;
+            4)
+                _caddy_camouflage_teardown || return 0
+                _caddy_camouflage_deploy
+                ;;
+            5) _caddy_camouflage_teardown ;;
+            0|*) return ;;
+        esac
+        return
+    fi
+    _caddy_camouflage_deploy
+}
+# --- Reality 伪装域名（Caddy）结束 ---
 
 _restore_full_transaction_snapshot() {
     local backup_dir="$1" restart_required="$2" context="$3"
@@ -6427,6 +7301,9 @@ _delete_node() {
 _check_config() {
     _info "正在按服务真实启动方式检查 config.json + relay.json..."
     _ensure_relay_config || return 1
+    if declare -F _caddy_cert_health_check >/dev/null 2>&1; then
+        _caddy_cert_health_check
+    fi
     local result
     if result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
         _success "config.json + relay.json 组合配置校验通过。"
@@ -6701,7 +7578,8 @@ _refresh_modified_node_artifacts() {
     case "$variant" in
         vless-reality)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
-            sni=$(printf '%s' "$node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+            # handshake 可能已指向本机回落站，客户端 SNI 必须取 server_name。
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // .tls.reality.handshake.server // empty')
             public_key=$(jq -r --arg tag "$tag" '.[$tag].publicKey // empty' "$METADATA_FILE")
             short_id=$(printf '%s' "$node" | jq -r '.tls.reality.short_id[0] // empty')
             [ -n "$public_key" ] || { _error "Reality 公钥元数据缺失，无法安全重建客户端配置。"; return 1; }
@@ -7497,10 +8375,18 @@ _modify_node_apply() (
         identity)
             case "$variant" in
                 vless-reality|any-reality)
-                    _atomic_modify_json "$CONFIG_FILE" '
-                        (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
-                        | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = $sni
-                    ' --arg tag "$tag" --arg sni "$arg1" || return 1
+                    # handshake 已指向本机回落站（Caddy 伪装站）时必须保持指向，
+                    # 否则 Reality 会回头连接自己的 443 端口形成自环。
+                    if _reality_handshake_is_local "$tag"; then
+                        _atomic_modify_json "$CONFIG_FILE" \
+                            '(.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni' \
+                            --arg tag "$tag" --arg sni "$arg1" || return 1
+                    else
+                        _atomic_modify_json "$CONFIG_FILE" '
+                            (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+                            | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = $sni
+                        ' --arg tag "$tag" --arg sni "$arg1" || return 1
+                    fi
                     ;;
                 shadowsocks-shadowtls)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .handshake.server) = $sni' --arg tag "$tag" --arg sni "$arg1" || return 1
@@ -7771,7 +8657,7 @@ _modify_node() {
         5)
             case "$variant" in
                 vless-reality|any-reality)
-                    current=$(printf '%s' "$expected_node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+                    current=$(printf '%s' "$expected_node" | jq -r '.tls.server_name // .tls.reality.handshake.server // empty')
                     read -r -p "请输入新伪装域名/SNI (当前: ${current}): " value
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
@@ -8545,6 +9431,7 @@ _main_menu() {
         echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} Argo 隧道节点"
         echo -e "    ${GREEN}[3]${NC} 查看节点链接      ${GREEN}[4]${NC} 删除节点"
         echo -e "    ${GREEN}[5]${NC} 修改节点          ${GREEN}[20]${NC} 一键换 SNI/重签证书"
+        echo -e "    ${GREEN}[21]${NC} Reality 伪装域名（Caddy）"
         echo ""
         
         # 服务控制
@@ -8578,7 +9465,7 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-20]: " choice
+        read -p "  请输入选项 [0-21]: " choice
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -8601,6 +9488,7 @@ _main_menu() {
             18) _require_singbox && _advanced_features ;;
             19) _xray_features ;;
             20) _require_singbox && _batch_change_sni ;;
+            21) _require_singbox && _caddy_camouflage_menu ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
