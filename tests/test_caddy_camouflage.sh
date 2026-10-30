@@ -483,6 +483,13 @@ check_true "卸载路径会清理 Caddy 二进制" "$?"
 # 安装必须校验官方 SHA-256，不允许无校验下载
 grep -q 'Caddy SHA-256 校验失败' "$ROOT/singbox.sh"
 check_true "Caddy 安装包含 SHA-256 校验" "$?"
+# 版本号改动容易漏同步：脚本与 README 必须一致，且不低于上一次发布
+script_version=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$ROOT/singbox.sh" | head -n 1)
+readme_version=$(sed -n 's/.*`singbox\.sh v\([0-9][0-9]*\)`.*/\1/p' "$ROOT/README.md" | head -n 1)
+check_true "脚本 SCRIPT_VERSION 为纯数字" "$([[ "$script_version" =~ ^[0-9]+$ ]] && echo 0 || echo 1)"
+check "README 记录的版本与脚本一致" "$script_version" "$readme_version"
+check_true "版本号不低于 v103（伪装域名跨协议复用）" \
+    "$([ "${script_version:-0}" -ge 103 ] && echo 0 || echo 1)"
 
 # 仅截取主菜单区域，避免匹配到 Argo 子菜单里的同名标题
 menu_section() { # 起始标题 结束标题
