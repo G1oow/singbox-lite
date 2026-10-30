@@ -3917,6 +3917,78 @@ EOF
     return 0
 }
 
+# 自签证书三元组，失败返回非零。
+_tls_material_self_signed() {
+    local domain="$1" tag="$2"
+    local cert_path="${SINGBOX_DIR}/${tag}.pem" key_path="${SINGBOX_DIR}/${tag}.key"
+    _generate_self_signed_cert "$domain" "$cert_path" "$key_path" || return 1
+    printf '%s\t%s\t%s\n' "$cert_path" "$key_path" "true"
+}
+
+# 手工证书三元组：用户自带证书时由用户决定是否跳过验证。
+_tls_material_manual() {
+    local domain="$1" cert_path="" key_path="" skip_verify="false" confirm
+    _info "请输入 ${domain} 对应的证书文件路径。"
+    _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
+    _info "  - (或)   使用 Cloudflare 源服务器证书"
+    read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
+    [ -f "$cert_path" ] || { _error "证书文件不存在: ${cert_path}"; return 1; }
+    read -p "请输入私钥文件 .key 的完整路径: " key_path
+    [ -f "$key_path" ] || { _error "私钥文件不存在: ${key_path}"; return 1; }
+    _validate_tls_key_pair "$cert_path" "$key_path" || return 1
+    read -p "您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        skip_verify="true"
+        _warn "已启用 skip-cert-verify: true，客户端将跳过证书验证。"
+    fi
+    printf '%s\t%s\t%s\n' "$cert_path" "$key_path" "$skip_verify"
+}
+
+# 生成节点 TLS 材料，输出 "<cert>\t<key>\t<skip_verify>"。
+# 伪装域名与 [21] 部署的伪装站一致时优先复用其 ACME 证书：证书公网可信，
+# 客户端无需跳过验证；否则退化为脚本自签证书或用户自带证书。
+_choose_tls_material() {
+    local domain="$1" tag="$2" shared="" choice
+    shared=$(_camouflage_tls_cert_for "$domain" 2>/dev/null || true)
+
+    if [ "${BATCH_MODE:-false}" = "true" ]; then
+        if [ -n "$shared" ]; then
+            _info "已复用伪装站证书（${domain}），客户端无需跳过证书验证。"
+            printf '%s\n' "$shared"
+            return 0
+        fi
+        _tls_material_self_signed "$domain" "$tag"
+        return $?
+    fi
+
+    echo "" >&2
+    echo "请选择证书类型:" >&2
+    if [ -n "$shared" ]; then
+        echo "  1) 复用伪装站证书 (${domain}，公网可信，客户端无需跳过验证)" >&2
+        echo "  2) 自动生成自签名证书 (适合CF回源/直连跳过验证)" >&2
+        echo "  3) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)" >&2
+        read -p "请选择 [1-3] (默认: 1): " choice
+        choice=${choice:-1}
+        case "$choice" in
+            1) printf '%s\n' "$shared"; return 0 ;;
+            2) _tls_material_self_signed "$domain" "$tag" && return 0; return 1 ;;
+            3) _tls_material_manual "$domain" && return 0; return 1 ;;
+            *) _error "无效选择。"; return 1 ;;
+        esac
+    fi
+    echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)" >&2
+    echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)" >&2
+    [ -n "$(_camouflage_state_domain)" ] && \
+        _info "如需复用 [21] 的伪装站证书，请把伪装域名填成 $(_camouflage_state_domain)。" >&2
+    read -p "请选择 [1-2] (默认: 1): " choice
+    choice=${choice:-1}
+    case "$choice" in
+        1) _tls_material_self_signed "$domain" "$tag" && return 0; return 1 ;;
+        2) _tls_material_manual "$domain" && return 0; return 1 ;;
+        *) _error "无效选择。"; return 1 ;;
+    esac
+}
+
 # 注意: _atomic_modify_json, _atomic_modify_yaml, _get_proxy_field, _add_node_to_yaml, _remove_node_from_yaml
 # 均在上方统一定义，此处不再重复定义以避免不一致
 
@@ -3974,20 +4046,27 @@ _show_node_link() {
             url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "hysteria2")
-            # 参数: password, sni, obfs_password(可选), port_hopping(可选)
-            local password="$1" sni="${2:-$DEFAULT_SNI}" obfs_password="$3" port_hopping="$4"
+            # 参数: password, sni, obfs_password(可选), port_hopping(可选), skip_verify(可选)
+            local password="$1" sni="${2:-$DEFAULT_SNI}" obfs_password="$3" port_hopping="$4" skip_verify="${5:-true}"
             local obfs_param=""; [[ -n "$obfs_password" ]] && obfs_param="&obfs=salamander&obfs-password=$(_url_encode "${obfs_password}")"
             local hop_param=""; [[ -n "$port_hopping" ]] && hop_param="&mport=${port_hopping}&ports=${port_hopping}"
-            local cert_path="${SINGBOX_DIR}/${tag}.pem"
-            local pin_param=""
-            local cert_pcs=$(_cert_sha256_hex "$cert_path")
-            [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
-            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
+            # 复用伪装站的公网可信证书时不能带 insecure/pinSHA256，否则客户端反而校验失败。
+            local insecure_param="&insecure=1" pin_param=""
+            if [ "$skip_verify" = "true" ]; then
+                local cert_path="${SINGBOX_DIR}/${tag}.pem" cert_pcs
+                cert_pcs=$(_cert_sha256_hex "$cert_path")
+                [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
+            else
+                insecure_param=""
+            fi
+            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}${insecure_param}${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
             ;;
         "tuic")
-            # 参数: uuid, password, sni
-            local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}"
-            url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$name")"
+            # 参数: uuid, password, sni, skip_verify(可选)
+            local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}" skip_verify="${4:-true}"
+            local insecure_param="&allow_insecure=1"
+            [ "$skip_verify" = "true" ] || insecure_param=""
+            url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native${insecure_param}#$(_url_encode "$name")"
             ;;
         "anytls")
             # v2rayN 使用 sing-box 运行 AnyTLS；其 sing-box 出站不会应用链接中的 pcs。
@@ -4196,43 +4275,9 @@ _add_vless_ws_tls() {
     local skip_verify=false
 
     # --- 步骤 5: 证书选择 ---
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-    fi
-
-    if [ "$cert_choice" == "1" ]; then
-        # 自签名证书
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-        skip_verify=true
-        _info "已生成自签名证书，客户端将跳过证书验证。"
-    else
-        # 手动上传证书
-        _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-        _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-        _info "  - (或)   使用 Cloudflare 源服务器证书"
-        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-
-        read -p "请输入私钥文件 .key 的完整路径: " key_path
-        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-        
-        # 询问是否跳过验证
-        read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
-        if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
-            skip_verify=true
-            _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
-        fi
-    fi
+    local tls_material
+    tls_material=$(_choose_tls_material "$camouflage_domain" "$tag") || return 1
+    IFS=$'\t' read -r cert_path key_path skip_verify <<< "$tls_material"
     
     # [!] 自定义名称
     local name=""
@@ -4369,40 +4414,9 @@ _add_vless_grpc_tls() {
     local key_path=""
     local skip_verify=false
 
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-    fi
-
-    if [ "$cert_choice" == "1" ]; then
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-        skip_verify=true
-        _info "已生成自签名证书，客户端将跳过证书验证。"
-    else
-        _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-        _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-        _info "  - (或)   使用 Cloudflare 源服务器证书"
-        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-
-        read -p "请输入私钥文件 .key 的完整路径: " key_path
-        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-
-        read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
-        if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
-            skip_verify=true
-            _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
-        fi
-    fi
+    local tls_material
+    tls_material=$(_choose_tls_material "$camouflage_domain" "$tag") || return 1
+    IFS=$'\t' read -r cert_path key_path skip_verify <<< "$tls_material"
 
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4537,43 +4551,9 @@ _add_trojan_ws_tls() {
     local skip_verify=false
 
     # --- 步骤 5: 证书选择 ---
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-        skip_verify=true
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-        if [ "$cert_choice" == "1" ]; then
-            cert_path="${SINGBOX_DIR}/${tag}.pem"
-            key_path="${SINGBOX_DIR}/${tag}.key"
-            _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-            skip_verify=true
-            _info "已生成自签名证书，客户端将跳过证书验证。"
-        else
-            # 手动上传证书
-            _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-            _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-            _info "  - (或)   使用 Cloudflare 源服务器证书"
-            read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-            [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-
-            read -p "请输入私钥文件 .key 的完整路径: " key_path
-            [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-            
-            # 询问是否跳过验证
-            read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
-            if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
-                skip_verify=true
-                _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
-            fi
-        fi
-    fi
+    local tls_material
+    tls_material=$(_choose_tls_material "$camouflage_domain" "$tag") || return 1
+    IFS=$'\t' read -r cert_path key_path skip_verify <<< "$tls_material"
 
     # [!] Trojan: 使用密码
     local password=""
@@ -4677,47 +4657,13 @@ _create_anytls_tls_node() {
     local name="$5"
 
     # --- 步骤 4: 证书选择 ---
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (推荐)"
-        echo "  2) 手动上传证书文件 (Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-    fi
-    
     local cert_path=""
     local key_path=""
-    local skip_verify=true  # 默认跳过验证 (自签证书需要)
+    local skip_verify=false
     local tag="anytls-in-${port}"
-    
-    if [ "$cert_choice" == "1" ]; then
-        # 自签名证书
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
-        _info "已生成自签名证书，客户端将跳过证书验证。"
-    else
-        # 手动上传证书
-        _info "请输入 ${server_name} 对应的证书文件路径。"
-        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-        
-        read -p "请输入私钥文件 .key 的完整路径: " key_path
-        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-        
-        # 询问是否跳过验证
-        read -p "$(echo -e ${YELLOW}"您是否正在使用自签名证书或Cloudflare源证书? (y/N): "${NC})" use_self_signed
-        if [[ "$use_self_signed" == "y" || "$use_self_signed" == "Y" ]]; then
-            skip_verify=true
-            _warning "已启用 'skip-cert-verify: true'，客户端将跳过证书验证。"
-        else
-            skip_verify=false
-        fi
-    fi
+    local tls_material
+    tls_material=$(_choose_tls_material "$server_name" "$tag") || return 1
+    IFS=$'\t' read -r cert_path key_path skip_verify <<< "$tls_material"
     
     # IPv6 处理
     local yaml_ip="$node_ip"
@@ -5118,9 +5064,9 @@ _add_hysteria2() {
     fi
 
     local tag="hy2-in-${port}"
-    local cert_path="${SINGBOX_DIR}/${tag}.pem"
-    local key_path="${SINGBOX_DIR}/${tag}.key"
-    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
+    local cert_path="" key_path="" skip_verify="true" tls_material
+    tls_material=$(_choose_tls_material "$server_name" "$tag") || return 1
+    IFS=$'\t' read -r cert_path key_path skip_verify <<< "$tls_material"
 
     local password=""
     if [ "$BATCH_MODE" = "true" ]; then
@@ -5235,7 +5181,7 @@ _add_hysteria2() {
         clash_ports="$port_hopping"
     fi
     
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg ports "$clash_ports" --arg pw "$password" --arg sn "$server_name" --arg up "$up" --arg down "$down" --arg op "$obfs_password" --arg hop "$port_hopping" \
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg ports "$clash_ports" --arg pw "$password" --arg sn "$server_name" --arg up "$up" --arg down "$down" --arg op "$obfs_password" --arg hop "$port_hopping" --arg sv "$skip_verify" \
         '{
             "name": $n,
             "type": "hysteria2",
@@ -5243,7 +5189,7 @@ _add_hysteria2() {
             "port": ($p|tonumber),
             "password": $pw,
             "sni": $sn,
-            "skip-cert-verify": true,
+            "skip-cert-verify": ($sv == "true"),
             "alpn": ["h3"],
             "up": ($up|tonumber),
             "down": ($down|tonumber)
@@ -5257,7 +5203,7 @@ _add_hysteria2() {
         _info "端口跳跃范围: ${port_hopping}"
     fi
     
-    _show_node_link "hysteria2" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$obfs_password" "$port_hopping" || return 1
+    _show_node_link "hysteria2" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$obfs_password" "$port_hopping" "$skip_verify" || return 1
 }
 
 _add_tuic() {
@@ -5282,10 +5228,9 @@ _add_tuic() {
     fi
 
     local tag="tuic-in-${port}"
-    local cert_path="${SINGBOX_DIR}/${tag}.pem"
-    local key_path="${SINGBOX_DIR}/${tag}.key"
-    
-    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
+    local cert_path="" key_path="" skip_verify="true" tls_material
+    tls_material=$(_choose_tls_material "$server_name" "$tag") || return 1
+    IFS=$'\t' read -r cert_path key_path skip_verify <<< "$tls_material"
 
     local uuid=$(${SINGBOX_BIN} generate uuid); local password=$(${SINGBOX_BIN} generate rand --hex 16)
     
@@ -5306,11 +5251,11 @@ _add_tuic() {
         '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
     
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$server_name" \
-        '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$server_name" --arg sv "$skip_verify" \
+        '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":($sv == "true"),"alpn":["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
     _success "TUICv5 节点 [${name}] 添加成功!"
-    _show_node_link "tuic" "$name" "$link_ip" "$port" "$tag" "$uuid" "$password" "$server_name" || return 1
+    _show_node_link "tuic" "$name" "$link_ip" "$port" "$tag" "$uuid" "$password" "$server_name" "$skip_verify" || return 1
 }
 
 _generate_shadowsocks_password() {
@@ -5747,14 +5692,21 @@ _view_nodes() {
                 local obfs_param=""; [[ -n "$op" && "$op" != "null" ]] && obfs_param="&obfs=salamander&obfs-password=$(_url_encode "${op}")"
                 # 端口跳跃参数
                 local hop_param=""; [[ -n "$hop" && "$hop" != "null" ]] && hop_param="&mport=${hop}&ports=${hop}"
-                url="hysteria2://${pw}@${link_ip}:${port}?sni=${sn}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$display_name")"
+                # 复用伪装站的公网可信证书时不能带 insecure，否则客户端反而拒绝连接。
+                local hy2_skip=$(_node_skip_verify "$proxy_name_to_find" "$node")
+                local hy2_insecure="&insecure=1"
+                [ "$hy2_skip" = "true" ] || hy2_insecure=""
+                url="hysteria2://${pw}@${link_ip}:${port}?sni=${sn}${hy2_insecure}${obfs_param}${hop_param}#$(_url_encode "$display_name")"
                 ;;
             "tuic")
                 # [资源优化] 合并2次jq为1次
                 local uuid pw
                 IFS=$'\t' read -r uuid pw <<< "$(echo "$node" | jq -r '[.users[0].uuid, .users[0].password] | @tsv')"
                 local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
-                url="tuic://${uuid}:${pw}@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
+                local tuic_skip=$(_node_skip_verify "$proxy_name_to_find" "$node")
+                local tuic_insecure="&allow_insecure=1"
+                [ "$tuic_skip" = "true" ] || tuic_insecure=""
+                url="tuic://${uuid}:${pw}@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native${tuic_insecure}#$(_url_encode "$display_name")"
                 ;;
             "anytls")
                 # [资源优化] 合并2次jq为1次
@@ -6202,11 +6154,14 @@ _batch_change_sni() {
 }
 # --- 一键换 SNI 与聚合订阅结束 ---
 
-# --- Reality 伪装域名（Caddy） ---
+# --- 伪装域名（Caddy） ---
 #
-# Reality 独占 443 端口；未通过认证的探针连接会被 Reality 原样转发到
-# Caddy 的 127.0.0.1 回环站点。Caddy 用 ACME HTTP-01 签发的真证书对外
-# 呈现一个正常的 HTTPS 网站，使伪装域名在浏览器里"真的存在"。
+# Caddy 用 ACME HTTP-01 签发的真证书托管伪装页，使伪装域名在浏览器里"真的存在"。
+# 该域名不是 Reality 独属：
+#   - 有 Reality 节点时，443 归 Reality，未认证探针被回落转发到 127.0.0.1 回环站点；
+#   - 没有 Reality 节点时（其他协议单独使用），443 空闲则让 Caddy 直接对外监听 443，
+#     同时保留回环站点，之后接入 Reality 可直接切回回落模式；
+#   - 任何 TLS 类协议（WS/gRPC/Trojan/AnyTLS/HY2/TUIC 等）都可以复用这张证书。
 # Caddy 仅在首次使用本功能时按需安装，卸载脚本时一并清理。
 
 # 读取 Caddy 伪装站状态文件的字段（无状态文件时输出空）
@@ -6222,15 +6177,16 @@ _camouflage_state_field() {
 
 _camouflage_state_write() {
     local domain="$1" port="$2" cert_mode="$3" cert_path="$4" key_path="$5" tag443="$6" not_after="$7"
+    local listen_scope="${8:-loopback}"
     local tmp
     tmp=$(mktemp "${CADDY_STATE_FILE}.tmp.XXXXXX") || return 1
     if ! jq -n \
         --arg domain "$domain" --arg port "$port" --arg certMode "$cert_mode" \
         --arg cert "$cert_path" --arg key "$key_path" --arg tag443 "$tag443" \
-        --arg notAfter "$not_after" \
+        --arg notAfter "$not_after" --arg scope "$listen_scope" \
         '{domain:$domain, fallbackPort:($port|tonumber), certMode:$certMode,
           certificatePath:$cert, keyPath:$key, port443Tag:$tag443,
-          certNotAfter:$notAfter, updatedAt:(now|todate)}' > "$tmp"; then
+          certNotAfter:$notAfter, listenScope:$scope, updatedAt:(now|todate)}' > "$tmp"; then
         rm -f -- "$tmp"
         return 1
     fi
@@ -6238,10 +6194,55 @@ _camouflage_state_write() {
     mv -f "$tmp" "$CADDY_STATE_FILE"
 }
 
+# 伪装站在公网 443 直接对外（无 Reality 节点占用 443 时才会启用）
+_camouflage_public_scope() {
+    [ "$(_camouflage_state_field '.listenScope')" = "public" ]
+}
+
 _camouflage_state_rebind_tag() {
     local tag="$1"
     [ -n "${CADDY_STATE_FILE:-}" ] && [ -s "$CADDY_STATE_FILE" ] || return 0
     _atomic_modify_json "$CADDY_STATE_FILE" '.port443Tag = $tag' --arg tag "$tag" >/dev/null 2>&1 || true
+}
+# 伪装站证书对，输出 "<cert>\t<key>"。ACME 模式下状态文件没有私钥路径，
+# 按 Caddy 的落盘命名约定（<domain>.crt / <domain>.key）推导。
+_caddy_cert_pair() {
+    local domain="${1:-}" cert key
+    domain="${domain:-$(_camouflage_state_field '.domain')}"
+    [ -n "$domain" ] || return 1
+    cert=$(_camouflage_state_field '.certificatePath')
+    key=$(_camouflage_state_field '.keyPath')
+    if [ -z "$cert" ] || [ ! -f "$cert" ]; then
+        cert=$(_caddy_cert_file "$domain" 2>/dev/null || true)
+        [ -n "$cert" ] || return 1
+    fi
+    if [ -z "$key" ] || [ ! -f "$key" ]; then
+        key="${cert%.crt}.key"
+    fi
+    [ -f "$cert" ] && [ -f "$key" ] || return 1
+    printf '%s\t%s\n' "$cert" "$key"
+}
+
+# 伪装站不是 Reality 独属：任何 TLS 类协议都可以复用同一张 ACME 证书。
+# 传入域名时必须与伪装站域名一致，否则客户端 SNI 与证书不匹配。
+_camouflage_shared_cert() {
+    local domain="${1:-}" state_domain
+    state_domain=$(_camouflage_state_domain)
+    [ -n "$state_domain" ] || return 1
+    if [ -n "$domain" ] && [ "$domain" != "$state_domain" ]; then
+        return 1
+    fi
+    _caddy_cert_pair "$state_domain"
+}
+
+# 创建/修改 TLS 类节点时的证书三元组 "<cert>\t<key>\t<skip_verify>"。
+# 复用公网可信证书后客户端无需跳过验证。
+_camouflage_tls_cert_for() {
+    local pair cert key
+    pair=$(_camouflage_shared_cert "${1:-}" 2>/dev/null) || return 1
+    IFS=$'\t' read -r cert key <<< "$pair"
+    [ -n "$cert" ] && [ -n "$key" ] || return 1
+    printf '%s\t%s\t%s\n' "$cert" "$key" "false"
 }
 
 _caddy_installed() {
@@ -6418,25 +6419,98 @@ _camouflage_verify_domain_loop() {
     return 1
 }
 
+# 单个站点的公共指令块；回环回落与公网 443 共用同一份内容。
+_caddy_site_body() {
+    local cert_mode="${1:-acme}" cert_path="${2:-}" key_path="${3:-}"
+    printf '\troot * %s\n' "$CADDY_WEB_ROOT"
+    printf '\tencode gzip\n\tfile_server\n'
+    if [ "$cert_mode" = "custom" ]; then
+        printf '\ttls %s %s\n' "$cert_path" "$key_path"
+    else
+        # TLS-ALPN-01 需要占用 443；443 可能归 Reality 或另一个站点，统一走 HTTP-01。
+        printf '\ttls {\n\t\tissuer acme {\n\t\t\tdisable_tlsalpn_challenge\n\t\t}\n\t}\n'
+    fi
+    printf '\tlog {\n\t\tlevel ERROR\n\t\toutput file %s\n\t}\n' "$CADDY_LOG_FILE"
+}
+
+# scope=loopback：只监听 127.0.0.1 回环端口，供 Reality 回落使用（默认）。
+# scope=public：额外直接对外监听 443，供没有 Reality 节点时单独伪装其他协议。
 _caddy_write_config() {
     local domain="$1" site_port="$2" cert_mode="${3:-acme}" cert_path="${4:-}" key_path="${5:-}"
+    local scope="${6:-loopback}"
     mkdir -p "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" || return 1
     chmod 700 "$CADDY_DATA_DIR" 2>/dev/null || true
     {
         printf '{\n\tadmin off\n\tskip_install_trust\n\tauto_https disable_redirects\n}\n\n'
-        printf 'https://%s:%s {\n' "$domain" "$site_port"
-        printf '\troot * %s\n' "$CADDY_WEB_ROOT"
-        printf '\tencode gzip\n\tfile_server\n'
-        if [ "$cert_mode" = "custom" ]; then
-            printf '\ttls %s %s\n' "$cert_path" "$key_path"
-        else
-            # TLS-ALPN-01 需要占用 443，而 443 归 Reality，必须禁用改用 HTTP-01。
-            printf '\ttls {\n\t\tissuer acme {\n\t\t\tdisable_tlsalpn_challenge\n\t\t}\n\t}\n'
+        if [ "$scope" = "public" ]; then
+            printf 'https://%s {\n' "$domain"
+            _caddy_site_body "$cert_mode" "$cert_path" "$key_path"
+            printf '}\n\n'
         fi
-        printf '\tlog {\n\t\tlevel ERROR\n\t\toutput file %s\n\t}\n' "$CADDY_LOG_FILE"
+        printf 'https://%s:%s {\n' "$domain" "$site_port"
+        # 公网模式下回环站点必须显式绑定 127.0.0.1，否则会重复占用全部地址。
+        [ "$scope" = "public" ] && printf '\tbind 127.0.0.1\n'
+        _caddy_site_body "$cert_mode" "$cert_path" "$key_path"
         printf '}\n'
     } > "$CADDY_CONF_FILE" || return 1
     chmod 600 "$CADDY_CONF_FILE" 2>/dev/null || true
+}
+
+# 443 空闲就让 Caddy 直接对外（没有 Reality 节点占用时），否则只用回环回落。
+# 重新部署时 443 可能正被本脚本自己的 Caddy 占用，这种情况要沿用原有范围。
+_camouflage_default_scope() {
+    local prev
+    prev=$(_camouflage_state_field '.listenScope')
+    if _check_port_conflict "443" "tcp" "true" ""; then
+        if [ "$prev" = "public" ] && _caddy_installed \
+            && _is_pid_file_running_cmd "$CADDY_PID_FILE" "$CADDY_BIN" 2>/dev/null; then
+            printf 'public'
+        elif [ "$prev" = "public" ] && declare -F _caddy_service >/dev/null 2>&1 \
+            && systemctl is-active --quiet "$CADDY_SERVICE_NAME" 2>/dev/null; then
+            printf 'public'
+        else
+            printf 'loopback'
+        fi
+    else
+        printf 'public'
+    fi
+}
+
+# 切换伪装站监听范围并更新状态文件；供 Reality 迁移 443 前后调用。
+_caddy_set_scope() {
+    local scope="$1" domain port cert_mode cert_path key_path
+    [ "$scope" = "public" ] || [ "$scope" = "loopback" ] || { _error "内部错误：未知监听范围 ${scope}。"; return 1; }
+    domain=$(_camouflage_state_domain)
+    port=$(_camouflage_state_field '.fallbackPort')
+    cert_mode=$(_camouflage_state_field '.certMode')
+    cert_path=$(_camouflage_state_field '.certificatePath')
+    key_path=$(_camouflage_state_field '.keyPath')
+    [ -n "$domain" ] || { _error "伪装站尚未部署，无法切换监听范围。"; return 1; }
+    port="${port:-$CADDY_FALLBACK_PORT}"
+    [ "$scope" = "$(_camouflage_state_field '.listenScope')" ] && return 0
+    if [ "$scope" = "public" ] && _check_port_conflict "443" "tcp" "true" ""; then
+        case "$(_camouflage_state_field '.listenScope')" in
+            public) : ;;
+            *)
+                _error "443 端口已被占用，无法让 Caddy 直接对外监听。"
+                return 1
+                ;;
+        esac
+    fi
+    _caddy_write_config "$domain" "$port" "$cert_mode" "$cert_path" "$key_path" "$scope" || return 1
+    local validate_err
+    if ! validate_err=$("$CADDY_BIN" validate --config "$CADDY_CONF_FILE" --adapter caddyfile 2>&1); then
+        _error "Caddyfile 校验失败："
+        echo "$validate_err"
+        return 1
+    fi
+    _caddy_service restart || { _error "Caddy 重启失败。"; return 1; }
+    _atomic_modify_json "$CADDY_STATE_FILE" '.listenScope = $scope' --arg scope "$scope" >/dev/null 2>&1 || true
+    if [ "$scope" = "loopback" ]; then
+        _info "Caddy 已让出公网 443，仅保留 127.0.0.1:${port} 回落站点。"
+    else
+        _info "Caddy 已直接对外监听公网 443。"
+    fi
 }
 
  # 下载单个伪装站文件；失败时保留现有文件，不中断流程。
@@ -6692,7 +6766,7 @@ _caddy_cert_health_check() {
     [ -n "${CADDY_STATE_FILE:-}" ] && [ -s "$CADDY_STATE_FILE" ] || return 0
     cert=$(_camouflage_state_field '.certificatePath')
     if [ -z "$cert" ] || [ ! -f "$cert" ]; then
-        _warn "Caddy 伪装站证书文件缺失，Reality 回落站点可能已失效（[21] 可重新部署）。"
+        _warn "伪装站证书文件缺失，Reality 回落与复用该证书的其他节点可能已失效（[21] 可重新部署）。"
         return 0
     fi
     if ! openssl x509 -checkend 1296000 -noout -in "$cert" >/dev/null 2>&1; then
@@ -6754,10 +6828,13 @@ _camouflage_pick_port443_tag() {
     printf '%s' "${tags[$((num - 1))]}"
 }
 
-# 事务保护下切换 Reality：状态锁 + 快照 + 组合校验 + 单次重启 + 失败回滚。
-_camouflage_apply_reality() (
-    local mode="$1" domain="$2" port443_tag="${3:-}"
-    [[ "$domain" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名格式无效。"; return 1; }
+# 事务保护下改写节点：状态锁 + 快照 + 组合校验 + 单次重启 + 失败回滚。
+# 具体改写交给 mutator（<context> 用于日志，也是回滚提示文案）。
+_camouflage_tx() (
+    local context="$1" mutator="$2"
+    shift 2
+    [ -n "$context" ] && [ -n "$mutator" ] || { _error "内部错误：事务参数缺失。"; return 1; }
+    command -v "$mutator" >/dev/null 2>&1 || { _error "内部错误：未找到 ${mutator}。"; return 1; }
 
     local lock_owned="false"
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
@@ -6782,11 +6859,35 @@ _camouflage_apply_reality() (
     else
         export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
     fi
-    trap 'camouflage_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then if ! _restore_full_transaction_snapshot "$backup_dir" "$restart_attempted" "Reality 伪装域名切换"; then camouflage_rc=1; fi; fi; export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0; if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi; exit "$camouflage_rc"' EXIT
+    # 事务内可能临时收回 Caddy 的公网 443；未提交时必须还原，否则伪装域名会失联。
+    trap 'camouflage_rc=$?; trap - EXIT INT TERM; if [ -n "${CAMOUFLAGE_SCOPE_RESTORE:-}" ]; then if ! _caddy_set_scope "$CAMOUFLAGE_SCOPE_RESTORE" >/dev/null 2>&1; then _warn "伪装站监听范围还原失败，请在 [21] 中重新部署。"; fi; fi; if [ "$committed" -ne 1 ]; then if ! _restore_full_transaction_snapshot "$backup_dir" "$restart_attempted" "$context"; then camouflage_rc=1; fi; fi; export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0; if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi; exit "$camouflage_rc"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
     _validate_protected_yaml_metadata || return 1
+    "$mutator" "$@" || return 1
+
+    if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
+        _error "伪装域名切换后的组合配置校验失败："
+        echo "$check_result"
+        return 1
+    fi
+    restart_attempted=1
+    _manage_service restart || { _error "伪装域名切换后服务重启失败。"; return 1; }
+
+    committed=1
+    trap - EXIT INT TERM
+    rm -rf -- "$backup_dir" || _warn "事务快照清理失败: $backup_dir"
+    export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
+    if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
+    return 0
+)
+
+# Reality 节点：apply 指向本机回落站，revert 恢复为外部域名握手。
+# 目标节点要占用 443 时，先收回 Caddy 的公网 443，失败则整笔回滚。
+_camouflage_mutate_reality() {
+    local mode="$1" domain="$2" port443_tag="${3:-}"
+    [[ "$domain" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名格式无效。"; return 1; }
 
     local list
     list=$(_camouflage_list_reality_nodes)
@@ -6796,9 +6897,24 @@ _camouflage_apply_reality() (
         local cur_port
         cur_port=$(jq -r --arg tag "$port443_tag" '.inbounds[]? | select(.tag == $tag) | .listen_port // empty' "$CONFIG_FILE")
         [ -n "$cur_port" ] || { _error "选定的 Reality 节点已不存在，请重新进入菜单。"; return 1; }
-        if [ "$cur_port" != "443" ] && _check_port_conflict "443" "tcp" "false" "$port443_tag"; then
-            _error "443 端口已被占用，无法把 Reality 迁移到 443。"
-            return 1
+        if [ "$cur_port" != "443" ]; then
+            if _camouflage_public_scope; then
+                # Caddy 正在占用公网 443；必须在 Reality 迁移前让出。
+                if ! _caddy_set_scope loopback; then
+                    _error "无法让 Caddy 让出公网 443，Reality 迁移已取消。"
+                    return 1
+                fi
+                CAMOUFLAGE_SCOPE_RESTORE="public"
+            fi
+            # Caddy 已让出 443，但仍可能读到旧的系统监听快照，故只信配置侧冲突。
+            if _check_port_in_singbox_file "$CONFIG_FILE" "443" "tcp" "$port443_tag"; then
+                _error "443 端口已被其他 sing-box 节点占用，无法把 Reality 迁移到 443。"
+                return 1
+            fi
+            if _check_port_occupied "443" "tcp"; then
+                _error "443 端口已被其它进程占用，无法把 Reality 迁移到 443。"
+                return 1
+            fi
         fi
     fi
 
@@ -6837,34 +6953,92 @@ _camouflage_apply_reality() (
     for i in "${!tags[@]}"; do
         _refresh_modified_node_artifacts "${tags[$i]}" "${names[$i]}" || return 1
     done
+    return 0
+}
 
-    if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
-        _error "伪装域名切换后的组合配置校验失败："
-        echo "$check_result"
+# 伪装域名不是 Reality 独属：其他 TLS 类节点同样可以复用该域名与伪装站证书。
+_camouflage_mutate_tls_nodes() {
+    local domain="$1"
+    local pair cert key plan tag variant port sni_target cert_mode name current type
+    pair=$(_camouflage_shared_cert "$domain") || {
+        _error "未找到 ${domain} 对应的伪装站证书，请先在 [21] 中部署伪装站点。"
         return 1
-    fi
-    restart_attempted=1
-    _manage_service restart || { _error "伪装域名切换后服务重启失败。"; return 1; }
+    }
+    IFS=$'\t' read -r cert key <<< "$pair"
+    plan=$(_batch_sni_plan 2>/dev/null) || { _error "无法读取现有节点信息。"; return 1; }
 
-    committed=1
-    trap - EXIT INT TERM
-    rm -rf -- "$backup_dir" || _warn "事务快照清理失败: $backup_dir"
-    export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
-    if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
-    _success "Reality 节点已更新：SNI=${domain}。"
-)
+    local tags=() ports=() types=() names=()
+    while IFS=$'\t' read -r tag variant port sni_target cert_mode name current; do
+        [ -n "$tag" ] || continue
+        [ "$sni_target" = "tls" ] || continue
+        type=$(jq -r --arg tag "$tag" '.inbounds[]? | select(.tag == $tag) | .type // empty' "$CONFIG_FILE")
+        tags+=("$tag")
+        ports+=("$port")
+        types+=("$type")
+        names+=("$(_find_proxy_name "$port" "$type" "$tag")")
+    done <<< "$plan"
+    [ "${#tags[@]}" -gt 0 ] || { _warn "当前没有可复用的 TLS 类节点。"; return 1; }
+
+    local i
+    for i in "${!tags[@]}"; do
+        tag="${tags[$i]}"
+        _atomic_modify_json "$CONFIG_FILE" '
+            (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+            | (.inbounds[] | select(.tag == $tag) | .tls.certificate_path) = $cert
+            | (.inbounds[] | select(.tag == $tag) | .tls.key_path) = $key
+        ' --arg tag "$tag" --arg sni "$domain" --arg cert "$cert" --arg key "$key" || return 1
+        # HY2 原生跳跃的全部子入站必须跟随主节点的 SNI 与证书。
+        if [ "${types[$i]}" = "hysteria2" ]; then
+            _atomic_modify_json "$CONFIG_FILE" '
+                .inbounds |= map(
+                    if ((.tag // "") | startswith($prefix)) then
+                        .tls.server_name = $sni
+                        | .tls.certificate_path = $cert
+                        | .tls.key_path = $key
+                    else . end)
+            ' --arg prefix "${tag}-hop-" --arg sni "$domain" --arg cert "$cert" --arg key "$key" || return 1
+        fi
+        # 换成公网可信证书后客户端无需再跳过验证。
+        if [ -n "${names[$i]}" ]; then
+            export OLD_NAME="${names[$i]}" NODE_SKIP_VERIFY="false"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME)))."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true")' || return 1
+        fi
+    done
+
+    for i in "${!tags[@]}"; do
+        _refresh_modified_node_artifacts "${tags[$i]}" "${names[$i]}" || return 1
+    done
+    return 0
+}
+
+_camouflage_apply_reality() {
+    _camouflage_tx "Reality 伪装域名切换" _camouflage_mutate_reality "$@" || return 1
+    _success "Reality 节点已更新：SNI=$2。"
+}
+
+_camouflage_apply_tls_nodes() {
+    local domain="$1"
+    _camouflage_tx "伪装域名同步到 TLS 类节点" _camouflage_mutate_tls_nodes "$domain" || return 1
+    _success "TLS 类节点已更新：SNI=${domain}，证书复用伪装站。"
+}
 
 _caddy_camouflage_status() {
-    local domain port mode cert tag443 not_after
+    local domain port mode cert tag443 not_after scope
     domain=$(_camouflage_state_field '.domain')
     port=$(_camouflage_state_field '.fallbackPort')
     mode=$(_camouflage_state_field '.certMode')
     cert=$(_camouflage_state_field '.certificatePath')
     tag443=$(_camouflage_state_field '.port443Tag')
+    scope=$(_camouflage_state_field '.listenScope')
     echo ""
     _info "--- Caddy 伪装站状态 ---"
     echo "  域名: ${domain:-未部署}"
     echo "  回落地址: 127.0.0.1:${port:-$CADDY_FALLBACK_PORT}"
+    if [ "$scope" = "public" ]; then
+        echo "  对外监听: 公网 443（Caddy 直接提供 HTTPS）"
+    else
+        echo "  对外监听: 仅本机回环（由 Reality 回落提供）"
+    fi
     echo "  证书方式: ${mode:-未部署}"
     [ -n "$tag443" ] && echo "  443 端口节点: ${tag443}"
     if [ -n "$cert" ] && [ -f "$cert" ]; then
@@ -6884,7 +7058,8 @@ _caddy_camouflage_deploy() {
     if ! _caddy_installed; then
         echo ""
         _warn "伪装域名功能需要按需安装 Caddy（官方二进制，约 15 MB）。"
-        _info "Caddy 只在本机回环端口托管伪装站点，不会占用 443。"
+        _info "有 Reality 节点时 Caddy 只在本机回环端口托管回落站点，不占用 443；"
+        _info "没有 Reality 节点时 443 空闲，则由 Caddy 直接对外提供 HTTPS 伪装页。"
         local agree
         read -r -p "是否同意安装 Caddy？[y/N]: " agree
         if [[ ! "$agree" =~ ^[Yy]$ ]]; then
@@ -6925,7 +7100,9 @@ _caddy_camouflage_deploy() {
         cert_mode="custom"
     fi
 
-    _caddy_write_config "$domain" "$site_port" "$cert_mode" "$cert_path" "$key_path" || return 1
+    local scope
+    scope=$(_camouflage_default_scope)
+    _caddy_write_config "$domain" "$site_port" "$cert_mode" "$cert_path" "$key_path" "$scope" || return 1
     _caddy_write_index_page || _warn "伪装页写入异常，继续使用现有页面。"
 
     local validate_err
@@ -6966,22 +7143,40 @@ _caddy_camouflage_deploy() {
     if [ -n "$final_cert" ] && [ -f "$final_cert" ]; then
         not_after=$(openssl x509 -in "$final_cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
     fi
-    _camouflage_state_write "$domain" "$site_port" "$cert_mode" "$final_cert" "$final_key" "" "$not_after" \
+    _camouflage_state_write "$domain" "$site_port" "$cert_mode" "$final_cert" "$final_key" "" "$not_after" "$scope" \
         || _warn "伪装站状态文件写入失败，下次进入可能需要重新部署。"
-    _success "伪装站点已就绪：https://${domain}/ （由 Reality 回落提供）"
+    if [ "$scope" = "public" ]; then
+        _success "伪装站点已就绪：https://${domain}/ （Caddy 直接对外监听 443）"
+    else
+        _success "伪装站点已就绪：127.0.0.1:${site_port} （由 Reality 回落提供）"
+    fi
 
     echo ""
-    _warn "下一步会把所有 Reality 节点的 SNI 改为 ${domain}，并把其中一个迁移到 443 端口。"
     local apply_choice tag443
-    read -r -p "是否现在执行？[Y/n]: " apply_choice
-    if [[ "$apply_choice" =~ ^[Nn]$ ]]; then
+    if [ -n "$(_camouflage_list_reality_nodes)" ]; then
+        _warn "下一步会把所有 Reality 节点的 SNI 改为 ${domain}，并把其中一个迁移到 443 端口。"
+        read -r -p "是否现在执行？[Y/n]: " apply_choice
+        if [[ "$apply_choice" =~ ^[Nn]$ ]]; then
+            _info "已跳过。可稍后在 [21] 中单独执行。"
+            return 0
+        fi
+        _info "可用的 Reality 节点："
+        tag443=$(_camouflage_pick_port443_tag) || return 1
+        _camouflage_apply_reality apply "$domain" "$tag443" || return 1
+        _camouflage_state_rebind_tag "$tag443"
+        echo ""
+        _output_base64_subscription
+        return 0
+    fi
+
+    # 没有 Reality 节点时，伪装域名与证书同样可以作用于其他 TLS 类协议。
+    _info "当前没有 Reality 节点。可将伪装域名与证书同步到其他 TLS 类节点（WS/gRPC/Trojan/AnyTLS/HY2/TUIC）。"
+    read -r -p "是否现在同步？[y/N]: " apply_choice
+    if [[ ! "$apply_choice" =~ ^[Yy]$ ]]; then
         _info "已跳过。可稍后在 [21] 中单独执行。"
         return 0
     fi
-    _info "可用的 Reality 节点："
-    tag443=$(_camouflage_pick_port443_tag) || return 1
-    _camouflage_apply_reality apply "$domain" "$tag443" || return 1
-    _camouflage_state_rebind_tag "$tag443"
+    _camouflage_apply_tls_nodes "$domain" || return 1
     echo ""
     _output_base64_subscription
 }
@@ -6993,9 +7188,23 @@ _caddy_camouflage_teardown() {
         _info "已取消。"
         return 1
     fi
-    read -r -p "是否把 Reality 节点恢复为默认伪装域名 ${DEFAULT_SNI}？[Y/n]: " revert
-    if [[ ! "$revert" =~ ^[Nn]$ ]]; then
-        _camouflage_apply_reality revert "$DEFAULT_SNI" "" || _warn "Reality 节点恢复失败，请手动检查节点配置。"
+    if [ -n "$(_camouflage_list_reality_nodes)" ]; then
+        read -r -p "是否把 Reality 节点恢复为默认伪装域名 ${DEFAULT_SNI}？[Y/n]: " revert
+        if [[ ! "$revert" =~ ^[Nn]$ ]]; then
+            _camouflage_apply_reality revert "$DEFAULT_SNI" "" || _warn "Reality 节点恢复失败，请手动检查节点配置。"
+        fi
+    fi
+    # 其他 TLS 类节点可能正在复用这张证书；删除后它们会失去有效证书。
+    local domain reuse_tag
+    domain=$(_camouflage_state_domain)
+    if [ -n "$domain" ] && [ -s "${CONFIG_FILE:-}" ]; then
+        reuse_tag=$(jq -r --arg d "/${domain}.crt" '
+            [.inbounds[]? | select((.tls.certificate_path // "") | endswith($d)) | .tag] | length
+        ' "$CONFIG_FILE" 2>/dev/null || true)
+        if [ -n "$reuse_tag" ] && [ "$reuse_tag" != "0" ]; then
+            _warn "有 ${reuse_tag} 个 TLS 类节点正在复用 ${domain} 的伪装站证书。"
+            _warn "移除后这些节点会失去有效证书，请随后用 [5] 改为自签或自定义证书。"
+        fi
     fi
     _caddy_service remove >/dev/null 2>&1 || true
     rm -rf -- "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" 2>/dev/null || true
@@ -7015,7 +7224,11 @@ _caddy_camouflage_menu() {
         _caddy_camouflage_status
         echo ""
         echo "  1) 重新部署 / 修复伪装站点"
-        echo "  2) 同步 Reality 节点到该域名（含 443 端口）"
+        if [ -n "$(_camouflage_list_reality_nodes)" ]; then
+            echo "  2) 同步 Reality 节点到该域名（含 443 端口）"
+        else
+            echo "  2) 同步其他 TLS 类节点到该域名（复用伪装站证书）"
+        fi
         echo "  3) 输出聚合 Base64 订阅"
         echo "  4) 更换伪装域名"
         echo "  5) 卸载伪装站点"
@@ -7025,10 +7238,14 @@ _caddy_camouflage_menu() {
         case "$choice" in
             1) _caddy_camouflage_deploy ;;
             2)
-                _info "可用的 Reality 节点："
-                tag443=$(_camouflage_pick_port443_tag) || return 1
-                _camouflage_apply_reality apply "$domain" "$tag443" || return 1
-                _camouflage_state_rebind_tag "$tag443"
+                if [ -n "$(_camouflage_list_reality_nodes)" ]; then
+                    _info "可用的 Reality 节点："
+                    tag443=$(_camouflage_pick_port443_tag) || return 1
+                    _camouflage_apply_reality apply "$domain" "$tag443" || return 1
+                    _camouflage_state_rebind_tag "$tag443"
+                else
+                    _camouflage_apply_tls_nodes "$domain" || return 1
+                fi
                 echo ""
                 _output_base64_subscription
                 ;;
@@ -7044,7 +7261,7 @@ _caddy_camouflage_menu() {
     fi
     _caddy_camouflage_deploy
 }
-# --- Reality 伪装域名（Caddy）结束 ---
+# --- 伪装域名（Caddy）结束 ---
 
 _restore_full_transaction_snapshot() {
     local backup_dir="$1" restart_required="$2" context="$3"
@@ -7551,6 +7768,23 @@ _validate_tls_key_pair() {
     [ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ] || { _error "证书与私钥不匹配。"; return 1; }
 }
 
+# 客户端是否跳过证书验证：以现有 YAML 为准；证书来自伪装站（公网可信）时强制为 false。
+_node_skip_verify() {
+    local proxy_name="$1" node="$2" skip_verify="false" cert_path domain
+    if [ -n "$proxy_name" ]; then
+        skip_verify=$(_get_proxy_field "$proxy_name" '.["skip-cert-verify"] // false')
+        [ "$skip_verify" = "true" ] || skip_verify="false"
+    fi
+    cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
+    domain=$(_camouflage_state_domain 2>/dev/null || true)
+    if [ -n "$cert_path" ] && [ -n "$domain" ]; then
+        case "$cert_path" in
+            */"${domain}.crt"|*/"${domain}"/*) skip_verify="false" ;;
+        esac
+    fi
+    printf '%s' "$skip_verify"
+}
+
 # 以服务器配置和规范化元数据为唯一事实源，完整重建客户端 YAML 与分享链接。
 _refresh_modified_node_artifacts() {
     local tag="$1" old_proxy_name="$2"
@@ -7620,7 +7854,7 @@ _refresh_modified_node_artifacts() {
             sni=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
             cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
             key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
-            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // false')
+            skip_verify=$(_node_skip_verify "$proxy_name" "$node")
             export NODE_UUID="$uuid" NODE_SNI="$sni" NODE_SKIP_VERIFY="$skip_verify"
             if [ "$variant" = "vless-ws-tls" ]; then
                 path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
@@ -7646,7 +7880,7 @@ _refresh_modified_node_artifacts() {
             path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
             cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
             key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
-            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // false')
+            skip_verify=$(_node_skip_verify "$proxy_name" "$node")
             export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_PATH="$path" NODE_SKIP_VERIFY="$skip_verify"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .["ws-opts"].path = env(NODE_PATH) | .["ws-opts"].headers.Host = env(NODE_SNI))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$path" "$skip_verify" "$cert_path" || return 1
@@ -7657,7 +7891,7 @@ _refresh_modified_node_artifacts() {
             [ -n "$sni" ] || sni=$(_get_proxy_field "$name" '.sni // ""')
             cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
             key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
-            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // false')
+            skip_verify=$(_node_skip_verify "$proxy_name" "$node")
             export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_SKIP_VERIFY="$skip_verify"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true"))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$skip_verify" "$cert_path" || return 1
@@ -7680,8 +7914,9 @@ _refresh_modified_node_artifacts() {
             down=$(jq -r --arg tag "$tag" '.[$tag].down // "100"' "$METADATA_FILE")
             cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
             key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
-            export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_OBFS="$obfs_password" NODE_HOP="$hop" NODE_UP="$up" NODE_DOWN="$down"
-            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | .up = (env(NODE_UP) | tonumber) | .down = (env(NODE_DOWN) | tonumber))' || return 1
+            skip_verify=$(_node_skip_verify "$proxy_name" "$node")
+            export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_OBFS="$obfs_password" NODE_HOP="$hop" NODE_UP="$up" NODE_DOWN="$down" NODE_SKIP_VERIFY="$skip_verify"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | .up = (env(NODE_UP) | tonumber) | .down = (env(NODE_DOWN) | tonumber) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true"))' || return 1
             if [ -n "$obfs_password" ]; then
                 _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.obfs = "salamander" | ."obfs-password" = env(NODE_OBFS))' || return 1
             else
@@ -7692,7 +7927,7 @@ _refresh_modified_node_artifacts() {
             else
                 _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(NEW_NAME)) | .ports)' || return 1
             fi
-            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$obfs_password" "$hop" || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$obfs_password" "$hop" "$skip_verify" || return 1
             ;;
         tuic)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
@@ -7701,9 +7936,10 @@ _refresh_modified_node_artifacts() {
             [ -n "$sni" ] || sni=$(_get_proxy_field "$name" '.sni // ""')
             cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
             key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
-            export NODE_UUID="$uuid" NODE_PASSWORD="$password" NODE_SNI="$sni"
-            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .password = env(NODE_PASSWORD) | .sni = env(NODE_SNI))' || return 1
-            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$password" "$sni" || return 1
+            skip_verify=$(_node_skip_verify "$proxy_name" "$node")
+            export NODE_UUID="$uuid" NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_SKIP_VERIFY="$skip_verify"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true"))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$password" "$sni" "$skip_verify" || return 1
             ;;
         shadowsocks)
             method=$(printf '%s' "$node" | jq -r '.method')
@@ -8699,9 +8935,18 @@ _modify_node() {
                     [ -n "$current" ] || current=$(_get_proxy_field "$proxy_name" '.sni // .servername // ""')
                     read -r -p "请输入新 SNI/证书域名 (当前: ${current}): " value
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
+                    local shared_pair="" shared_cert="" shared_key=""
+                    if [ "$value" = "$(_camouflage_state_domain)" ]; then
+                        shared_pair=$(_camouflage_shared_cert "$value" 2>/dev/null || true)
+                        [ -n "$shared_pair" ] && IFS=$'\t' read -r shared_cert shared_key <<< "$shared_pair"
+                    fi
                     echo "  1) 重新生成脚本管理的自签证书"
                     echo "  2) 使用自定义证书和私钥"
-                    read -r -p "请选择证书方式 [1-2] (默认: 1): " cert_choice; cert_choice=${cert_choice:-1}
+                    [ -n "$shared_cert" ] && echo "  3) 复用伪装站证书 (公网可信，客户端无需跳过验证)"
+                    local cert_default="1"
+                    [ -n "$shared_cert" ] && cert_default="3"
+                    read -r -p "请选择证书方式 [1-3] (默认: ${cert_default}): " cert_choice
+                    cert_choice=${cert_choice:-$cert_default}
                     if [ "$cert_choice" = "1" ]; then
                         _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" self_signed
                     elif [ "$cert_choice" = "2" ]; then
@@ -8711,6 +8956,8 @@ _modify_node() {
                         read -r -p "客户端是否跳过证书链验证？[y/N]: " confirm
                         skip_verify=false; [[ "$confirm" =~ ^[Yy]$ ]] && skip_verify=true
                         _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" custom "$cert_path" "$key_path" "$skip_verify"
+                    elif [ "$cert_choice" = "3" ] && [ -n "$shared_cert" ]; then
+                        _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" custom "$shared_cert" "$shared_key" false
                     else
                         _error "无效选择。"; return 1
                     fi
@@ -9485,7 +9732,7 @@ _main_menu() {
         echo -e "    ${GREEN}[18]${NC} 落地/中转/第三方节点导入"
         echo -e "    ${GREEN}[19]${NC} Xray 节点管理"
         echo -e "    ${GREEN}[20]${NC} 一键换 SNI/重签证书"
-        echo -e "    ${GREEN}[21]${NC} Reality 伪装域名（Caddy）"
+        echo -e "    ${GREEN}[21]${NC} 伪装域名（Caddy）"
         echo ""
         
         echo -e "  ─────────────────────────────────────────────────"
