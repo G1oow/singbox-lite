@@ -245,10 +245,13 @@ case "$conf" in
     *) echo "ok    loopback 模式只生成回环站点" ;;
 esac
 case "$conf" in
-    *"bind 127.0.0.1"*) echo "FAIL  loopback 模式不应绑定 127.0.0.1"; fail=$((fail + 1)) ;;
-    *) echo "ok    loopback 模式无需显式 bind" ;;
+    *"https://vpn.example.com:8443 {"*) echo "ok    loopback 模式监听回落端口" ;;
+    *) echo "FAIL  loopback 模式缺少回落站点"; fail=$((fail + 1)) ;;
 esac
-
+case "$conf" in
+    *"bind 127.0.0.1"*) echo "ok    loopback 模式显式绑定 127.0.0.1" ;;
+    *) echo "FAIL  loopback 模式未绑定 127.0.0.1（回落端口会暴露到公网）"; fail=$((fail + 1)) ;;
+esac
 _caddy_write_config "vpn.example.com" 8443 "acme" "" "" "public"
 conf="$(cat "$CADDY_CONF_FILE")"
 case "$conf" in
@@ -256,13 +259,15 @@ case "$conf" in
     *) echo "FAIL  public 模式缺少对外站点"; fail=$((fail + 1)) ;;
 esac
 case "$conf" in
-    *"bind 127.0.0.1"*) echo "ok    public 模式回环站点绑定 127.0.0.1" ;;
-    *) echo "FAIL  public 模式回环站点未绑定 127.0.0.1"; fail=$((fail + 1)) ;;
+    *"https://vpn.example.com:8443 {"*) echo "FAIL  public 模式不得再写回环站点（会触发 automation policy 冲突）"; fail=$((fail + 1)) ;;
+    *) echo "ok    public 模式不写回环站点" ;;
 esac
-case "$conf" in
-    *"https://vpn.example.com:8443 {"*) echo "ok    public 模式保留回环回落入口" ;;
-    *) echo "FAIL  public 模式缺少回环回落入口"; fail=$((fail + 1)) ;;
-esac
+check "public 模式只生成一个 site 块" "1" "$(grep -c '^https://' "$CADDY_CONF_FILE")"
+check "同一域名只有一份证书自动化策略" "1" "$(grep -c 'issuer acme' "$CADDY_CONF_FILE")"
+
+_caddy_write_config "vpn.example.com" 8443 "acme" "" "" "loopback"
+check "loopback 模式只生成一个 site 块" "1" "$(grep -c '^https://' "$CADDY_CONF_FILE")"
+check "loopback 模式只有一份证书自动化策略" "1" "$(grep -c 'issuer acme' "$CADDY_CONF_FILE")"
 
 # 443 是否被占用决定默认监听范围
 PORT_CONFLICT_443="false"
