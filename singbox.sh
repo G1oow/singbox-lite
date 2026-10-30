@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="103"
+export SCRIPT_VERSION="104"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -6419,7 +6419,7 @@ _camouflage_verify_domain_loop() {
     return 1
 }
 
-# 单个站点的公共指令块；回环回落与公网 443 共用同一份内容。
+# 单个站点的公共指令块。
 _caddy_site_body() {
     local cert_mode="${1:-acme}" cert_path="${2:-}" key_path="${3:-}"
     printf '\troot * %s\n' "$CADDY_WEB_ROOT"
@@ -6433,8 +6433,11 @@ _caddy_site_body() {
     printf '\tlog {\n\t\tlevel ERROR\n\t\toutput file %s\n\t}\n' "$CADDY_LOG_FILE"
 }
 
+# 每个监听范围只生成一个 site 块。同一个域名若出现两个带 tls 的 site 块，
+# Caddy 会以 "hostname appears in more than one automation policy" 拒绝 adapt，
+# 因此 public 与 loopback 互斥，由 _caddy_set_scope 在需要时重写。
 # scope=loopback：只监听 127.0.0.1 回环端口，供 Reality 回落使用（默认）。
-# scope=public：额外直接对外监听 443，供没有 Reality 节点时单独伪装其他协议。
+# scope=public：直接对外监听 443，供没有 Reality 节点时单独伪装其他协议。
 _caddy_write_config() {
     local domain="$1" site_port="$2" cert_mode="${3:-acme}" cert_path="${4:-}" key_path="${5:-}"
     local scope="${6:-loopback}"
@@ -6445,18 +6448,18 @@ _caddy_write_config() {
         if [ "$scope" = "public" ]; then
             printf 'https://%s {\n' "$domain"
             _caddy_site_body "$cert_mode" "$cert_path" "$key_path"
-            printf '}\n\n'
+            printf '}\n'
+        else
+            printf 'https://%s:%s {\n' "$domain" "$site_port"
+            # 回环站点仅供 Reality 回落，必须显式绑定 127.0.0.1；
+            # 否则 Caddy 会监听 `*:${site_port}`，把回落端口暴露到公网。
+            printf '\tbind 127.0.0.1\n'
+            _caddy_site_body "$cert_mode" "$cert_path" "$key_path"
+            printf '}\n'
         fi
-        printf 'https://%s:%s {\n' "$domain" "$site_port"
-        # 公网模式下回环站点必须显式绑定 127.0.0.1，否则会重复占用全部地址。
-        [ "$scope" = "public" ] && printf '\tbind 127.0.0.1\n'
-        _caddy_site_body "$cert_mode" "$cert_path" "$key_path"
-        printf '}\n'
     } > "$CADDY_CONF_FILE" || return 1
     chmod 600 "$CADDY_CONF_FILE" 2>/dev/null || true
 }
-
-# 443 空闲就让 Caddy 直接对外（没有 Reality 节点占用时），否则只用回环回落。
 # 重新部署时 443 可能正被本脚本自己的 Caddy 占用，这种情况要沿用原有范围。
 _camouflage_default_scope() {
     local prev
@@ -7128,8 +7131,11 @@ _caddy_camouflage_deploy() {
             return 1
         fi
     fi
-    if ! _caddy_verify_site "$domain" "$site_port"; then
-        _error "伪装站点自检失败：https://${domain}:${site_port}/ 未返回 200。"
+    # public 模式只监听 443，不能再拿回环端口自检，否则必然失败并误回滚。
+    local verify_port="$site_port"
+    [ "$scope" = "public" ] && verify_port="443"
+    if ! _caddy_verify_site "$domain" "$verify_port"; then
+        _error "伪装站点自检失败：https://${domain}:${verify_port}/ 未返回 200。"
         _caddy_log_tail
         _caddy_cleanup_partial
         return 1
