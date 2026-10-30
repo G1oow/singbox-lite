@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v100`、`advanced_relay.sh v19`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v103`、`advanced_relay.sh v19`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -14,6 +14,7 @@
 | `advanced_relay.sh` | 落地/中转、第三方节点导入、端口转发和规则管理 |
 | `parser.sh` | 第三方节点链接的严格解析器，通常由中转脚本调用 |
 | `xray_manager.sh` | Xray-core 安装、服务和节点管理，与主脚本共享 `clash.yaml` |
+| `AGENTS.md` | 开发约定：测试流程、版本号规则、代码风格、脱敏与危险操作边界 |
 
 ## 主要能力
 
