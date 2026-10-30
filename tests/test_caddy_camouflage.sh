@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reality 伪装域名（Caddy）回归测试
+# 伪装域名（Caddy）与跨协议证书复用回归测试
 # 依赖: bash、jq、sed、grep
 # 用法: bash tests/test_caddy_camouflage.sh
 set -uo pipefail
@@ -33,7 +33,7 @@ export GITHUB_RAW_BASE="https://example.invalid/singbox-lite/main"
 RED='' GREEN='' YELLOW='' CYAN='' NC='' ORANGE=''
 
 # singbox.sh 会直接执行主菜单，不能 source 整个文件，只能按注释锚点抽取被测块
-sed -n '/^# --- Reality 伪装域名（Caddy） ---$/,/^# --- Reality 伪装域名（Caddy）结束 ---$/p' \
+sed -n '/^# --- 伪装域名（Caddy） ---$/,/^# --- 伪装域名（Caddy）结束 ---$/p' \
     "$ROOT/singbox.sh" > "$WORK/camouflage.sh"
 [ -s "$WORK/camouflage.sh" ] || { echo "抽取伪装域名功能块失败" >&2; exit 1; }
 sed -n '/^_reality_handshake_is_local() {$/,/^}$/p' "$ROOT/singbox.sh" > "$WORK/handshake-local.sh"
@@ -79,6 +79,25 @@ _atomic_modify_json() {
     [ -f "$file" ] || return 1
     jq "$@" "$filter" "$file" > "${file}.new" && mv "${file}.new" "$file"
 }
+# 443 占用情况由用例通过 PORT_CONFLICT_443 控制，测试不依赖真实端口状态
+_check_port_conflict() {
+    local port="$1" proto="${2:-tcp}"
+    [ "$port" = "443" ] && [ "${PORT_CONFLICT_443:-false}" = "true" ] && return 0
+    return 1
+}
+# 路径比较在不同平台（含 MSYS 路径转换）下不可靠，这里只比对文件名与目录标记。
+check_cert_pair() { # 描述 实际 "<cert>\t<key>"
+    local desc="$1" actual="$2" cert key
+    IFS=$'\t' read -r cert key <<< "$actual"
+    if [ "$(basename "${cert:-none}")" = "vpn.example.com.crt" ] \
+        && [ "$(basename "${key:-none}")" = "vpn.example.com.key" ]; then
+        printf 'ok    %s\n' "$desc"
+    else
+        printf 'FAIL  %s\n      证书对不符合预期: %s\n' "$desc" "$actual"
+        fail=$((fail + 1))
+    fi
+}
+_find_proxy_name() { printf '%s' "${3:-}"; }
 _list_main_primary_inbounds() {
     local node tag
     while IFS= read -r node; do
@@ -218,6 +237,133 @@ case "$conf" in
     *) echo "ok    自定义证书模式未启用 ACME" ;;
 esac
 
+# --- 监听范围：无 Reality 节点时 Caddy 直接对外 ---------------------------
+_caddy_write_config "vpn.example.com" 8443 "acme" "" "" "loopback"
+conf="$(cat "$CADDY_CONF_FILE")"
+case "$conf" in
+    *"https://vpn.example.com {"*) echo "FAIL  loopback 模式不应直接对外监听 443"; fail=$((fail + 1)) ;;
+    *) echo "ok    loopback 模式只生成回环站点" ;;
+esac
+case "$conf" in
+    *"bind 127.0.0.1"*) echo "FAIL  loopback 模式不应绑定 127.0.0.1"; fail=$((fail + 1)) ;;
+    *) echo "ok    loopback 模式无需显式 bind" ;;
+esac
+
+_caddy_write_config "vpn.example.com" 8443 "acme" "" "" "public"
+conf="$(cat "$CADDY_CONF_FILE")"
+case "$conf" in
+    *"https://vpn.example.com {"*) echo "ok    public 模式直接对外监听 443" ;;
+    *) echo "FAIL  public 模式缺少对外站点"; fail=$((fail + 1)) ;;
+esac
+case "$conf" in
+    *"bind 127.0.0.1"*) echo "ok    public 模式回环站点绑定 127.0.0.1" ;;
+    *) echo "FAIL  public 模式回环站点未绑定 127.0.0.1"; fail=$((fail + 1)) ;;
+esac
+case "$conf" in
+    *"https://vpn.example.com:8443 {"*) echo "ok    public 模式保留回环回落入口" ;;
+    *) echo "FAIL  public 模式缺少回环回落入口"; fail=$((fail + 1)) ;;
+esac
+
+# 443 是否被占用决定默认监听范围
+PORT_CONFLICT_443="false"
+check "443 空闲时默认直接对外" "public" "$(_camouflage_default_scope)"
+PORT_CONFLICT_443="true"
+check "443 被占用时只用回环回落" "loopback" "$(_camouflage_default_scope)"
+PORT_CONFLICT_443="false"
+
+# --- 伪装站证书被其他协议复用 -------------------------------------------
+mkdir -p "${CADDY_DATA_DIR}/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com"
+ACME_DIR="${CADDY_DATA_DIR}/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com"
+# MSYS 下 -subj "/CN=..." 会被路径转换破坏，改用配置文件声明主题
+openssl_conf="$(mktemp)"
+cat > "$openssl_conf" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = vpn.example.com
+[ext]
+subjectAltName = DNS:vpn.example.com
+EOF
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 30 -config "$openssl_conf" \
+    -keyout "${ACME_DIR}/vpn.example.com.key" -out "${ACME_DIR}/vpn.example.com.crt" >/dev/null 2>&1
+check_true "生成 ACME 目录下的测试证书" "$?"
+rm -f "$openssl_conf"
+
+_camouflage_state_write "vpn.example.com" 8443 "acme" "${ACME_DIR}/vpn.example.com.crt" "" "" "" "public"
+pair="$(_caddy_cert_pair "vpn.example.com")"
+check_cert_pair "ACME 证书对可解析" "$pair"
+
+shared="$(_camouflage_shared_cert "vpn.example.com")"
+check_cert_pair "伪装域名可复用证书" "$shared"
+_camouflage_shared_cert "other.example.com" >/dev/null 2>&1
+check_false "域名不一致时拒绝复用证书" "$?"
+
+tls_triplet="$(_camouflage_tls_cert_for "vpn.example.com")"
+check "复用伪装站证书时客户端无需跳过验证" "false" "${tls_triplet##*$'\t'}"
+_camouflage_tls_cert_for "other.example.com" >/dev/null 2>&1
+check_false "域名不一致时不返回证书三元组" "$?"
+
+check "状态文件记录监听范围" "public" "$(_camouflage_state_field '.listenScope')"
+check_true "public 模式判定" "$(_camouflage_public_scope && echo 0 || echo 1)"
+
+_camouflage_state_write "vpn.example.com" 8443 "acme" "${ACME_DIR}/vpn.example.com.crt" "" "" "" "loopback"
+_camouflage_public_scope
+check_false "loopback 模式不判定为对外监听" "$?"
+
+# --- 其他 TLS 协议同步到伪装域名 ----------------------------------------
+cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[
+ {"type":"vless","tag":"vless-ws-in-30001","listen_port":30001,
+  "users":[{"uuid":"11111111-1111-1111-1111-111111111111"}],
+  "tls":{"enabled":true,"server_name":"old.example.com",
+         "certificate_path":"OLD_CERT","key_path":"OLD_KEY"},
+  "transport":{"type":"ws","path":"/ws"}}
+]}
+JSON
+cat > "$METADATA_FILE" <<'JSON'
+{"vless-ws-in-30001":{"name":"WS 节点","yaml":true}}
+JSON
+cat > "$CLASH_YAML_FILE" <<'YAML'
+proxies:
+  - name: "WS 节点"
+    type: vless
+    server: 198.51.100.7
+    port: 30001
+    skip-cert-verify: true
+YAML
+_camouflage_state_write "vpn.example.com" 8443 "acme" "${ACME_DIR}/vpn.example.com.crt" "" "" "" "public"
+
+_batch_sni_plan() {
+    printf 'vless-ws-in-30001\tvless-ws-tls\t30001\ttls\tcustom\tWS 节点\told.example.com\n'
+}
+_refresh_modified_node_artifacts() { return 0; }
+_atomic_modify_yaml() {
+    local file="$1" filter="$2"
+    [ -f "$file" ] || return 1
+    case "$filter" in
+        *skip-cert-verify*) sed -i 's/skip-cert-verify: true/skip-cert-verify: false/' "$file" ;;
+    esac
+    return 0
+}
+
+_camouflage_mutate_tls_nodes "vpn.example.com"
+check_true "TLS 类节点可复用伪装域名" "$?"
+check "TLS 节点 SNI 更新为伪装域名" "vpn.example.com" \
+    "$(jq -r '.inbounds[] | select(.tag == "vless-ws-in-30001") | .tls.server_name' "$CONFIG_FILE")"
+check "TLS 节点证书改为伪装站证书" "vpn.example.com.crt" \
+    "$(basename "$(jq -r '.inbounds[] | select(.tag == "vless-ws-in-30001") | .tls.certificate_path' "$CONFIG_FILE")")"
+check "TLS 节点私钥改为伪装站私钥" "vpn.example.com.key" \
+    "$(basename "$(jq -r '.inbounds[] | select(.tag == "vless-ws-in-30001") | .tls.key_path' "$CONFIG_FILE")")"
+check "复用公网证书后客户端不再跳过验证" "false" \
+    "$(sed -n 's/.*skip-cert-verify: //p' "$CLASH_YAML_FILE")"
+
+# 伪装站不存在时不能凭空同步
+rm -f "$CADDY_STATE_FILE"
+_camouflage_mutate_tls_nodes "vpn.example.com" >/dev/null 2>&1
+check_false "伪装站未部署时拒绝同步" "$?"
+
 # --- 443 候选选择 -------------------------------------------------------
 write_nodes() {
     cat > "$CONFIG_FILE" <<'JSON'
@@ -319,6 +465,16 @@ grep -q '_reality_handshake_is_local' "$ROOT/singbox.sh"
 check_true "节点修改已接入 handshake 保持逻辑" "$?"
 grep -q '_caddy_cert_health_check' "$ROOT/singbox.sh"
 check_true "配置检查已接入证书健康检查" "$?"
+grep -q '同步其他 TLS 类节点到该域名' "$ROOT/singbox.sh"
+check_true "无 Reality 节点时菜单提示跨协议同步" "$?"
+grep -q '_camouflage_apply_tls_nodes' "$ROOT/singbox.sh"
+check_true "[21] 已接入跨协议证书复用" "$?"
+grep -q '_choose_tls_material' "$ROOT/singbox.sh"
+check_true "节点创建已接入证书选择菜单" "$?"
+grep -q '正在复用 ${domain} 的伪装站证书' "$ROOT/singbox.sh"
+check_true "卸载伪装站会提示证书被复用" "$?"
+grep -q '_caddy_set_scope loopback' "$ROOT/singbox.sh"
+check_true "Reality 迁移 443 前会让 Caddy 退出公网 443" "$?"
 # 卸载脚本必须显式清理 Caddy 产物，否则会留下常驻进程
 grep -q '_caddy_service remove' "$ROOT/singbox.sh"
 check_true "卸载路径会停止 Caddy 服务" "$?"
