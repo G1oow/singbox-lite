@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="110"
+export SCRIPT_VERSION="111"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -6667,12 +6667,20 @@ _caddy_wait_cert() {
     return 1
 }
 
+# 自检必须容忍启动竞态：实测 `systemctl restart` 返回只需约 30ms，而 Caddy
+# 真正开始监听 8443 要约 300ms。原实现 restart 后立刻单次 curl，正好落在
+# 这个窗口里，于是"证书已签发、服务也正常"的部署被判为失败并整笔回滚。
 _caddy_verify_site() {
-    local domain="$1" port="$2" code
+    local domain="$1" port="$2" timeout="${3:-30}" waited=0 code
     command -v curl >/dev/null 2>&1 || return 0
-    code=$(curl -fsS --max-time 20 --resolve "${domain}:${port}:127.0.0.1" \
-        -o /dev/null -w '%{http_code}' "https://${domain}:${port}/" 2>/dev/null) || return 1
-    [ "$code" = "200" ]
+    while :; do
+        code=$(curl -fsS --max-time 20 --resolve "${domain}:${port}:127.0.0.1" \
+            -o /dev/null -w '%{http_code}' "https://${domain}:${port}/" 2>/dev/null) || code=""
+        [ "$code" = "200" ] && return 0
+        [ "$waited" -ge "$timeout" ] && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
 }
 
 _caddy_log_tail() {
@@ -6854,7 +6862,28 @@ _caddy_owns_port() {
     _is_pid_running_cmd "$pid" "$CADDY_BIN"
 }
 
+# 部署失败时的收尾。默认只停服务，保留 Caddyfile / www / 尤其是证书目录。
+# 删证书的代价远大于保留：
+#   1) 引用该证书的 hy2/tuic 节点立刻变成"指向已删除证书"，config.json
+#      陷入不可重启状态（sing-box 直接 FATAL），需要人工救；
+#   2) 重新签发受 Let's Encrypt 频率限制（同一域名 168 小时 5 张），
+#      失败重试几次就会把额度打满；
+#   3) 伪装站被彻底打掉，而它此前可能一直是好的。
+# 只有首次部署（此前没有可用证书）时才清理干净，避免留下半成品。
 _caddy_cleanup_partial() {
+    local domain prev_cert keep=0
+    domain=$(_camouflage_state_domain)
+    prev_cert=$(_camouflage_state_field '.certificatePath')
+    if [ -n "$domain" ] && _caddy_cert_file "$domain" >/dev/null 2>&1; then
+        keep=1
+    elif [ -n "$prev_cert" ] && [ -f "$prev_cert" ]; then
+        keep=1
+    fi
+    _caddy_service stop >/dev/null 2>&1 || true
+    if [ "$keep" = "1" ]; then
+        _warn "部署未完成，已停止 Caddy 服务；证书与站点文件已保留（未删除），修复后可重试。"
+        return 0
+    fi
     _caddy_service remove >/dev/null 2>&1 || true
     rm -rf -- "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" 2>/dev/null || true
     rm -f -- "$CADDY_CONF_FILE" 2>/dev/null || true
