@@ -33,7 +33,7 @@ jobs:
       - name: Bash 语法检查
         run: |
           set -euo pipefail
-          for f in singbox.sh advanced_relay.sh parser.sh xray_manager.sh tests/test_node_naming.sh tests/test_batch_sni.sh tests/test_caddy_camouflage.sh; do
+          for f in singbox.sh advanced_relay.sh parser.sh xray_manager.sh tests/test_node_naming.sh tests/test_batch_sni.sh tests/test_caddy_camouflage.sh tests/test_argo_watchdog.sh; do
             bash -n "$f"
             echo "bash -n $f ok"
           done
@@ -46,4 +46,7 @@ jobs:
 
       - name: Reality 伪装域名（Caddy）测试
         run: bash tests/test_caddy_camouflage.sh
+
+      - name: Argo 守护（cron/OpenRC）测试
+        run: bash tests/test_argo_watchdog.sh
 
