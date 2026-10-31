@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v105`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v106`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -515,3 +515,9 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 新建节点或 `[5] 修改节点` 时，若填写的伪装域名与伪装站一致，证书菜单多出"复用伪装站证书"选项并默认选中；批量创建模式也会自动复用。
 - 若后续需要把 443 交给 Reality，`[21]` 会先让 Caddy 退回回环模式；事务未提交（失败回滚）时自动恢复原有监听范围，避免伪装域名失联。
 - Hysteria2 / TUIC 的客户端 `skip-cert-verify` 与分享链接（`insecure` / `allow_insecure` / `pinSHA256`）改为按实际证书来源推导，复用公网可信证书时不再输出跳过验证参数。
+
+### 2026.11.04
+
+- 同步上游 Argo 守护修复：Alpine 自带 BusyBox `crontab`/`crond` 不再被误判为开机自启已就绪。仅在实际运行 OpenRC（`/run/openrc/softlevel` 存在）且 `/etc/init.d/` 下没有 cron 服务时才安装 `dcron`，并按服务名检查 `/etc/init.d/<svc>` 是否存在后再尝试启用。
+- OpenRC 分支不再吞掉失败：`rc-update add <svc> default` 必须成功且 `/etc/runlevels/default/<svc>` 为符号链接，`rc-service <svc> start` 与 `status` 都必须通过，否则报错并拒绝创建没有重启自愈能力的 Argo 节点。
+- 升级脚本后首次打开主菜单时，若已存在 Argo 元数据，会自动补一次开机守护（失败仅告警，不阻塞进入菜单），避免只有新建节点或手动重启隧道时才修复。无 OpenRC PID 1 的容器仍需在容器启动流程中运行 cron。
