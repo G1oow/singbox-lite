@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v108`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v109`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -528,3 +528,5 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 修复每次进入主菜单都阻塞约 6 秒：`config.json` 的 `ntp` 已是脚本管理的默认值时，`_time_prepare_ntp_config_locked` 会无条件重跑三个 SNTP 探测，而不可达时间源各自要等满超时。现在结论未变化且 `${SINGBOX_DIR}/time-sync.json` 的探测时间在 TTL（默认 6 小时，`TIME_PROBE_CACHE_TTL` 可覆盖，设为 0 关闭）内直接复用，不再重复探测；`[11] 时间诊断/校时` 仍始终强制实测。实测启动耗时从约 6.3 秒降到约 0.25 秒。
 - 修复 443 被节点占用时申请证书必然卡住：`_camouflage_default_scope` 在 443 被占用时只能选 loopback，而 loopback 站点的 `bind 127.0.0.1` 会被 Caddy 的 auto_https 继承给 ACME challenge 服务器，实测 `:80` 变成 `127.0.0.1:80`，Let's Encrypt 从公网无法访问，HTTP-01 必然失败并卡满 180 秒超时后回滚。现在 loopback + ACME 模式会额外生成一个 `http://:80 { bind 0.0.0.0 }` 站点，把 challenge 拉回对外监听（实测恢复为 `*:80`），回环站点本身仍只绑 `127.0.0.1`。custom 证书模式与 public 模式不生成该站点。
 - `tests/test_caddy_camouflage.sh` 增加回归用例：自身实例占用 8443 时放行且不提前停服，其他程序占用时仍拒绝部署；loopback+ACME 必须生成对外 `:80` challenge 站点而回环站点仍只绑 `127.0.0.1`；custom 与 public 模式不得重复声明 `:80`。
+- 修复"切换伪装域名后组合配置校验失败"的误诊与死锁：当节点的 `certificate_path` 指向已不存在的证书（更换/卸载伪装站时删掉了证书，但节点仍引用旧路径）时，`sing-box` 会直接 FATAL，之后每一次伪装域名事务都在预检阶段失败，用户只看到"切换失败"而不知道根因在证书缺失，且无法从菜单自救。现在事务入口先执行 `_camouflage_repair_orphan_certs`，把这类节点指回当前有效的伪装站证书与域名；没有可替代证书时明确提示"请先用 [21] 部署或 [5] 改证书"而不是静默失败。校验失败且输出含 `read certificate` 时追加同样的提示。
+- `tests/test_caddy_camouflage.sh` 增加孤儿证书用例：能识别指向缺失证书的节点、可指回现存证书、修复后无残留缺失路径、无可用替代证书时拒绝静默修复。

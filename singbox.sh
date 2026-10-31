@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="108"
+export SCRIPT_VERSION="109"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -6957,11 +6957,17 @@ _camouflage_tx() (
     trap 'exit 143' TERM
 
     _validate_protected_yaml_metadata || return 1
+    # 先清理指向已删除证书的残留节点，否则这些 FATAL 会让 mutator 之后的
+    # 组合校验必然失败，用户只会看到"切换域名失败"而不知道根因在证书缺失。
+    _camouflage_repair_orphan_certs >/dev/null || return 1
     "$mutator" "$@" || return 1
 
     if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
         _error "伪装域名切换后的组合配置校验失败："
         echo "$check_result"
+        if printf '%s' "$check_result" | grep -qi 'read certificate'; then
+            _error "这是证书文件缺失，不是域名格式问题。请用 [21] 重新部署伪装站点，或用 [5] 把相关节点改为自签/自定义证书。"
+        fi
         return 1
     fi
     restart_attempted=1
@@ -6974,6 +6980,57 @@ _camouflage_tx() (
     if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
     return 0
 )
+
+# 找出 config.json 里指向已不存在证书的 inbound。
+# 这类残留多半来自"卸载/更换伪装站时删掉了证书，但节点仍在引用它"：
+# 它们会让 sing-box 直接 FATAL，也会让此后每一次事务的组合校验失败，
+# 用户看到的是"切换域名失败"，实际根因早就埋下了。
+_camouflage_orphan_cert_tags() {
+    [ -s "${CONFIG_FILE:-}" ] || return 1
+    # 一次 jq 取出 tag+cert，再由 shell 判断文件是否存在。
+    # 刻意不在 jq 里做路径字符串比较：MSYS 等环境会把命令行里的绝对路径
+    # 自动改写成 Windows 路径，导致比较永远不相等而静默漏检。
+    jq -r '.inbounds[]?
+           | select((.tls.certificate_path // "") != "")
+           | [.tag, .tls.certificate_path] | @tsv' "$CONFIG_FILE" 2>/dev/null \
+        | tr -d '\r' \
+        | while IFS=$'\t' read -r tag cert; do
+            # 用 if/fi 而不是 `[ -f .. ] && continue`：后者条件不成立时返回 1，
+            # 作为循环体最后一条语句会把 while 提前结束，只检查第一个就退出。
+            if [ -n "$tag" ] && [ -n "$cert" ] && [ ! -f "$cert" ]; then
+                printf '%s\n' "$tag"
+            fi
+        done
+}
+
+# 事务开始前先把孤儿证书节点指回当前有效的伪装站证书，避免整笔事务被 FATAL 打断。
+# 成功时输出修复的 tag 数量；无可修时输出 0。
+_camouflage_repair_orphan_certs() {
+    local orphans pair cert key fixed=0
+    orphans=$(_camouflage_orphan_cert_tags | awk 'NF')
+    [ -n "$orphans" ] || { printf '0'; return 0; }
+    pair=$(_caddy_cert_pair 2>/dev/null || true)
+    IFS=$'\t' read -r cert key <<< "$pair"
+    if [ -z "$cert" ] || [ ! -f "$cert" ] || [ ! -f "$key" ]; then
+        _error "以下节点的证书文件已不存在，且当前没有可替代的伪装站证书："
+        printf '  - %s\n' $orphans
+        _error "请先用 [21] 部署伪装站点，或用 [5] 把这些节点改为自签/自定义证书。"
+        return 1
+    fi
+    local tag
+    for tag in $orphans; do
+        _atomic_modify_json "$CONFIG_FILE" '
+            (.inbounds[] | select(.tag == $tag) | .tls.certificate_path) = $cert
+            | (.inbounds[] | select(.tag == $tag) | .tls.key_path) = $key
+            | (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
+        ' --arg tag "$tag" --arg cert "$cert" --arg key "$key" \
+          --arg sni "$(_camouflage_state_domain)" || return 1
+        fixed=$((fixed + 1))
+    done
+    _warn "检测到 ${fixed} 个节点的证书文件已丢失，已指回当前伪装站证书。"
+    printf '%s' "$fixed"
+}
+
 
 # Reality 节点：apply 指向本机回落站，revert 恢复为外部域名握手。
 # 目标节点要占用 443 时，先收回 Caddy 的公网 443，失败则整笔回滚。
