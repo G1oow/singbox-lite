@@ -568,7 +568,13 @@ esac
 CADDYSTUB
 chmod +x "$WORK/bin/caddy"
 # 以下替身只在本用例生效：前面已有用例断言过真实的 Caddyfile 生成与状态写入。
-_caddy_owns_port() { [ "${CADDY_OWNS_PORT_STUB:-false}" = "true" ]; }
+# CADDY_OWNS_PORT_STUB 可写 true（任意端口）或用空格分隔的端口列表
+_caddy_owns_port() {
+    local spec="${CADDY_OWNS_PORT_STUB:-false}" port="$1"
+    [ "$spec" = "true" ] && return 0
+    case " $spec " in *" $port "*) return 0 ;; esac
+    return 1
+}
 _caddy_service() {
     case "${1:-}" in
         # 部署在 $(...) 子 shell 中运行，用文件标记而不是变量传递
@@ -602,6 +608,8 @@ _check_port_conflict() {
             fi
             return 0
             ;;
+        # 80：Caddy 自己的 ACME challenge 站点会常驻占用它
+        80) [ "${PORT_CONFLICT_80:-false}" = "true" ] && return 0; return 1 ;;
         443) [ "${PORT_CONFLICT_443:-false}" = "true" ] && return 0; return 1 ;;
         *) return 1 ;;
     esac
@@ -621,6 +629,20 @@ esac
 # 只放行、不提前停服：配置写入或 Caddyfile 校验失败时旧站点必须仍然完好
 check "放行时不提前停止旧 Caddy 实例" "1" \
     "$([ -f "$WORK/caddy.stopped" ] && echo 0 || echo 1)"
+
+# 重新部署时 80 必然被自己上一轮的 ACME challenge 站点占用，不能因此降级取消
+CADDY_OWNS_PORT_STUB="8443 80"
+PORT_CONFLICT_8443=true
+PORT_CONFLICT_80=true
+rm -f "$WORK/caddy.stopped"
+re80_out=$(printf '%s\n' "speedtest.example.com" | _caddy_camouflage_deploy 2>&1)
+re80_rc=$?
+check_true "80 被自身 Caddy 占用时不降级、不取消部署" "$re80_rc"
+case "$re80_out" in
+    *"80 端口被占用"*) echo "FAIL  仍把自身占用的 80 判为冲突"; fail=$((fail + 1)) ;;
+    *) echo "ok    不再把自身占用的 80 判为冲突" ;;
+esac
+PORT_CONFLICT_80=false
 
 # 占用者是别的程序时必须继续拦截，不能因为放行自身而放宽真实冲突
 CADDY_OWNS_PORT_STUB=false
@@ -660,6 +682,47 @@ JSON
 PORT_CONFLICT_8443=false
 check "443 空闲时默认对外监听（否则 ACME 无法完成）" "public" \
     "$(_camouflage_default_scope)"
+
+# --- 事务前的孤儿证书修复 ------------------------------------------------
+# 场景：卸载/更换伪装站时删掉了证书，但节点仍引用旧路径。这类残留会让
+# sing-box 直接 FATAL，并让此后每一次事务的组合校验失败，用户只看到
+# "切换伪装域名失败"，无法判断根因。事务入口必须先把它修掉。
+ACME_DIR="$CADDY_DATA_DIR/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
+mkdir -p "$ACME_DIR/vpn.example.com"
+GOOD_CERT="$ACME_DIR/vpn.example.com/vpn.example.com.crt"
+GOOD_KEY="$ACME_DIR/vpn.example.com/vpn.example.com.key"
+touch "$GOOD_CERT" "$GOOD_KEY"
+# 前面的用例把 _camouflage_state_write 换成了空替身，这里直接落状态文件
+jq -n --arg d "vpn.example.com" --arg c "$GOOD_CERT" \
+    '{domain:$d, fallbackPort:8443, certMode:"acme", certificatePath:$c, keyPath:"", port443Tag:"", listenScope:"loopback"}' \
+    > "$CADDY_STATE_FILE"
+
+MISSING="$ACME_DIR/gone.example.com/gone.example.com.crt"
+MISSING_KEY="$ACME_DIR/gone.example.com/gone.example.com.key"
+cat > "$CONFIG_FILE" <<JSON
+{"inbounds":[
+ {"type":"hysteria2","tag":"hy2-in-30001","listen_port":30001,"users":[{"password":"p"}],
+  "tls":{"enabled":true,"server_name":"gone.example.com","certificate_path":"$MISSING","key_path":"$MISSING_KEY"}},
+ {"type":"tuic","tag":"tuic-in-10010","listen_port":10010,"users":[{"password":"p"}],
+  "tls":{"enabled":true,"server_name":"gone.example.com","certificate_path":"$MISSING","key_path":"$MISSING_KEY"}}
+]}
+JSON
+
+check "能识别指向缺失证书的节点" "2" \
+    "$(_camouflage_orphan_cert_tags | awk 'NF' | wc -l | tr -d ' ')"
+_camouflage_repair_orphan_certs >/dev/null 2>&1
+check_true "孤儿证书可被指回现存伪装站证书" "$?"
+check "修复后不再有缺失证书的节点" "0" \
+    "$(_camouflage_orphan_cert_tags | awk 'NF' | wc -l | tr -d ' ')"
+check "修复后证书路径指向现存文件" "1" \
+    "$([ -f "$(jq -r '.inbounds[0].tls.certificate_path' "$CONFIG_FILE")" ] && echo 1 || echo 0)"
+check "修复后 SNI 跟随伪装站域名" "vpn.example.com" \
+    "$(jq -r '.inbounds[0].tls.server_name' "$CONFIG_FILE")"
+
+# 没有可用替代证书时必须明确失败，而不是静默改动
+rm -f "$GOOD_CERT" "$GOOD_KEY"
+_camouflage_repair_orphan_certs >/dev/null 2>&1
+check_false "无可用替代证书时拒绝静默修复" "$?"
 
 if [ "$fail" -eq 0 ]; then
     echo ""
