@@ -661,6 +661,47 @@ PORT_CONFLICT_8443=false
 check "443 空闲时默认对外监听（否则 ACME 无法完成）" "public" \
     "$(_camouflage_default_scope)"
 
+# --- 事务前的孤儿证书修复 ------------------------------------------------
+# 场景：卸载/更换伪装站时删掉了证书，但节点仍引用旧路径。这类残留会让
+# sing-box 直接 FATAL，并让此后每一次事务的组合校验失败，用户只看到
+# "切换伪装域名失败"，无法判断根因。事务入口必须先把它修掉。
+ACME_DIR="$CADDY_DATA_DIR/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
+mkdir -p "$ACME_DIR/vpn.example.com"
+GOOD_CERT="$ACME_DIR/vpn.example.com/vpn.example.com.crt"
+GOOD_KEY="$ACME_DIR/vpn.example.com/vpn.example.com.key"
+touch "$GOOD_CERT" "$GOOD_KEY"
+# 前面的用例把 _camouflage_state_write 换成了空替身，这里直接落状态文件
+jq -n --arg d "vpn.example.com" --arg c "$GOOD_CERT" \
+    '{domain:$d, fallbackPort:8443, certMode:"acme", certificatePath:$c, keyPath:"", port443Tag:"", listenScope:"loopback"}' \
+    > "$CADDY_STATE_FILE"
+
+MISSING="$ACME_DIR/gone.example.com/gone.example.com.crt"
+MISSING_KEY="$ACME_DIR/gone.example.com/gone.example.com.key"
+cat > "$CONFIG_FILE" <<JSON
+{"inbounds":[
+ {"type":"hysteria2","tag":"hy2-in-30001","listen_port":30001,"users":[{"password":"p"}],
+  "tls":{"enabled":true,"server_name":"gone.example.com","certificate_path":"$MISSING","key_path":"$MISSING_KEY"}},
+ {"type":"tuic","tag":"tuic-in-10010","listen_port":10010,"users":[{"password":"p"}],
+  "tls":{"enabled":true,"server_name":"gone.example.com","certificate_path":"$MISSING","key_path":"$MISSING_KEY"}}
+]}
+JSON
+
+check "能识别指向缺失证书的节点" "2" \
+    "$(_camouflage_orphan_cert_tags | awk 'NF' | wc -l | tr -d ' ')"
+_camouflage_repair_orphan_certs >/dev/null 2>&1
+check_true "孤儿证书可被指回现存伪装站证书" "$?"
+check "修复后不再有缺失证书的节点" "0" \
+    "$(_camouflage_orphan_cert_tags | awk 'NF' | wc -l | tr -d ' ')"
+check "修复后证书路径指向现存文件" "1" \
+    "$([ -f "$(jq -r '.inbounds[0].tls.certificate_path' "$CONFIG_FILE")" ] && echo 1 || echo 0)"
+check "修复后 SNI 跟随伪装站域名" "vpn.example.com" \
+    "$(jq -r '.inbounds[0].tls.server_name' "$CONFIG_FILE")"
+
+# 没有可用替代证书时必须明确失败，而不是静默改动
+rm -f "$GOOD_CERT" "$GOOD_KEY"
+_camouflage_repair_orphan_certs >/dev/null 2>&1
+check_false "无可用替代证书时拒绝静默修复" "$?"
+
 if [ "$fail" -eq 0 ]; then
     echo ""
     echo "全部通过。"
