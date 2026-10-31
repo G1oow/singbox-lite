@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v109`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v110`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -530,3 +530,5 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - `tests/test_caddy_camouflage.sh` 增加回归用例：自身实例占用 8443 时放行且不提前停服，其他程序占用时仍拒绝部署；loopback+ACME 必须生成对外 `:80` challenge 站点而回环站点仍只绑 `127.0.0.1`；custom 与 public 模式不得重复声明 `:80`。
 - 修复"切换伪装域名后组合配置校验失败"的误诊与死锁：当节点的 `certificate_path` 指向已不存在的证书（更换/卸载伪装站时删掉了证书，但节点仍引用旧路径）时，`sing-box` 会直接 FATAL，之后每一次伪装域名事务都在预检阶段失败，用户只看到"切换失败"而不知道根因在证书缺失，且无法从菜单自救。现在事务入口先执行 `_camouflage_repair_orphan_certs`，把这类节点指回当前有效的伪装站证书与域名；没有可替代证书时明确提示"请先用 [21] 部署或 [5] 改证书"而不是静默失败。校验失败且输出含 `read certificate` 时追加同样的提示。
 - `tests/test_caddy_camouflage.sh` 增加孤儿证书用例：能识别指向缺失证书的节点、可指回现存证书、修复后无残留缺失路径、无可用替代证书时拒绝静默修复。
+- 修复重新部署时把自身 Caddy 占用的 80 判为冲突：为让 ACME HTTP-01 走公网，loopback 模式会常驻一个 `http://:80` challenge 站点，于是首次部署成功后 80 一直被自己的 Caddy 占用。原 80 检查未排除自身，导致此后每次重新部署都提示"80 端口被占用，Caddy 无法通过 ACME HTTP-01 签发与续期证书"并要求降级为自定义证书或取消。现在该检查同样先判定 `_caddy_owns_port 80`，是自己的实例就跳过降级，只有被其他程序占用才提示。
+- `tests/test_caddy_camouflage.sh` 增加 80 端口自身占用用例。

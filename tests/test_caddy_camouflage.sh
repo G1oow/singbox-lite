@@ -568,7 +568,13 @@ esac
 CADDYSTUB
 chmod +x "$WORK/bin/caddy"
 # 以下替身只在本用例生效：前面已有用例断言过真实的 Caddyfile 生成与状态写入。
-_caddy_owns_port() { [ "${CADDY_OWNS_PORT_STUB:-false}" = "true" ]; }
+# CADDY_OWNS_PORT_STUB 可写 true（任意端口）或用空格分隔的端口列表
+_caddy_owns_port() {
+    local spec="${CADDY_OWNS_PORT_STUB:-false}" port="$1"
+    [ "$spec" = "true" ] && return 0
+    case " $spec " in *" $port "*) return 0 ;; esac
+    return 1
+}
 _caddy_service() {
     case "${1:-}" in
         # 部署在 $(...) 子 shell 中运行，用文件标记而不是变量传递
@@ -602,6 +608,8 @@ _check_port_conflict() {
             fi
             return 0
             ;;
+        # 80：Caddy 自己的 ACME challenge 站点会常驻占用它
+        80) [ "${PORT_CONFLICT_80:-false}" = "true" ] && return 0; return 1 ;;
         443) [ "${PORT_CONFLICT_443:-false}" = "true" ] && return 0; return 1 ;;
         *) return 1 ;;
     esac
@@ -621,6 +629,20 @@ esac
 # 只放行、不提前停服：配置写入或 Caddyfile 校验失败时旧站点必须仍然完好
 check "放行时不提前停止旧 Caddy 实例" "1" \
     "$([ -f "$WORK/caddy.stopped" ] && echo 0 || echo 1)"
+
+# 重新部署时 80 必然被自己上一轮的 ACME challenge 站点占用，不能因此降级取消
+CADDY_OWNS_PORT_STUB="8443 80"
+PORT_CONFLICT_8443=true
+PORT_CONFLICT_80=true
+rm -f "$WORK/caddy.stopped"
+re80_out=$(printf '%s\n' "speedtest.example.com" | _caddy_camouflage_deploy 2>&1)
+re80_rc=$?
+check_true "80 被自身 Caddy 占用时不降级、不取消部署" "$re80_rc"
+case "$re80_out" in
+    *"80 端口被占用"*) echo "FAIL  仍把自身占用的 80 判为冲突"; fail=$((fail + 1)) ;;
+    *) echo "ok    不再把自身占用的 80 判为冲突" ;;
+esac
+PORT_CONFLICT_80=false
 
 # 占用者是别的程序时必须继续拦截，不能因为放行自身而放宽真实冲突
 CADDY_OWNS_PORT_STUB=false

@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="109"
+export SCRIPT_VERSION="110"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -7229,7 +7229,9 @@ _caddy_camouflage_deploy() {
     _camouflage_verify_domain_loop "$domain" || return 1
 
     local cert_mode="acme" cert_path="" key_path=""
-    if _check_port_conflict "80" "tcp" "true" ""; then
+    # 80 被本脚本自己的 Caddy 占用是正常现场：那个 :80 站点正是 ACME 的
+    # challenge 服务器，重新部署时它必然在监听。只有被别的程序占用才需要降级。
+    if _check_port_conflict "80" "tcp" "true" "" && ! _caddy_owns_port "80"; then
         _warn "80 端口被占用，Caddy 无法通过 ACME HTTP-01 签发与续期证书。"
         echo "  1) 使用已有的公网可信证书（fullchain.pem + privkey.pem）"
         echo "  2) 取消"
