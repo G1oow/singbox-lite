@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="106"
+export SCRIPT_VERSION="108"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -1146,6 +1146,20 @@ _time_prepare_ntp_config_locked() {
             fi
         fi
         return 0
+    fi
+    # 结论未变就不要重跑探测：三个不可达时间源会让每次 `sb` 启动都阻塞约 6 秒。
+    # 与上次结论相同的 sidecar 在 TTL 内直接复用；[11] 时间诊断始终强制实测。
+    local cache_ttl="${TIME_PROBE_CACHE_TTL:-21600}"
+    if [ "$current" = "$managed" ] && [ -n "$previous_status" ] \
+        && [ -n "$(jq -r '.checked_at_system_utc // empty' "$state_file" 2>/dev/null)" ] \
+        && [[ "$cache_ttl" =~ ^[0-9]+$ ]] && [ "$cache_ttl" -gt 0 ]; then
+        local checked_epoch now_epoch
+        checked_epoch=$(jq -r '.checked_at_system_utc // empty' "$state_file" 2>/dev/null)
+        checked_epoch=$(date -u -d "$checked_epoch" +%s 2>/dev/null || echo "")
+        now_epoch=$(date -u +%s)
+        if [ -n "$checked_epoch" ] && [ "$((now_epoch - checked_epoch))" -lt "$cache_ttl" ]; then
+            return 0
+        fi
     fi
 
     wanted='{"enabled":false}'
@@ -6491,11 +6505,21 @@ _caddy_write_config() {
             printf '\tbind 127.0.0.1\n'
             _caddy_site_body "$cert_mode" "$cert_path" "$key_path"
             printf '}\n'
+            # Caddy 会把这里的 bind 继承给 auto_https 动态创建的 ACME :80
+            # challenge 服务器，实测变成 127.0.0.1:80——公网不可达，HTTP-01
+            # 必然失败并卡满 180 秒后回滚（443 被节点占用时就是这条路径）。
+            # 显式提供一个对外监听 80 的 challenge 站点，把它拉回 0.0.0.0。
+            # custom 证书不需要 challenge，不占用 80。
+            if [ "$cert_mode" != "custom" ]; then
+                printf '\nhttp://:80 {\n\tbind 0.0.0.0\n\trespond 404\n}\n'
+            fi
         fi
     } > "$CADDY_CONF_FILE" || return 1
     chmod 600 "$CADDY_CONF_FILE" 2>/dev/null || true
 }
 # 重新部署时 443 可能正被本脚本自己的 Caddy 占用，这种情况要沿用原有范围。
+# 443 被其他节点占用时只能走 loopback；此时 _caddy_write_config 会额外补一个
+# 对外监听 80 的 challenge 站点，保证 ACME HTTP-01 仍然可用。
 _camouflage_default_scope() {
     local prev
     prev=$(_camouflage_state_field '.listenScope')
@@ -6813,12 +6837,42 @@ _caddy_cert_health_check() {
     fi
     return 0
 }
+# 回环端口若正被本脚本自己的 Caddy 占用，属于"上次部署卡住/未清理"的正常现场，
+# 不能当作冲突：重新部署本来就要重启同一个服务，判为冲突会让用户永远无法修复。
+_caddy_owns_port() {
+    local port="$1" pid=""
+    [ -n "${CADDY_BIN:-}" ] || return 1
+    if _is_pid_file_running_cmd "${CADDY_PID_FILE:-}" "$CADDY_BIN" 2>/dev/null; then
+        return 0
+    fi
+    # systemd / OpenRC 托管时没有 PID 文件，退化为按监听进程的 cmdline 判定。
+    command -v ss >/dev/null 2>&1 || return 1
+    pid=$(ss -lnptH 2>/dev/null \
+        | awk -v p=":${port}" 'length($4) >= length(p) && substr($4, length($4) - length(p) + 1) == p' \
+        | grep -o 'pid=[0-9]*' | head -n 1 | cut -d= -f2)
+    [ -n "$pid" ] || return 1
+    _is_pid_running_cmd "$pid" "$CADDY_BIN"
+}
 
 _caddy_cleanup_partial() {
     _caddy_service remove >/dev/null 2>&1 || true
     rm -rf -- "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" 2>/dev/null || true
     rm -f -- "$CADDY_CONF_FILE" 2>/dev/null || true
     _warn "已回滚 Caddy 部署产物，sing-box 配置未做任何改动。"
+}
+# 部署前的回环端口检查。占用者是本脚本自己的 Caddy 时不算冲突：
+# 上一次部署中断会留下仍在监听 8443 的实例，直接判冲突会让用户永远无法重新部署。
+# 这里只放行、不停服——真正收回端口的是稍后的服务重启，这样配置写入或
+# Caddyfile 校验失败时旧站点仍然完好，不会因为一次失败的部署把现有伪装站打死。
+_caddy_check_fallback_port() {
+    local port="$1"
+    _check_port_conflict "$port" "tcp" "true" "" || return 0
+    if _caddy_owns_port "$port"; then
+        _warn "回环端口 ${port} 正被本脚本自己的 Caddy 占用，将在重启服务时接管该端口。"
+        return 0
+    fi
+    _error "回环端口 ${port} 已被占用，无法部署伪装站点。"
+    return 1
 }
 
 _camouflage_list_reality_nodes() {
@@ -7113,11 +7167,7 @@ _caddy_camouflage_deploy() {
         _camouflage_domain_valid "$domain" && break
         _error "域名格式无效（不要带 http:// 或路径，不能是 IP 地址）。"
     done
-
-    if _check_port_conflict "$site_port" "tcp" "true" ""; then
-        _error "回环端口 ${site_port} 已被占用，无法部署伪装站点。"
-        return 1
-    fi
+    _caddy_check_fallback_port "$site_port" || return 1
 
     _camouflage_verify_domain_loop "$domain" || return 1
 
