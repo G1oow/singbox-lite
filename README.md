@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v110`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v111`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -532,3 +532,6 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - `tests/test_caddy_camouflage.sh` 增加孤儿证书用例：能识别指向缺失证书的节点、可指回现存证书、修复后无残留缺失路径、无可用替代证书时拒绝静默修复。
 - 修复重新部署时把自身 Caddy 占用的 80 判为冲突：为让 ACME HTTP-01 走公网，loopback 模式会常驻一个 `http://:80` challenge 站点，于是首次部署成功后 80 一直被自己的 Caddy 占用。原 80 检查未排除自身，导致此后每次重新部署都提示"80 端口被占用，Caddy 无法通过 ACME HTTP-01 签发与续期证书"并要求降级为自定义证书或取消。现在该检查同样先判定 `_caddy_owns_port 80`，是自己的实例就跳过降级，只有被其他程序占用才提示。
 - `tests/test_caddy_camouflage.sh` 增加 80 端口自身占用用例。
+- 修复"证书已签发但自检失败"的误判：实测 `systemctl restart` 返回只需约 30ms，而 Caddy 真正开始监听 8443 要约 300ms。原 `_caddy_verify_site` 在 restart 返回后立刻单次 `curl`，正好落在这个启动竞态窗口内，于是把一次成功部署判为"自检失败"并整笔回滚——日志里能看到 `certificate obtained successfully` 之后紧接着就是回滚。现在自检会重试（默认最多 30 秒），拿到 200 立即通过，超时才失败。
+- 修复失败收尾把证书一起删掉：原 `_caddy_cleanup_partial` 无条件 `rm -rf` 掉 `CADDY_DATA_DIR`，其中包含刚签发的证书。后果是引用该证书的 hy2/tuic 节点立刻变成"指向已删除证书"，`config.json` 陷入不可重启状态（sing-box 直接 FATAL），必须人工救；同时重新签发要消耗 Let's Encrypt 同一域名 168 小时 5 张的配额，重试几次就会打满。现在失败时只停止服务，**保留证书与站点文件**，便于直接重试；只有首次部署（此前没有任何可用证书）时才彻底清理，避免留下半成品。
+- `tests/test_caddy_camouflage.sh` 增加回归用例：自检在启动竞态窗口内重试并最终成功、持续失败时按超时返回、已有证书时清理不删除证书与站点目录、首次部署失败时才彻底清理。

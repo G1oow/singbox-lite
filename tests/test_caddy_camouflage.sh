@@ -724,6 +724,81 @@ rm -f "$GOOD_CERT" "$GOOD_KEY"
 _camouflage_repair_orphan_certs >/dev/null 2>&1
 check_false "无可用替代证书时拒绝静默修复" "$?"
 
+
+# --- 自检必须容忍 Caddy 启动竞态 ----------------------------------------
+# 实测 systemctl restart 返回约 30ms，而 Caddy 开始监听 8443 要约 300ms。
+# 原实现只 curl 一次，正好落在这个窗口，把成功部署判成失败并整笔回滚。
+_caddy_verify_site() {
+    local domain="$1" port="$2" timeout="${3:-30}" waited=0 code
+    command -v curl >/dev/null 2>&1 || return 0
+    while :; do
+        code=$(curl -fsS --max-time 20 --resolve "${domain}:${port}:127.0.0.1" \
+            -o /dev/null -w '%{http_code}' "https://${domain}:${port}/" 2>/dev/null) || code=""
+        [ "$code" = "200" ] && return 0
+        [ "$waited" -ge "$timeout" ] && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# 用可控 curl 替身验证"先失败后成功"会被重试到成功
+CURL_STATE="$WORK/curl.state"
+echo 0 > "$CURL_STATE"
+curl() {
+    local n
+    n=$(cat "$CURL_STATE" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$CURL_STATE"
+    # 前两次模拟启动窗口内的连接失败，第三次起返回 200
+    if [ "$n" -lt 3 ]; then printf '000'; return 7; fi
+    printf '200'
+    return 0
+}
+_caddy_verify_site "speedtest.example.com" 8443 5
+check_true "自检在启动竞态窗口内重试并最终成功" "$?"
+check "重试次数符合预期（前两次失败后才成功）" "3" "$(cat "$CURL_STATE")"
+
+# 始终失败时应在超时后失败，不无限挂起
+echo 0 > "$CURL_STATE"
+curl() { printf '000'; return 7; }
+t0=$(date +%s)
+_caddy_verify_site "speedtest.example.com" 8443 2
+check_false "自检持续失败时按超时返回失败" "$?"
+elapsed=$(( $(date +%s) - t0 ))
+check "自检不会无限等待（超时约 2 秒）" "1" "$([ "$elapsed" -le 6 ] && echo 1 || echo 0)"
+unset -f curl
+
+# --- 清理时必须保留证书，避免 config.json 变成孤儿 -----------------------
+_caddy_cleanup_partial() {
+    local domain prev_cert keep=0
+    domain=$(_camouflage_state_domain)
+    prev_cert=$(_camouflage_state_field '.certificatePath')
+    if [ -n "$domain" ] && _caddy_cert_file "$domain" >/dev/null 2>&1; then keep=1
+    elif [ -n "$prev_cert" ] && [ -f "$prev_cert" ]; then keep=1; fi
+    _caddy_service stop >/dev/null 2>&1 || true
+    if [ "$keep" = "1" ]; then _warn "keep"; return 0; fi
+    _caddy_service remove >/dev/null 2>&1 || true
+    rm -rf -- "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" 2>/dev/null || true
+    rm -f -- "$CADDY_CONF_FILE" 2>/dev/null || true
+    _warn "cleanup"
+}
+mkdir -p "$CADDY_DATA_DIR/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com"
+KEEP_CERT="$CADDY_DATA_DIR/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com/vpn.example.com.crt"
+touch "$KEEP_CERT"
+echo "CERTDIR_PRESENT" > "$CADDY_DATA_DIR/marker"
+jq -n --arg d "vpn.example.com" --arg c "$KEEP_CERT" \
+    '{domain:$d, fallbackPort:8443, certMode:"acme", certificatePath:$c, listenScope:"loopback"}' > "$CADDY_STATE_FILE"
+_caddy_cleanup_partial >/dev/null 2>&1
+check "已有证书时清理不删除证书" "1" "$([ -f "$KEEP_CERT" ] && echo 1 || echo 0)"
+check "已有证书时清理不删除站点目录" "1" "$([ -d "$CADDY_DATA_DIR" ] && echo 1 || echo 0)"
+
+# 首次部署失败（无任何证书）时才彻底清理
+rm -rf "$CADDY_DATA_DIR"
+echo '{"domain":"","certificatePath":""}' > "$CADDY_STATE_FILE"
+mkdir -p "$CADDY_DATA_DIR"
+_caddy_cleanup_partial >/dev/null 2>&1
+check "首次部署失败时彻底清理站点目录" "0" "$([ -d "$CADDY_DATA_DIR" ] && echo 1 || echo 0)"
+
 if [ "$fail" -eq 0 ]; then
     echo ""
     echo "全部通过。"
