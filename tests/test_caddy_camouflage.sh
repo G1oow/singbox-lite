@@ -269,6 +269,34 @@ _caddy_write_config "vpn.example.com" 8443 "acme" "" "" "loopback"
 check "loopback 模式只生成一个 site 块" "1" "$(grep -c '^https://' "$CADDY_CONF_FILE")"
 check "loopback 模式只有一份证书自动化策略" "1" "$(grep -c 'issuer acme' "$CADDY_CONF_FILE")"
 
+# --- loopback + ACME 必须让 :80 challenge 对外可达 -----------------------
+# 实测：loopback 站点的 bind 127.0.0.1 会被 Caddy 继承给 auto_https 动态创建的
+# ACME :80 challenge 服务器，变成 127.0.0.1:80，公网校验必然失败并卡满超时。
+# 443 被节点占用时只能走 loopback，这条路径必须仍然能签证书。
+case "$(cat "$CADDY_CONF_FILE")" in
+    *"http://:80 {"*) echo "ok    loopback+ACME 补了 :80 challenge 站点" ;;
+    *) echo "FAIL  loopback+ACME 缺少 :80 challenge 站点（HTTP-01 会卡住）"; fail=$((fail + 1)) ;;
+esac
+case "$(cat "$CADDY_CONF_FILE")" in
+    *"bind 0.0.0.0"*) echo "ok    :80 challenge 站点对外监听 0.0.0.0" ;;
+    *) echo "FAIL  :80 challenge 站点未绑 0.0.0.0（公网不可达）"; fail=$((fail + 1)) ;;
+esac
+check "loopback 站点自身仍只绑回环" "1" "$(grep -c 'bind 127.0.0.1' "$CADDY_CONF_FILE")"
+
+# custom 证书不需要 challenge，不应占用 80
+_caddy_write_config "vpn.example.com" 8443 "custom" "/tmp/f.pem" "/tmp/k.pem" "loopback"
+case "$(cat "$CADDY_CONF_FILE")" in
+    *"http://:80 {"*) echo "FAIL  custom 模式不应占用 80"; fail=$((fail + 1)) ;;
+    *) echo "ok    custom 模式不占用 80" ;;
+esac
+
+# public 模式由 Caddy 自动处理 :80，不应重复声明
+_caddy_write_config "vpn.example.com" 8443 "acme" "" "" "public"
+case "$(cat "$CADDY_CONF_FILE")" in
+    *"http://:80 {"*) echo "FAIL  public 模式不应重复声明 :80"; fail=$((fail + 1)) ;;
+    *) echo "ok    public 模式不重复声明 :80" ;;
+esac
+
 # 443 是否被占用决定默认监听范围
 PORT_CONFLICT_443="false"
 check "443 空闲时默认直接对外" "public" "$(_camouflage_default_scope)"
@@ -522,6 +550,116 @@ for opt in 20 21; do
     grep -qE "^[[:space:]]+${opt}\\) " "$ROOT/singbox.sh"
     check_true "case 分支 [${opt}] 仍然存在" "$?"
 done
+
+# --- 重新部署：回环端口被上一次部署残留的自身 Caddy 占用 -----------------
+# 场景：上次部署卡住，Caddy 仍在 127.0.0.1:8443 提供服务（甚至状态文件已丢）。
+# 期望：识别为自身占用并继续部署，而不是报"端口已被占用"让用户无从修复。
+CADDY_SERVICE_STOPPED=0
+PORT_CONFLICT_8443=true
+CADDY_OWNS_PORT_STUB=true
+# 部署流程会真实执行 `caddy validate`；用替身可执行文件替代，测试不依赖真实 Caddy。
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/caddy" <<'CADDYSTUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+    validate|version) exit 0 ;;
+    *) exit 0 ;;
+esac
+CADDYSTUB
+chmod +x "$WORK/bin/caddy"
+# 以下替身只在本用例生效：前面已有用例断言过真实的 Caddyfile 生成与状态写入。
+_caddy_owns_port() { [ "${CADDY_OWNS_PORT_STUB:-false}" = "true" ]; }
+_caddy_service() {
+    case "${1:-}" in
+        # 部署在 $(...) 子 shell 中运行，用文件标记而不是变量传递
+        stop) : > "$WORK/caddy.stopped"; return 0 ;;
+        *) return 0 ;;
+    esac
+}
+_camouflage_domain_valid() { [ -n "${1:-}" ]; }
+_camouflage_verify_domain_loop() { return 0; }
+_caddy_install() { return 0; }
+_caddy_installed() { return 0; }
+_caddy_write_config() { return 0; }
+_caddy_write_index_page() { return 0; }
+_caddy_wait_cert() { return 0; }
+_caddy_verify_site() { return 0; }
+_caddy_cert_file() { printf '%s' "/tmp/vpn.example.com.crt"; }
+_camouflage_list_reality_nodes() { return 0; }
+_camouflage_state_write() { return 0; }
+_output_base64_subscription() { return 0; }
+_validate_tls_key_pair() { return 0; }
+_caddy_cleanup_partial() { return 0; }
+_check_port_conflict() {
+    local port="$1"
+    case "$port" in
+        # 停掉自身服务后端口应被释放；他人占用则停服无效。
+        # 部署在 $(...) 子 shell 中运行，只能靠文件标记观察停服动作。
+        8443)
+            [ "${PORT_CONFLICT_8443:-false}" = "true" ] || return 1
+            if [ "${CADDY_OWNS_PORT_STUB:-false}" = "true" ] && [ -f "$WORK/caddy.stopped" ]; then
+                return 1
+            fi
+            return 0
+            ;;
+        443) [ "${PORT_CONFLICT_443:-false}" = "true" ] && return 0; return 1 ;;
+        *) return 1 ;;
+    esac
+}
+rm -f "$WORK/caddy.stopped"
+deploy_out=$(printf '%s\n' "speedtest.example.com" | _caddy_camouflage_deploy 2>&1)
+deploy_rc=$?
+check_true "自身 Caddy 占用 8443 时不再误判为冲突" "$deploy_rc"
+case "$deploy_out" in
+    *"回环端口 8443 已被占用"*) echo "FAIL  仍提示端口被占用"; fail=$((fail + 1)) ;;
+    *) echo "ok    不再提示端口被占用" ;;
+esac
+case "$deploy_out" in
+    *"本脚本自己的 Caddy 占用"*) echo "ok    提示占用者是本脚本自己的 Caddy" ;;
+    *) echo "FAIL  未提示自身占用"; fail=$((fail + 1)) ;;
+esac
+# 只放行、不提前停服：配置写入或 Caddyfile 校验失败时旧站点必须仍然完好
+check "放行时不提前停止旧 Caddy 实例" "1" \
+    "$([ -f "$WORK/caddy.stopped" ] && echo 0 || echo 1)"
+
+# 占用者是别的程序时必须继续拦截，不能因为放行自身而放宽真实冲突
+CADDY_OWNS_PORT_STUB=false
+rm -f "$WORK/caddy.stopped"
+blocked_out=$(printf '%s\n' "speedtest.example.com" | _caddy_camouflage_deploy 2>&1)
+blocked_rc=$?
+check_false "其他程序占用 8443 时仍然拒绝部署" "$blocked_rc"
+case "$blocked_out" in
+    *"回环端口 8443 已被占用"*) echo "ok    非自身占用仍给出冲突提示" ;;
+    *) echo "FAIL  非自身占用未给出冲突提示"; fail=$((fail + 1)) ;;
+esac
+check "非自身占用时不得停止服务" "1" \
+    "$([ -f "$WORK/caddy.stopped" ] && echo 0 || echo 1)"
+# 恢复真实实现：上一个用例把它替换成空替身了。
+_camouflage_list_reality_nodes() {
+    local node tag port variant
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        tag=$(printf '%s' "$node" | jq -r '.tag // empty')
+        port=$(printf '%s' "$node" | jq -r '.listen_port // empty')
+        [ -n "$tag" ] && [ -n "$port" ] || continue
+        variant=$(_detect_main_node_variant "$tag")
+        case "$variant" in
+            vless-reality|any-reality) printf '%s\t%s\t%s\n' "$tag" "$port" "$variant" ;;
+        esac
+    done <<< "$(_list_main_primary_inbounds)"
+}
+
+# --- 443 空闲时仍应对外监听（ACME HTTP-01 依赖公网 :80）------------------
+# 不能因为存在 Reality 节点就一律选 loopback：loopback 只绑 127.0.0.1，
+# 公网 :80 不可达，HTTP-01 必然失败。证书只能先在 public 范围签发。
+cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[
+ {"type":"hysteria2","tag":"hy2-in-10002","listen_port":10002,"users":[{"password":"p"}]}
+]}
+JSON
+PORT_CONFLICT_8443=false
+check "443 空闲时默认对外监听（否则 ACME 无法完成）" "public" \
+    "$(_camouflage_default_scope)"
 
 if [ "$fail" -eq 0 ]; then
     echo ""

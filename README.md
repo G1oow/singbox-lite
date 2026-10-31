@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v106`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v108`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -103,7 +103,7 @@ sb
 前置条件与行为：
 
 - **域名解析**：脚本用 Cloudflare DoH 查询 A/AAAA 记录并与本机公网 IPv4/IPv6 逐一比对，命中任一即通过；不通过会显示"解析结果 / 本机公网地址"对照并允许重试（最多 3 轮）。域名开启了 CDN 加速（如 Cloudflare 橙云）时解析指向边缘节点，比对必然失败，需先关闭加速。
-- **监听范围**：443 已被占用（例如已有一个 Reality 节点占用 443）时，Caddy 只监听 `127.0.0.1:8443` 供 Reality 回落；443 空闲时（例如只有 WS/Trojan/HY2 等其他协议），Caddy 直接对外监听公网 443 提供 HTTPS，同时保留 `127.0.0.1:8443` 回环站点，之后接入 Reality 需要 443 时会自动让出。
+- **监听范围**：443 已被占用（例如已有一个 Reality 节点占用 443）时，Caddy 只监听 `127.0.0.1:8443` 供 Reality 回落，并额外补一个对外监听 `0.0.0.0:80` 的站点只用于 ACME HTTP-01 校验——否则 `bind 127.0.0.1` 会被 Caddy 继承给 challenge 服务器，导致公网校验必然失败；443 空闲时（例如只有 WS/Trojan/HY2 等其他协议），Caddy 直接对外监听公网 443 提供 HTTPS，同时保留 `127.0.0.1:8443` 回环站点，之后接入 Reality 需要 443 时会自动让出。
 - **80 端口**：Caddy 通过 ACME HTTP-01 签发并自动续期证书；443 可能归 Reality 或被复用，TLS-ALPN-01 统一不可用。80 端口被占用时会降级为"使用你已有的 fullchain.pem / privkey.pem"，否则取消且不改动任何配置。**80 端口需要长期保持空闲且公网可达**，否则证书会在 90 天后过期，伪装站反而比不伪装更可疑；`[12] 检查配置文件` 会在证书剩余不足 15 天时告警。
 - **Caddy 安装**：只在首次使用本功能时询问并安装（GitHub 官方 Release 二进制 + 官方 SHA-256 校验 + 可执行性验证 + 原子替换），不使用系统包管理器，卸载干净。安装后用 `caddy validate` 校验 Caddyfile，再启动服务、等待证书签发，并自检 `https://<域名>:8443/` 返回 200；任一步失败都会拆掉 Caddy 全部产物且 sing-box 配置一行未动。卸载时若仍有 TLS 节点在复用该证书，会提前告警。
 - **进程与文件**：Caddy 跟随脚本现有的 `systemd` / `openrc` / `direct` 三种模式运行；站点根目录、Caddyfile、数据目录全部收敛在 `${SINGBOX_DIR}` 下（`www`、`Caddyfile`、`caddy`），状态写入 `${SINGBOX_DIR}/caddy_camouflage.json`，`[17] 卸载脚本` 会一并停止并清理。
@@ -521,3 +521,10 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 同步上游 Argo 守护修复：Alpine 自带 BusyBox `crontab`/`crond` 不再被误判为开机自启已就绪。仅在实际运行 OpenRC（`/run/openrc/softlevel` 存在）且 `/etc/init.d/` 下没有 cron 服务时才安装 `dcron`，并按服务名检查 `/etc/init.d/<svc>` 是否存在后再尝试启用。
 - OpenRC 分支不再吞掉失败：`rc-update add <svc> default` 必须成功且 `/etc/runlevels/default/<svc>` 为符号链接，`rc-service <svc> start` 与 `status` 都必须通过，否则报错并拒绝创建没有重启自愈能力的 Argo 节点。
 - 升级脚本后首次打开主菜单时，若已存在 Argo 元数据，会自动补一次开机守护（失败仅告警，不阻塞进入菜单），避免只有新建节点或手动重启隧道时才修复。无 OpenRC PID 1 的容器仍需在容器启动流程中运行 cron。
+
+### 2026.11.05
+
+- 修复重新部署伪装站时被自己的 Caddy 拦住：上一次部署中断后 Caddy 仍占用 `127.0.0.1:8443`（systemd/OpenRC 托管时没有 PID 文件，状态文件也可能丢失），脚本会误报"回环端口 8443 已被占用"且无法从菜单自救。现在按监听进程的 cmdline 判定占用者是否为 `${CADDY_BIN}`，是自己的实例就放行并交由后续服务重启接管端口；占用者是其他程序时仍照原样拒绝。放行时刻意不提前停服，避免配置写入或 Caddyfile 校验失败时把现有伪装站打死。
+- 修复每次进入主菜单都阻塞约 6 秒：`config.json` 的 `ntp` 已是脚本管理的默认值时，`_time_prepare_ntp_config_locked` 会无条件重跑三个 SNTP 探测，而不可达时间源各自要等满超时。现在结论未变化且 `${SINGBOX_DIR}/time-sync.json` 的探测时间在 TTL（默认 6 小时，`TIME_PROBE_CACHE_TTL` 可覆盖，设为 0 关闭）内直接复用，不再重复探测；`[11] 时间诊断/校时` 仍始终强制实测。实测启动耗时从约 6.3 秒降到约 0.25 秒。
+- 修复 443 被节点占用时申请证书必然卡住：`_camouflage_default_scope` 在 443 被占用时只能选 loopback，而 loopback 站点的 `bind 127.0.0.1` 会被 Caddy 的 auto_https 继承给 ACME challenge 服务器，实测 `:80` 变成 `127.0.0.1:80`，Let's Encrypt 从公网无法访问，HTTP-01 必然失败并卡满 180 秒超时后回滚。现在 loopback + ACME 模式会额外生成一个 `http://:80 { bind 0.0.0.0 }` 站点，把 challenge 拉回对外监听（实测恢复为 `*:80`），回环站点本身仍只绑 `127.0.0.1`。custom 证书模式与 public 模式不生成该站点。
+- `tests/test_caddy_camouflage.sh` 增加回归用例：自身实例占用 8443 时放行且不提前停服，其他程序占用时仍拒绝部署；loopback+ACME 必须生成对外 `:80` challenge 站点而回环站点仍只绑 `127.0.0.1`；custom 与 public 模式不得重复声明 `:80`。
