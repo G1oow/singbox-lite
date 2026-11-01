@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v112`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v113`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -97,7 +97,7 @@ sb
 | 退出 | 0 | 退出脚本 |
 
 `[5] 修改节点` 会按实际协议显示可用项目。所有主节点均可修改名称、客户端连接地址、端口和认证信息；Reality 可更新伪装域名并轮换密钥，TLS 类节点可更新 SNI、自签证书或自定义证书，WebSocket/gRPC 可修改传输路径，Hysteria2 还可调整混淆、端口跳跃和客户端带宽。保存时会统一校验 sing-box 配置并同步元数据、分享链接与 Clash/Mihomo 配置，失败则自动回滚。
-`[20] 一键更换所有节点 SNI` 把全部可管理主节点的伪装域名统一换成同一个值：Reality 同步 `tls.server_name` 与 `handshake.server`，ShadowTLS 更新 `handshake.server`，TLS 类节点更新 `server_name` 并按需重新签发脚本自管的 RSA 自签证书（`SINGBOX_DIR/<tag>.pem` / `.key`，含同名与泛域名 SAN），Hysteria2 的跳跃子入站会跟随主节点同步。使用自定义证书（含 acme.sh 符号链接与外部路径）的节点整体跳过，避免换 SNI 后证书不匹配；VLESS-TCP、Shadowsocks、SOCKS5 等无 SNI 的节点同样跳过。执行前会列出每个节点的处理方式，执行时持状态锁、创建事务快照、校验 `config.json + relay.json` 组合配置并在失败时自动回滚，成功后重启一次服务，可接着一键输出聚合 Base64 订阅。
+`[20] 一键更换所有节点 SNI` 把全部可管理主节点的伪装域名统一换成同一个值：Reality 同步 `tls.server_name` 与 `handshake.server`，ShadowTLS 更新 `handshake.server`，TLS 类节点更新 `server_name` 并按需重新签发脚本自管的 RSA 自签证书（`SINGBOX_DIR/<tag>.pem` / `.key`，含同名与泛域名 SAN），Hysteria2 的跳跃子入站会跟随主节点同步。使用自定义证书（含 acme.sh 符号链接与外部路径）的节点整体跳过，避免换 SNI 后证书不匹配；VLESS-TCP、Shadowsocks、SOCKS5 等无 SNI 的节点同样跳过。执行前会列出每个节点的处理方式，执行时持状态锁、创建事务快照、校验 `config.json + relay.json` 组合配置并在失败时自动回滚，成功后重启一次服务并直接输出聚合 Base64 订阅（不再询问）。
 `[21] 伪装域名（Caddy）` 把节点伪装成一个真实可访问的 HTTPS 网站：由 Caddy 出示 ACME 真证书并返回伪装页，因此 `https://<你的域名>/` 在浏览器里是一个正常站点。**伪装域名不是 Reality 独属**：没有任何 Reality 节点时同样可以部署，该域名与这张公网可信证书可以直接给 VLESS-WS/gRPC、Trojan-WS、AnyTLS、Hysteria2、TUIC 等 TLS 类节点复用。
 
 前置条件与行为：
@@ -540,3 +540,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 
 - `[21]` 部署完成后的同步作用域从"仅 Reality 节点"扩展为"所有节点"：部署成功后的确认不再只改 Reality 的 `server_name` 与 `handshake`，还会在同一笔事务内把其他 TLS 类节点（VLESS-WS/gRPC、Trojan-WS、AnyTLS、Hysteria2、TUIC）的 `server_name` 与证书路径一并换到伪装域名与伪装站证书，并关闭客户端 `skip-cert-verify`。选一个 Reality 节点迁移到 443 的步骤保持不变。菜单第 2 项文案同步改为"同步所有节点到该域名"。
 - 新增 `_camouflage_mutate_all_nodes` / `_camouflage_apply_all_nodes` 作为统一入口：先执行 Reality 换域名与 443 迁移，再在有 TLS 类节点时同步证书复用；没有 TLS 类节点不视为失败，避免纯 Reality 场景被误判成事务失败。`_camouflage_has_tls_nodes` 与 `[20]` 复用同一份 `_batch_sni_plan` 判定，两处口径不会漂移。
+
+### 2026.11.07
+
+- 聚合 Base64 订阅改为直接输出：`[3] 查看节点链接` 列出分享链接后不再询问"是否生成聚合 Base64 订阅"，`[20] 一键更换所有节点 SNI` 成功后也不再询问"是否立即输出聚合 Base64 订阅"，两处都在链接齐全时直接打印聚合订阅，少一次交互。

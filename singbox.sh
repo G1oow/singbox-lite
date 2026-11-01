@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="112"
+export SCRIPT_VERSION="113"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5790,12 +5790,9 @@ _view_nodes() {
     echo "-------------------------------------"
     
     # 生成聚合 Base64 订阅：复用本次刚生成的链接，避免丢掉未持久化 share_link 的节点
+    # 直接输出，不再向用户确认
     if [ -s "$links_tmp" ]; then
-        echo ""
-        read -p "是否生成聚合 Base64 订阅? (y/N): " gen_base64
-        if [[ "$gen_base64" == "y" || "$gen_base64" == "Y" ]]; then
-            _output_base64_subscription "$links_tmp"
-        fi
+        _output_base64_subscription "$links_tmp"
     fi
     rm -f -- "$links_tmp"
     VIEW_LINKS_TMP=""
@@ -6196,10 +6193,8 @@ _batch_change_sni() {
     [ "$apply_rc" -eq 0 ] || return "$apply_rc"
 
     echo ""
-    read -r -p "是否立即输出聚合 Base64 订阅？[Y/n]: " show_sub
-    if [[ ! "$show_sub" =~ ^[Nn]$ ]]; then
-        _output_base64_subscription
-    fi
+    # 换 SNI 后直接输出聚合订阅，不再向用户确认
+    _output_base64_subscription
 }
 # --- 一键换 SNI 与聚合订阅结束 ---
 

@@ -349,6 +349,12 @@ check "传入链接文件内容参与编码" "yes" \
     "$(printf '%s' "$PASSED_B64" | base64 -d 2>/dev/null | grep -q 'passed.example.com' && echo yes || echo no)"
 check "传入链接单行计数" "1" \
     "$(printf '%s' "$PASSED_B64" | base64 -d 2>/dev/null | awk 'NF {c++} END {print c+0}')"
+# 聚合订阅不再征求同意：两处入口都必须直接输出
+view_block=$(sed -n '/^_view_nodes() {/,/^}/p' "$ROOT/singbox.sh")
+check "查看节点链接不再询问是否生成聚合订阅" "no" "$(printf '%s' "$view_block" | grep -q '是否生成聚合' && echo yes || echo no)"
+check "查看节点链接直接调用聚合输出" "yes" "$(printf '%s' "$view_block" | grep -q '_output_base64_subscription' && echo yes || echo no)"
+sni_block=$(cat "$WORK/sni.sh")
+check "换 SNI 后不再询问是否输出聚合订阅" "no" "$(printf '%s' "$sni_block" | grep -q '是否立即输出聚合' && echo yes || echo no)"
 echo ""
 if [ "$fail" -eq 0 ]; then
     echo "全部通过"
