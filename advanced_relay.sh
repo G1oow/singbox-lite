@@ -397,12 +397,13 @@ _nft_ensure_base() {
 
 _nft_delete_rules_by_comment() {
     local comment="$1"
-    local entries chain handle delete_failed=0
-    command -v nft &>/dev/null || return 0
-    entries=$(nft -a list table inet "$NFT_TABLE" 2>/dev/null | awk -v c="comment \"$comment\"" '
+    local entries listing chain handle delete_failed=0
+    command -v nft &>/dev/null || return 1
+    listing=$(nft -a list table inet "$NFT_TABLE" 2>/dev/null) || return 1
+    entries=$(awk -v c="comment \"$comment\"" '
         /^[[:space:]]*chain / { chain=$2 }
         index($0, c) && /# handle / { print chain, $NF }
-    ')
+    ' <<< "$listing") || return 1
     [ -z "$entries" ] && return 0
     while read -r chain handle; do
         [ -n "$chain" ] && [ -n "$handle" ] || continue
@@ -508,18 +509,18 @@ _find_udp_hop_conflict_in_range() {
 
 _save_nftables_rules() {
     command -v nft &>/dev/null || return 0
-    mkdir -p /etc/nftables.d
-    local nft_tmp
+    mkdir -p "$(dirname "$NFT_PERSIST_FILE")" || return 1
+    local nft_tmp nft_config="${NFT_CONFIG_FILE:-/etc/nftables.conf}"
     nft_tmp=$(mktemp "${NFT_PERSIST_FILE}.tmp.XXXXXX") || return 1
     if nft list table inet "$NFT_TABLE" > "$nft_tmp" 2>/dev/null \
         && chmod 600 "$nft_tmp" && mv -f "$nft_tmp" "$NFT_PERSIST_FILE"; then
-        if [ ! -f /etc/nftables.conf ]; then
+        if [ ! -f "$nft_config" ]; then
             {
                 echo '#!/usr/sbin/nft -f'
                 echo 'include "/etc/nftables.d/*.nft"'
-            } > /etc/nftables.conf
-        elif ! grep -q 'singboxlite\.nft\|/etc/nftables\.d/\*\.nft' /etc/nftables.conf 2>/dev/null; then
-            echo 'include "/etc/nftables.d/singboxlite.nft"' >> /etc/nftables.conf
+            } > "$nft_config" || return 1
+        elif ! grep -q 'singboxlite\.nft\|/etc/nftables\.d/\*\.nft' "$nft_config" 2>/dev/null; then
+            echo 'include "/etc/nftables.d/singboxlite.nft"' >> "$nft_config" || return 1
         fi
         if command -v systemctl &>/dev/null; then
             systemctl enable nftables >/dev/null 2>&1 || true
@@ -625,7 +626,7 @@ _txn_restore_file() {
     if [ -e "$dir/${key}.absent" ]; then
         rm -f -- "$file"
     elif [ -e "$dir/$key" ]; then
-        cp -p "$dir/$key" "$file"
+        cp -p "$dir/$key" "$file" || return 1
         _secure_state_file "$file"
     fi
 }
@@ -2654,15 +2655,16 @@ _pf_nft_dnat_target() {
 
 _pf_delete_nft_rule_set() {
     local listen_port="$1"
-    local proto chain
+    local proto chain rc=0
     for proto in tcp udp; do
         for chain in prerouting output; do
-            _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-${chain}"
+            _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-${chain}" || rc=1
         done
-        _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-fwd-in"
-        _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-fwd-out"
+        _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-fwd-in" || rc=1
+        _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-fwd-out" || rc=1
     done
-    _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-masq"
+    _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-masq" || rc=1
+    return "$rc"
 }
 
 _pf_find_hy2_hop_conflict() {
@@ -2951,11 +2953,11 @@ _pf_apply_nft_rules() {
 
     if [ "$action" == "delete" ]; then
         _pf_delete_nft_rule_set "$listen_port"
-        return 0
+        return $?
     fi
 
     _nft_ensure_base || return 1
-    _pf_delete_nft_rule_set "$listen_port"
+    _pf_delete_nft_rule_set "$listen_port" || return 1
 
     local to_dest
     to_dest=$(_pf_nft_dnat_target "$family" "$target_ip" "$target_port")
@@ -2969,11 +2971,11 @@ _pf_apply_nft_rules() {
         fi
         # 不在 output 链按“仅目标端口”做 DNAT：该规则会误改本机访问任意远端同端口的连接。
         # 外部进入本机的转发流量只需要 prerouting；删除函数仍会清理历史 output 规则。
-        nft add rule inet "$NFT_TABLE" forward "$proto" dport "$target_port" "$addr_key" daddr "$target_ip" ct state new,established,related accept comment "singboxlite-pf-${listen_port}-${proto}-fwd-in" >/dev/null 2>&1 || true
-        nft add rule inet "$NFT_TABLE" forward "$proto" sport "$target_port" "$addr_key" saddr "$target_ip" ct state established,related accept comment "singboxlite-pf-${listen_port}-${proto}-fwd-out" >/dev/null 2>&1 || true
+        nft add rule inet "$NFT_TABLE" forward "$proto" dport "$target_port" "$addr_key" daddr "$target_ip" ct state new,established,related accept comment "singboxlite-pf-${listen_port}-${proto}-fwd-in" >/dev/null 2>&1 || rc=1
+        nft add rule inet "$NFT_TABLE" forward "$proto" sport "$target_port" "$addr_key" saddr "$target_ip" ct state established,related accept comment "singboxlite-pf-${listen_port}-${proto}-fwd-out" >/dev/null 2>&1 || rc=1
     done
 
-    nft add rule inet "$NFT_TABLE" postrouting "$addr_key" daddr "$target_ip" masquerade comment "singboxlite-pf-${listen_port}-masq" >/dev/null 2>&1 || true
+    nft add rule inet "$NFT_TABLE" postrouting "$addr_key" daddr "$target_ip" masquerade comment "singboxlite-pf-${listen_port}-masq" >/dev/null 2>&1 || rc=1
     if [ "$rc" -ne 0 ]; then
         _pf_delete_nft_rule_set "$listen_port"
     fi
@@ -3016,9 +3018,9 @@ _pf_build_rule_json() {
 _pf_apply_singbox_rules() {
     local action="$1"
     local listen_port="$2"
-    local target_addr="$3"
-    local target_port="$4"
-    local network="$5"
+    local target_addr="${3:-}"
+    local target_port="${4:-}"
+    local network="${5:-}"
     local in_tag="pf-in-${listen_port}"
     local out_tag="pf-out-${listen_port}"
 
@@ -3279,6 +3281,62 @@ _pf_add() {
     read -p "  按回车继续..."
 }
 
+# PF 删除和引擎切换必须同时保存运行表与持久化文件，不能靠重新生成近似规则回滚。
+_pf_txn_snapshot() {
+    local dir="$1" with_nft="$2" tables
+    _txn_snapshot_file "$dir" relay "$RELAY_CONFIG_FILE" &&
+        _txn_snapshot_file "$dir" pf "$PF_METADATA_FILE" || return 1
+    if [ "$with_nft" = true ]; then
+        _txn_snapshot_file "$dir" nft-persist "$NFT_PERSIST_FILE" &&
+            _txn_snapshot_file "$dir" nft-config "${NFT_CONFIG_FILE:-/etc/nftables.conf}" || return 1
+        tables=$(nft list tables 2>/dev/null) || return 1
+        if grep -Fxq "table inet $NFT_TABLE" <<< "$tables"; then
+            nft list table inet "$NFT_TABLE" > "$dir/nft-table" || return 1
+        else
+            : > "$dir/nft-table.absent" || return 1
+        fi
+        : > "$dir/with-nft" || return 1
+    fi
+    : > "$dir/complete"
+}
+
+_pf_txn_restore() {
+    local dir="$1" rc=0 tables
+    [ -f "$dir/complete" ] || return 1
+    _txn_restore_file "$dir" relay "$RELAY_CONFIG_FILE" || rc=1
+    _txn_restore_file "$dir" pf "$PF_METADATA_FILE" || rc=1
+    if [ -f "$dir/with-nft" ]; then
+        # 将删除当前表和加载旧表放在同一 nft batch 中，失败不会先清空运行表。
+        tables=$(nft list tables 2>/dev/null) || rc=1
+        if [ "$rc" -eq 0 ]; then
+            : > "$dir/nft-restore" || return 1
+            if grep -Fxq "table inet $NFT_TABLE" <<< "$tables"; then
+                printf 'delete table inet %s\n' "$NFT_TABLE" >> "$dir/nft-restore" || return 1
+            fi
+            if [ -f "$dir/nft-table" ]; then
+                cat "$dir/nft-table" >> "$dir/nft-restore" || return 1
+            fi
+            nft -f "$dir/nft-restore" || rc=1
+        fi
+        _txn_restore_file "$dir" nft-persist "$NFT_PERSIST_FILE" || rc=1
+        _txn_restore_file "$dir" nft-config "${NFT_CONFIG_FILE:-/etc/nftables.conf}" || rc=1
+    fi
+    _restart_checked || rc=1
+    if [ "$rc" -ne 0 ]; then
+        _error "端口转发恢复失败，快照保留在: $dir"
+    fi
+    return "$rc"
+}
+
+_pf_txn_cleanup() {
+    local dir="$1" key
+    for key in nft-persist nft-config nft-table; do
+        rm -f -- "$dir/$key" "$dir/$key.absent"
+    done
+    rm -f -- "$dir/nft-restore" "$dir/with-nft" "$dir/complete"
+    _txn_cleanup "$dir"
+}
+
 _pf_delete() {
     echo ""
     _info "=== 删除端口转发规则 ==="
@@ -3319,16 +3377,17 @@ _pf_delete() {
     local txn_dir delete_ok="false" updated_meta
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$RELAY_CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" pf "$PF_METADATA_FILE"; then
-        _txn_cleanup "$txn_dir"
+    local with_nft=false
+    [ "$sel_engine" = nftables ] && with_nft=true
+    if ! _pf_txn_snapshot "$txn_dir" "$with_nft"; then
+        _pf_txn_cleanup "$txn_dir"
         _state_lock_release
         return 1
     fi
     if [ "$sel_engine" == "nftables" ]; then
-        _pf_apply_nft_rules "delete" "$selected_port" "$del_dest" "$sel_tport" "$sel_net" "$sel_family"
-        _save_nftables_rules
-        delete_ok="true"
+        if _pf_apply_nft_rules "delete" "$selected_port" "$del_dest" "$sel_tport" "$sel_net" "$sel_family" && _save_nftables_rules; then
+            delete_ok="true"
+        fi
     else
         if _pf_apply_singbox_rules "delete" "$selected_port" && _restart_checked; then
             delete_ok="true"
@@ -3337,25 +3396,20 @@ _pf_delete() {
 
     updated_meta=$(jq --arg p "$selected_port" 'del(.[$p])' "$PF_METADATA_FILE") || delete_ok="false"
     if [ "$delete_ok" != "true" ] || ! _atomic_write_json "$PF_METADATA_FILE" "$updated_meta"; then
-        _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
-        _txn_restore_file "$txn_dir" pf "$PF_METADATA_FILE"
-        if [ "$sel_engine" == "nftables" ]; then
-            _pf_apply_nft_rules "add" "$selected_port" "$del_dest" "$sel_tport" "$sel_net" "$sel_family" >/dev/null 2>&1 || true
-            _save_nftables_rules
-        else
-            _manage_service restart >/dev/null 2>&1 || true
+        if _pf_txn_restore "$txn_dir"; then
+            _pf_txn_cleanup "$txn_dir"
+            _error "端口转发删除失败，已恢复原规则"
         fi
-        _txn_cleanup "$txn_dir"
         _state_lock_release
-        _error "端口转发删除失败，已恢复原规则"
         return 1
     fi
-    _txn_cleanup "$txn_dir"
+    _pf_txn_cleanup "$txn_dir"
     _state_lock_release
 
     _success "已删除端口 ${selected_port} 的转发规则"
     _pf_auto_manage_dns_cron
     read -p "  按回车继续..."
+    return 0
 }
 
 _pf_modify() {
@@ -3696,7 +3750,62 @@ _pf_auto_manage_dns_cron() {
     fi
 }
 
+_pf_switch_engine_apply() {
+    local port="$1" engine="$2" addr="$3" tport="$4" net="$5" dest="$6" family="$7"
+    local txn_dir payload new_family new_ip is_domain updated_meta ok=false
+    if [ "$engine" != nftables ]; then
+        payload=$(_pf_prepare_nft_target "$addr") || return 1
+        [ -n "$payload" ] || return 1
+        IFS=$'\t' read -r new_family new_ip is_domain <<< "$payload"
+    fi
+    txn_dir=$(_txn_begin) || return 1
+    if ! _pf_txn_snapshot "$txn_dir" true; then
+        _pf_txn_cleanup "$txn_dir"
+        _error "无法创建端口转发变更快照"
+        return 1
+    fi
+    if [ "$engine" = nftables ]; then
+        [ -n "$family" ] || family=$(_pf_guess_target_family "$dest")
+        if _pf_apply_nft_rules delete "$port" "$dest" "$tport" "$net" "$family" &&
+            _save_nftables_rules &&
+            _pf_apply_singbox_rules add "$port" "$addr" "$tport" "$net" &&
+            _restart_checked &&
+            updated_meta=$(jq --arg p "$port" \
+                '.[$p].engine = "singbox" | del(.[$p].resolved_ip, .[$p].target_family, .[$p].target_is_domain)' "$PF_METADATA_FILE") &&
+            _atomic_write_json "$PF_METADATA_FILE" "$updated_meta"; then
+            ok=true
+        fi
+    else
+        if _pf_apply_singbox_rules delete "$port" && _restart_checked &&
+            _pf_enable_forwarding &&
+            _pf_apply_nft_rules add "$port" "$new_ip" "$tport" "$net" "$new_family" &&
+            _save_nftables_rules &&
+            updated_meta=$(jq --arg p "$port" --arg fam "$new_family" --arg ip "$new_ip" --argjson domain "$is_domain" \
+                '.[$p].engine = "nftables" | .[$p].target_family = $fam | .[$p].resolved_ip = $ip |
+                 if $domain then .[$p].target_is_domain = true else del(.[$p].target_is_domain) end' "$PF_METADATA_FILE") &&
+            _atomic_write_json "$PF_METADATA_FILE" "$updated_meta"; then
+            ok=true
+        fi
+    fi
+    if [ "$ok" != true ]; then
+        if _pf_txn_restore "$txn_dir"; then
+            _pf_txn_cleanup "$txn_dir"
+            _error "引擎切换失败，已恢复原状态"
+        fi
+        return 1
+    fi
+    _pf_txn_cleanup "$txn_dir"
+}
+
 _pf_switch_engine() {
+    local rc=0
+    _state_lock_acquire || return 1
+    _pf_switch_engine_locked || rc=$?
+    _state_lock_release
+    return "$rc"
+}
+
+_pf_switch_engine_locked() {
     echo ""
     _info "=== 切换转发引擎 ==="
     echo ""
@@ -3746,35 +3855,7 @@ _pf_switch_engine() {
         read -p "  确认将此规则从 nftables 切换到 singbox 用户态转发？(y/N): " confirm
         [ "$confirm" != "y" ] && return
 
-        # 删除旧 nftables 规则
-        [ -z "$cur_family" ] && cur_family=$(_pf_guess_target_family "$cur_del_dest")
-        _pf_apply_nft_rules "delete" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family"
-        _save_nftables_rules
-
-        # 用原始域名/IP 建 singbox 规则（singbox 自己做 DNS 解析）
-        if ! _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net"; then
-            _pf_apply_nft_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
-            _save_nftables_rules
-            _error "切换失败，已恢复旧的 nftables 规则"
-            read -p "  按回车继续..."; return
-        fi
-        if ! _restart_checked; then
-            _pf_apply_singbox_rules "delete" "$selected_port" >/dev/null 2>&1
-            _pf_apply_nft_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
-            _save_nftables_rules
-            _error "切换失败，已恢复旧的 nftables 规则"
-            read -p "  按回车继续..."; return
-        fi
-
-        # 更新 metadata：引擎改为 singbox，清除 nftables 专用字段
-        local switched_meta
-        switched_meta=$(jq --arg p "$selected_port" \
-            '.[$p].engine = "singbox" | del(.[$p].resolved_ip) | del(.[$p].target_family) | del(.[$p].target_is_domain)' \
-            "$PF_METADATA_FILE")
-        _atomic_write_json "$PF_METADATA_FILE" "$switched_meta" || {
-            _error "端口转发 metadata 更新失败"
-            return 1
-        }
+        _pf_switch_engine_apply "$selected_port" "$cur_engine" "$cur_addr" "$cur_tport" "$cur_net" "$cur_del_dest" "$cur_family" || return 1
 
         _success "已切换到 singbox 引擎，规则生效！"
         echo -e "  ${YELLOW}注意: singbox 用户态转发 UDP 性能低于 nftables，但兼容性更好（如 QUIC/Hysteria2）${NC}"
@@ -3807,60 +3888,14 @@ _pf_switch_engine() {
         read -p "  确认将此规则从 singbox 切换到 nftables 内核转发？(y/N): " confirm
         [ "$confirm" != "y" ] && return
 
-        # 删除旧 singbox 规则
-        if ! _pf_apply_singbox_rules "delete" "$selected_port"; then
-            _error "旧的 singbox 规则删除失败，无法切换"
-            read -p "  按回车继续..."; return
-        fi
-        if ! _restart_checked; then
-            _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
-            _manage_service restart >/dev/null 2>&1
-            _error "切换失败，已恢复旧的 singbox 规则"
-            read -p "  按回车继续..."; return
-        fi
-
-        # nftables 需要解析域名拿到 IP
-        local new_family=""
-        local new_resolved=""
-        local new_is_domain="false"
-        local resolved_payload=""
-        resolved_payload=$(_pf_prepare_nft_target "$cur_addr")
-        if [ $? -ne 0 ] || [ -z "$resolved_payload" ]; then
-            _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
-            _manage_service restart >/dev/null 2>&1
-            _error "目标地址无法解析为可用的 IPv4/IPv6，已恢复旧的 singbox 规则"
-            read -p "  按回车继续..."; return
-        fi
-        IFS=$'\t' read -r new_family new_resolved new_is_domain <<< "$resolved_payload"
-        [ "$new_is_domain" == "true" ] && _success "域名已解析: $cur_addr -> $new_resolved (${new_family})"
-
-        _pf_enable_forwarding
-        if ! _pf_apply_nft_rules "add" "$selected_port" "$new_resolved" "$cur_tport" "$cur_net" "$new_family"; then
-            _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
-            _manage_service restart >/dev/null 2>&1
-            _error "切换失败，已恢复旧的 singbox 规则"
-            read -p "  按回车继续..."; return
-        fi
-        _save_nftables_rules
-
-        # 更新 metadata：引擎改为 nftables，补充 nftables 专用字段
-        local updated_meta
-        updated_meta=$(jq --arg p "$selected_port" --arg fam "$new_family" --arg ip "$new_resolved" \
-            '.[$p].engine = "nftables" | .[$p].target_family = $fam | .[$p].resolved_ip = $ip' \
-            "$PF_METADATA_FILE")
-        if [ "$new_is_domain" == "true" ]; then
-            updated_meta=$(echo "$updated_meta" | jq --arg p "$selected_port" '.[$p].target_is_domain = true')
-        fi
-        _atomic_write_json "$PF_METADATA_FILE" "$updated_meta" || {
-            _error "端口转发 metadata 更新失败"
-            return 1
-        }
+        _pf_switch_engine_apply "$selected_port" "$cur_engine" "$cur_addr" "$cur_tport" "$cur_net" "$cur_del_dest" "$cur_family" || return 1
 
         _success "已切换到 nftables 引擎，规则生效！"
     fi
 
     _pf_auto_manage_dns_cron
     read -p "  按回车继续..."
+    return 0
 }
 
 _port_forward_menu() {

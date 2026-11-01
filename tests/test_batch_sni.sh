@@ -355,6 +355,7 @@ check "查看节点链接不再询问是否生成聚合订阅" "no" "$(printf '%
 check "查看节点链接直接调用聚合输出" "yes" "$(printf '%s' "$view_block" | grep -q '_output_base64_subscription' && echo yes || echo no)"
 sni_block=$(cat "$WORK/sni.sh")
 check "换 SNI 后不再询问是否输出聚合订阅" "no" "$(printf '%s' "$sni_block" | grep -q '是否立即输出聚合' && echo yes || echo no)"
+bash -n "$ROOT/tests/test_main_regressions.sh" && bash "$ROOT/tests/test_main_regressions.sh" || fail=$((fail + 1))
 echo ""
 if [ "$fail" -eq 0 ]; then
     echo "全部通过"

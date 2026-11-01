@@ -614,6 +614,12 @@ _check_port_conflict() {
         *) return 1 ;;
     esac
 }
+for fn in _main_create_tx_snapshot_file _main_create_tx_restore_file; do
+    source <(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/singbox.sh")
+done
+_with_state_lock() { "$@"; }
+_caddy_service_running() { return 0; }
+mkdir -p "$CADDY_WEB_ROOT"
 rm -f "$WORK/caddy.stopped"
 deploy_out=$(printf '%s\n' "speedtest.example.com" | _caddy_camouflage_deploy 2>&1)
 deploy_rc=$?
@@ -914,6 +920,8 @@ check_true "部署提示文案声明作用域为所有节点" "$?"
 grep -q '同步所有节点到该域名' "$ROOT/singbox.sh"
 check_true "菜单第 2 项文案声明作用域为所有节点" "$?"
 
+
+bash -n "$ROOT/tests/test_caddy_deploy_transaction.sh" && bash "$ROOT/tests/test_caddy_deploy_transaction.sh" || fail=$((fail + 1))
 
 if [ "$fail" -eq 0 ]; then
     echo ""
