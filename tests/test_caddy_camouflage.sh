@@ -798,6 +798,122 @@ echo '{"domain":"","certificatePath":""}' > "$CADDY_STATE_FILE"
 mkdir -p "$CADDY_DATA_DIR"
 _caddy_cleanup_partial >/dev/null 2>&1
 check "首次部署失败时彻底清理站点目录" "0" "$([ -d "$CADDY_DATA_DIR" ] && echo 1 || echo 0)"
+# --- 同步作用域是所有节点：Reality + TLS 类节点在同一笔事务内 ------------
+# 部署后的确认与菜单第 2 项都必须覆盖其他 TLS 类协议，而不只是 Reality：
+# 否则伪装域名指向本机后，这些节点仍带着旧域名与旧证书，客户端直接连不上。
+ACME_DIR2="$CADDY_DATA_DIR/caddy/certificates/acme-v02.api.letsencrypt.org-directory/vpn.example.com"
+mkdir -p "$ACME_DIR2"
+cp "$ACME_DIR/vpn.example.com.crt" "$ACME_DIR2/vpn.example.com.crt" 2>/dev/null || \
+    touch "$ACME_DIR2/vpn.example.com.crt"
+# 前面已把 _camouflage_state_write 换成空替身，这里直接落状态文件
+jq -n --arg d "vpn.example.com" --arg c "${ACME_DIR2}/vpn.example.com.crt" \
+    '{domain:$d, fallbackPort:8443, certMode:"acme", certificatePath:$c, keyPath:"", port443Tag:"", listenScope:"loopback"}' \
+    > "$CADDY_STATE_FILE"
+touch "${ACME_DIR2}/vpn.example.com.key"
+
+cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[
+ {"type":"vless","tag":"vless-reality-in-443","listen_port":443,"users":[{"uuid":"11111111-1111-1111-1111-111111111111"}],
+  "tls":{"enabled":true,"server_name":"old.example.com",
+         "reality":{"enabled":true,"handshake":{"server":"old.example.com","server_port":443},"private_key":"k","short_id":["a"]}}},
+ {"type":"vless","tag":"vless-ws-in-30001","listen_port":30001,"users":[{"uuid":"22222222-2222-2222-2222-222222222222"}],
+  "tls":{"enabled":true,"server_name":"old.example.com","certificate_path":"OLD","key_path":"OLDKEY"},
+  "transport":{"type":"ws","path":"/ws"}},
+ {"type":"tuic","tag":"tuic-in-30002","listen_port":30002,"users":[{"uuid":"33333333-3333-3333-3333-333333333333","password":"p"}],
+  "tls":{"enabled":true,"server_name":"old.example.com"}}
+]}
+JSON
+cat > "$METADATA_FILE" <<'JSON'
+{"vless-reality-in-443":{"name":"Reality-Node","publicKey":"pk1"},
+ "vless-ws-in-30001":{"name":"WS-Node"},
+ "tuic-in-30002":{"name":"TUIC-Node"}}
+JSON
+cat > "$CLASH_YAML_FILE" <<'YAML'
+proxies:
+  - name: "WS-Node"
+    type: vless
+    server: 198.51.100.7
+    port: 30001
+    skip-cert-verify: true
+YAML
+
+# 事务外壳所需的最小替身：真实实现依赖 flock、sing-box 二进制与服务管理
+_flock_wait() { return 0; }
+# 无 flock 的 Windows/MSYS 环境靠这个变量跳过共享锁；Linux CI 下同样成立
+export SINGBOXLITE_LOCK_HELD=1
+_manage_service() { return 0; }
+_validate_protected_yaml_metadata() { return 0; }
+_camouflage_repair_orphan_certs() { return 0; }
+# 事务外壳会展开 $SINGBOX_BIN；替身函数本身不读它，但不能是未定义变量
+export SINGBOX_BIN="$WORK/bin/sing-box"
+_check_combined_config_files() { return 0; }
+_restore_full_transaction_snapshot() { return 1; }
+_main_create_tx_snapshot() {
+    mkdir -p "$1/credentials" || return 1
+    : > "$1/nft.unavailable"
+    return 0
+}
+# 4 号参数是"伪装站存在"的替身开关，避免用例依赖真实证书目录布局
+_batch_sni_plan() {
+    printf '%s\n' \
+        "$(printf 'vless-ws-in-30001\tvless-ws-tls\t30001\ttls\t%s\tWS-Node\told.example.com' "${PLAN_CERT_MODE:-self_signed}")" \
+        "$(printf 'tuic-in-30002\ttuic\t30002\ttls\t%s\tTUIC-Node\told.example.com' "${PLAN_TUIC_CERT_MODE:-none}")"
+}
+_refresh_modified_node_artifacts() { return 0; }
+
+check_true "存在 TLS 类节点时判定为真" "$(_camouflage_has_tls_nodes && echo 0 || echo 1)"
+_batch_sni_plan() { printf 'vless-reality-in-443\tvless-reality\t443\treality\tnone\tReality-Node\told.example.com\n'; }
+check_false "只有 Reality 节点时判定为假" "$(_camouflage_has_tls_nodes && echo 0 || echo 1)"
+
+_batch_sni_plan() {
+    printf '%s\n' \
+        "$(printf 'vless-ws-in-30001\tvless-ws-tls\t30001\ttls\t%s\tWS-Node\told.example.com' "${PLAN_CERT_MODE:-self_signed}")" \
+        "$(printf 'tuic-in-30002\ttuic\t30002\ttls\t%s\tTUIC-Node\told.example.com' "${PLAN_TUIC_CERT_MODE:-none}")"
+}
+
+sync_out=$(_camouflage_apply_all_nodes "vpn.example.com" "" 2>&1)
+sync_rc=$?
+check_true "所有节点同步成功" "$sync_rc"
+refield() { jq -r --arg t "$1" ".inbounds[] | select(.tag == \$t) | $2" "$CONFIG_FILE"; }
+check "Reality SNI 同步为伪装域名" "vpn.example.com" "$(refield vless-reality-in-443 '.tls.server_name')"
+check "Reality handshake 指向本机回落" "127.0.0.1" "$(refield vless-reality-in-443 '.tls.reality.handshake.server')"
+check "Reality handshake 端口为回落端口" "8443" "$(refield vless-reality-in-443 '.tls.reality.handshake.server_port')"
+check "Reality 原端口不被改动" "443" "$(refield vless-reality-in-443 '.listen_port')"
+check "TLS 类节点 SNI 同步为伪装域名" "vpn.example.com" "$(refield vless-ws-in-30001 '.tls.server_name')"
+check "TLS 类节点证书改为伪装站证书" "vpn.example.com.crt" \
+    "$(basename "$(refield vless-ws-in-30001 '.tls.certificate_path')")"
+check "TLS 类节点私钥改为伪装站私钥" "vpn.example.com.key" \
+    "$(basename "$(refield vless-ws-in-30001 '.tls.key_path')")"
+check "无证书的 TLS 节点也被同步" "vpn.example.com" "$(refield tuic-in-30002 '.tls.server_name')"
+check "复用公网可信证书后客户端不再跳过验证" "false" \
+    "$(sed -n 's/.*skip-cert-verify: //p' "$CLASH_YAML_FILE")"
+case "$sync_out" in
+    *"所有节点已更新"*) echo "ok    同步成功提示覆盖所有节点" ;;
+    *) echo "FAIL  同步提示未覆盖所有节点"; fail=$((fail + 1)) ;;
+esac
+
+# 没有 TLS 类节点时（例如伪装的域名还没部署到这类节点）不能整笔判失败
+cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[
+ {"type":"vless","tag":"vless-reality-in-9443","listen_port":9443,"users":[{"uuid":"11111111-1111-1111-1111-111111111111"}],
+  "tls":{"enabled":true,"server_name":"old.example.com",
+         "reality":{"enabled":true,"handshake":{"server":"old.example.com","server_port":443},"private_key":"k","short_id":["a"]}}}
+]}
+JSON
+_batch_sni_plan() { printf 'vless-reality-in-9443\tvless-reality\t9443\treality\tnone\tReality-Node\told.example.com\n'; }
+_camouflage_apply_all_nodes "vpn.example.com" "" >/dev/null 2>&1
+check_true "纯 Reality 场景下同步仍然成功" "$?"
+check "纯 Reality 场景 SNI 已同步" "vpn.example.com" \
+    "$(jq -r '.inbounds[0].tls.server_name' "$CONFIG_FILE")"
+
+# 菜单与部署提示必须如实说明作用域是所有节点
+grep -q '_camouflage_apply_all_nodes' "$ROOT/singbox.sh"
+check_true "部署与菜单第 2 项已接入全节点同步" "$?"
+grep -q '所有节点的 SNI 改为' "$ROOT/singbox.sh"
+check_true "部署提示文案声明作用域为所有节点" "$?"
+grep -q '同步所有节点到该域名' "$ROOT/singbox.sh"
+check_true "菜单第 2 项文案声明作用域为所有节点" "$?"
+
 
 if [ "$fail" -eq 0 ]; then
     echo ""

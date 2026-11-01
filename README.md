@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v111`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v112`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -107,10 +107,10 @@ sb
 - **80 端口**：Caddy 通过 ACME HTTP-01 签发并自动续期证书；443 可能归 Reality 或被复用，TLS-ALPN-01 统一不可用。80 端口被占用时会降级为"使用你已有的 fullchain.pem / privkey.pem"，否则取消且不改动任何配置。**80 端口需要长期保持空闲且公网可达**，否则证书会在 90 天后过期，伪装站反而比不伪装更可疑；`[12] 检查配置文件` 会在证书剩余不足 15 天时告警。
 - **Caddy 安装**：只在首次使用本功能时询问并安装（GitHub 官方 Release 二进制 + 官方 SHA-256 校验 + 可执行性验证 + 原子替换），不使用系统包管理器，卸载干净。安装后用 `caddy validate` 校验 Caddyfile，再启动服务、等待证书签发，并自检 `https://<域名>:8443/` 返回 200；任一步失败都会拆掉 Caddy 全部产物且 sing-box 配置一行未动。卸载时若仍有 TLS 节点在复用该证书，会提前告警。
 - **进程与文件**：Caddy 跟随脚本现有的 `systemd` / `openrc` / `direct` 三种模式运行；站点根目录、Caddyfile、数据目录全部收敛在 `${SINGBOX_DIR}` 下（`www`、`Caddyfile`、`caddy`），状态写入 `${SINGBOX_DIR}/caddy_camouflage.json`，`[17] 卸载脚本` 会一并停止并清理。
-- **Reality 迁移**：有 Reality 节点时，确认后会要求选出一个 Reality 节点占用 443（已有 443 就直接复用，未指定默认第一个），其余 Reality 节点保持原端口；若 Caddy 当时占用公网 443，会先让它退回回环模式，失败则整笔回滚。**所有** Reality 节点的 `handshake` 统一改为 `127.0.0.1:8443`、`server_name` 改为该域名——因为域名已指向本机，继续保留 `handshake.server=<域名>` 会让 Reality 回头连接自己的 443 形成自环。改端口沿用现有端口变更流程（快照、冲突复检、失败回滚），节点名称保持不变。
+- **Reality 迁移**：有 Reality 节点时，确认后会要求选出一个 Reality 节点占用 443（已有 443 就直接复用，未指定默认第一个），其余 Reality 节点保持原端口；若 Caddy 当时占用公网 443，会先让它退回回环模式，失败则整笔回滚。**所有** Reality 节点的 `handshake` 统一改为 `127.0.0.1:8443`、`server_name` 改为该域名——因为域名已指向本机，继续保留 `handshake.server=<域名>` 会让 Reality 回头连接自己的 443 形成自环。迁移与 TLS 类节点的证书复用合并在**同一笔事务**内完成，任一步失败整笔回滚。改端口沿用现有端口变更流程（快照、冲突复检、失败回滚），节点名称保持不变。
 - **与 `[20]` 的关系**：`[20] 一键更换所有节点 SNI` 会检测到伪装站存在；若新 SNI 与该域名不一致，会提示回落证书将不匹配并要求二次确认（默认 N）。切换 SNI 时 Reality 的 `handshake` 指向会保持不变，避免打断已部署的伪装站。
 
-菜单入口另有子菜单支持重新部署、更换域名、重新输出订阅和卸载伪装站。**没有 Reality 节点时**，菜单第 2 项改为"同步其他 TLS 类节点到该域名"：把这些节点的 `server_name` 指向该域名、`certificate_path` / `key_path` 换成伪装站证书，并把客户端 `skip-cert-verify` 关掉（证书公网可信）；Hysteria2 的跳跃子入站会跟随主节点同步。新建或修改 TLS 节点时，若填写的伪装域名与伪装站一致，证书选择菜单会多出"复用伪装站证书"选项。
+菜单入口另有子菜单支持重新部署、更换域名、重新输出订阅和卸载伪装站。**同步作用域是所有节点**：有 Reality 节点时，菜单第 2 项在迁移 443 的同时，把其他 TLS 类节点（VLESS-WS/gRPC、Trojan-WS、AnyTLS、Hysteria2、TUIC）也一并同步到该域名——`server_name` 指向该域名、`certificate_path` / `key_path` 换成伪装站证书，并把客户端 `skip-cert-verify` 关掉（证书公网可信）；Hysteria2 的跳跃子入站会跟随主节点同步。**没有 Reality 节点时**，第 2 项只做这批 TLS 类节点的同步。新建或修改 TLS 节点时，若填写的伪装域名与伪装站一致，证书选择菜单会多出"复用伪装站证书"选项。
 
 ## 节点命名规则
 
@@ -535,3 +535,8 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 修复"证书已签发但自检失败"的误判：实测 `systemctl restart` 返回只需约 30ms，而 Caddy 真正开始监听 8443 要约 300ms。原 `_caddy_verify_site` 在 restart 返回后立刻单次 `curl`，正好落在这个启动竞态窗口内，于是把一次成功部署判为"自检失败"并整笔回滚——日志里能看到 `certificate obtained successfully` 之后紧接着就是回滚。现在自检会重试（默认最多 30 秒），拿到 200 立即通过，超时才失败。
 - 修复失败收尾把证书一起删掉：原 `_caddy_cleanup_partial` 无条件 `rm -rf` 掉 `CADDY_DATA_DIR`，其中包含刚签发的证书。后果是引用该证书的 hy2/tuic 节点立刻变成"指向已删除证书"，`config.json` 陷入不可重启状态（sing-box 直接 FATAL），必须人工救；同时重新签发要消耗 Let's Encrypt 同一域名 168 小时 5 张的配额，重试几次就会打满。现在失败时只停止服务，**保留证书与站点文件**，便于直接重试；只有首次部署（此前没有任何可用证书）时才彻底清理，避免留下半成品。
 - `tests/test_caddy_camouflage.sh` 增加回归用例：自检在启动竞态窗口内重试并最终成功、持续失败时按超时返回、已有证书时清理不删除证书与站点目录、首次部署失败时才彻底清理。
+
+### 2026.11.06
+
+- `[21]` 部署完成后的同步作用域从"仅 Reality 节点"扩展为"所有节点"：部署成功后的确认不再只改 Reality 的 `server_name` 与 `handshake`，还会在同一笔事务内把其他 TLS 类节点（VLESS-WS/gRPC、Trojan-WS、AnyTLS、Hysteria2、TUIC）的 `server_name` 与证书路径一并换到伪装域名与伪装站证书，并关闭客户端 `skip-cert-verify`。选一个 Reality 节点迁移到 443 的步骤保持不变。菜单第 2 项文案同步改为"同步所有节点到该域名"。
+- 新增 `_camouflage_mutate_all_nodes` / `_camouflage_apply_all_nodes` 作为统一入口：先执行 Reality 换域名与 443 迁移，再在有 TLS 类节点时同步证书复用；没有 TLS 类节点不视为失败，避免纯 Reality 场景被误判成事务失败。`_camouflage_has_tls_nodes` 与 `[20]` 复用同一份 `_batch_sni_plan` 判定，两处口径不会漂移。

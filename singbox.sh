@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="111"
+export SCRIPT_VERSION="112"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -7200,6 +7200,36 @@ _camouflage_apply_tls_nodes() {
     _success "TLS 类节点已更新：SNI=${domain}，证书复用伪装站。"
 }
 
+# 是否存在可复用伪装站证书的 TLS 类节点（WS/gRPC/Trojan/AnyTLS/HY2/TUIC）。
+# 与 [20] 复用同一份计划判定，避免两处口径不一致。
+_camouflage_has_tls_nodes() {
+    local plan tag variant port sni_target rest
+    plan=$(_batch_sni_plan 2>/dev/null) || return 1
+    # 计划行是 7 列，必须显式多接一个变量，否则第 4 列会把余下各列一起吞掉。
+    while IFS=$'\t' read -r tag variant port sni_target rest; do
+        [ "$sni_target" = "tls" ] && return 0
+    done <<< "$plan"
+    return 1
+}
+
+# 一次事务内同步所有节点：Reality 全部换 SNI（含 443 迁移），TLS 类节点改为复用伪装站证书。
+# 没有 TLS 类节点时不算失败，否则纯 Reality 场景会被误判成事务失败。
+_camouflage_mutate_all_nodes() {
+    local domain="$1" port443_tag="${2:-}"
+    _camouflage_mutate_reality apply "$domain" "$port443_tag" || return 1
+    _camouflage_has_tls_nodes || return 0
+    _camouflage_mutate_tls_nodes "$domain" || return 1
+    return 0
+}
+
+_camouflage_apply_all_nodes() {
+    local domain="$1" tag443="${2:-}"
+    _camouflage_tx "伪装域名同步到所有节点" _camouflage_mutate_all_nodes "$domain" "$tag443" || return 1
+    [ -n "$tag443" ] && _camouflage_state_rebind_tag "$tag443"
+    _success "所有节点已更新：SNI=${domain}，443 端口节点 ${tag443:-未迁移}。"
+    return 0
+}
+
 _caddy_camouflage_status() {
     local domain port mode cert tag443 not_after scope
     domain=$(_camouflage_state_field '.domain')
@@ -7333,7 +7363,7 @@ _caddy_camouflage_deploy() {
     echo ""
     local apply_choice tag443
     if [ -n "$(_camouflage_list_reality_nodes)" ]; then
-        _warn "下一步会把所有 Reality 节点的 SNI 改为 ${domain}，并把其中一个迁移到 443 端口。"
+        _warn "下一步会把所有节点的 SNI 改为 ${domain}，并把其中一个 Reality 节点迁移到 443 端口。"
         read -r -p "是否现在执行？[Y/n]: " apply_choice
         if [[ "$apply_choice" =~ ^[Nn]$ ]]; then
             _info "已跳过。可稍后在 [21] 中单独执行。"
@@ -7341,8 +7371,7 @@ _caddy_camouflage_deploy() {
         fi
         _info "可用的 Reality 节点："
         tag443=$(_camouflage_pick_port443_tag) || return 1
-        _camouflage_apply_reality apply "$domain" "$tag443" || return 1
-        _camouflage_state_rebind_tag "$tag443"
+        _camouflage_apply_all_nodes "$domain" "$tag443" || return 1
         echo ""
         _output_base64_subscription
         return 0
@@ -7404,7 +7433,7 @@ _caddy_camouflage_menu() {
         echo ""
         echo "  1) 重新部署 / 修复伪装站点"
         if [ -n "$(_camouflage_list_reality_nodes)" ]; then
-            echo "  2) 同步 Reality 节点到该域名（含 443 端口）"
+            echo "  2) 同步所有节点到该域名（Reality 含 443 端口 + TLS 类节点复用证书）"
         else
             echo "  2) 同步其他 TLS 类节点到该域名（复用伪装站证书）"
         fi
@@ -7420,8 +7449,7 @@ _caddy_camouflage_menu() {
                 if [ -n "$(_camouflage_list_reality_nodes)" ]; then
                     _info "可用的 Reality 节点："
                     tag443=$(_camouflage_pick_port443_tag) || return 1
-                    _camouflage_apply_reality apply "$domain" "$tag443" || return 1
-                    _camouflage_state_rebind_tag "$tag443"
+                    _camouflage_apply_all_nodes "$domain" "$tag443" || return 1
                 else
                     _camouflage_apply_tls_nodes "$domain" || return 1
                 fi
