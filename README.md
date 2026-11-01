@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v113`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v114`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -203,6 +203,8 @@ Hysteria2、TUIC、VMess、Trojan、AnyTLS 等其余第三方分享链接不属�
 SS2022 可导入 SIP002 明文用户信息链接；为兼容现有分享工具，也接受非标准的 Base64 编码用户信息及旧式整串 Base64 链接。带插件的链接会被拒绝；普通分享链接无法表达落地节点是否要求 ShadowTLS 或 Multiplex/Padding，因此这些附加设置不会自动启用。中转机与第三方落地机需要保持时间准确；导入成功只表示配置通过检查，仍需确认实际连通。
 
 VLESS 导入结果都会显式写入 `network: "tcp"`。Reality 模式严格检查 SNI、公钥、Short ID、uTLS 指纹和 `flow`；WS+TLS 模式严格校验 SNI、Host、Path 与 uTLS 指纹；HTTP/HTTPS 代理作为落地节点时通过 HTTP CONNECT 转发 TCP 流量。
+
+WS+TLS 导入暂不支持显式 `alpn` 与 `ed` 参数；解析器会明确拒绝这类链接，不再接受后静默丢弃参数。
 
 sing-box 中 HTTPS 代理的出站类型仍为 `http`，通过 `tls.enabled: true` 启用 TLS；中转菜单按 TLS 状态显示为 `https`。使用 `https://IP:端口` 导入域名证书代理时，需在链接中加 `?sni=证书域名`，并确保域名与实际证书匹配；`http://` 则不会启用 TLS。
 
@@ -544,3 +546,12 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 ### 2026.11.07
 
 - 聚合 Base64 订阅改为直接输出：`[3] 查看节点链接` 列出分享链接后不再询问"是否生成聚合 Base64 订阅"，`[20] 一键更换所有节点 SNI` 成功后也不再询问"是否立即输出聚合 Base64 订阅"，两处都在链接齐全时直接打印聚合订阅，少一次交互。
+
+### v114：状态恢复与分享链接修复
+
+- Xray 只有在配置、元数据、YAML 和证书全部备份成功后才执行变更；恢复失败保留快照，不再把备份失败误判为原文件不存在。
+- 端口转发删除与引擎切换纳入运行规则、持久化配置和 metadata 的整体回滚；删除或保存失败不会继续移除管理记录。
+- Caddy 部署先校验临时配置，失败恢复原 Caddyfile、状态文件与服务运行状态；保留证书，避免破坏已部署节点。
+- 修复 `[20]` 告警函数定义位置、`yaml:false` 被默认值覆盖，以及 VLESS 回退导出因空字段错位丢失 TLS/WS 的问题。
+- 分享链接的密码按 URI 字段编码；AnyTLS-Reality 客户端 SNI 优先取节点域名，不使用本机回落地址。
+- 新增离线故障注入与真实菜单、导出行为回归，通过现有测试入口运行，不依赖真实服务或外网。

@@ -401,7 +401,8 @@ _parse_vless_ws_tls() {
     local link security transport sni host path fingerprint insecure_raw insecure output
     link="$1"
     _parse_vless_uri "$link"
-    _require_query_keys encryption flow security sni servername fp insecure allowInsecure host path alpn ed headerType type
+    # 未实现的 ALPN/early-data 不得静默丢弃，未知参数由严格白名单明确拒绝。
+    _require_query_keys encryption flow security sni servername fp insecure allowInsecure host path headerType type
 
     security="${QUERY_PARAMS[security]-}"
     transport="${QUERY_PARAMS[type]-}"

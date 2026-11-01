@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="113"
+export SCRIPT_VERSION="114"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -1355,7 +1355,7 @@ _find_proxy_name() {
     local port="$1" type="$2" tag="$3" proxy_name=""
     if [ -n "$tag" ] && [ -f "$METADATA_FILE" ]; then
         local yaml_enabled
-        yaml_enabled=$(jq -r --arg t "$tag" '.[$t].yaml // empty' "$METADATA_FILE" 2>/dev/null)
+        yaml_enabled=$(jq -r --arg t "$tag" 'if .[$t] | has("yaml") then .[$t].yaml else empty end' "$METADATA_FILE" 2>/dev/null)
         [ "$yaml_enabled" = "false" ] && return 0
         proxy_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE" 2>/dev/null)
         [ -n "$proxy_name" ] && { echo "$proxy_name"; return 0; }
@@ -4092,7 +4092,7 @@ _show_node_link() {
             # 参数: password, sni, ws_path, skip_verify
             local password="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4" cert_path="$5"
             local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            url="trojan://$(_url_encode "$password")@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "hysteria2")
             # 参数: password, sni, obfs_password(可选), port_hopping(可选), skip_verify(可选)
@@ -4108,14 +4108,14 @@ _show_node_link() {
             else
                 insecure_param=""
             fi
-            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}${insecure_param}${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
+            url="hysteria2://$(_url_encode "$password")@${link_ip}:${port}?sni=${sni}${insecure_param}${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
             ;;
         "tuic")
             # 参数: uuid, password, sni, skip_verify(可选)
             local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}" skip_verify="${4:-true}"
             local insecure_param="&allow_insecure=1"
             [ "$skip_verify" = "true" ] || insecure_param=""
-            url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native${insecure_param}#$(_url_encode "$name")"
+            url="tuic://${uuid}:$(_url_encode "$password")@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native${insecure_param}#$(_url_encode "$name")"
             ;;
         "anytls")
             # v2rayN 使用 sing-box 运行 AnyTLS；其 sing-box 出站不会应用链接中的 pcs。
@@ -4123,12 +4123,12 @@ _show_node_link() {
             local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3"
             local insecure_param=""
             [ "$skip_verify" = "true" ] && insecure_param="&insecure=1"
-            url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}&type=tcp#$(_url_encode "$name")"
+            url="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}&type=tcp#$(_url_encode "$name")"
             ;;
         "any-reality")
             # 参数: password, sni, public_key, short_id
             local password="$1" sni="${2:-$DEFAULT_SNI}" public_key="$3" short_id="$4"
-            url="anytls://${password}@${link_ip}:${port}?security=reality&sni=${sni}&fp=chrome&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+            url="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=reality&sni=${sni}&fp=chrome&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
             ;;
         "shadowsocks")
             # 参数: method, password
@@ -4834,7 +4834,7 @@ _create_anyreality_node() {
     local link_ip="$node_ip"
     [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
 
-    local share_link="anytls://${password}@${link_ip}:${port}?security=reality&sni=${server_name}&fp=chrome&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+    local share_link="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=reality&sni=${server_name}&fp=chrome&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
     local meta_json
     meta_json=$(jq -n \
         --arg type "any-reality" \
@@ -5657,10 +5657,12 @@ _view_nodes() {
             case "$type" in
             "vless")
                 # [资源优化] 合并 VLESS 关键字段读取，避免循环内多次 jq
-                local _vless_fields
-                # [加固] 智能回溯 SNI: 优先 .tls.server_name, 备选 .tls.reality.handshake.server, 保底 www.amd.com
-            _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.amd.com"), (.tls.certificate_path // ""), (.transport.path // ""), (.transport.service_name // "")] | @tsv')
-            IFS=$'\t' read -r uuid flow is_reality transport_type tls_enabled tls_sn cert_path ws_path grpc_service_name <<< "$_vless_fields"
+                local -a _vless_fields
+                # NUL 不属于合法 URI 字段；保留空 flow、路径中的空白及反斜杠。
+                mapfile -d '' -t _vless_fields < <(printf '%s' "$node" | jq -j '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.amd.com"), (.tls.certificate_path // ""), (.transport.path // ""), (.transport.service_name // "")][] | ., "\u0000"')
+                local uuid="${_vless_fields[0]}" flow="${_vless_fields[1]}" is_reality="${_vless_fields[2]}"
+                local transport_type="${_vless_fields[3]}" tls_enabled="${_vless_fields[4]}" tls_sn="${_vless_fields[5]}"
+                local cert_path="${_vless_fields[6]}" ws_path="${_vless_fields[7]}" grpc_service_name="${_vless_fields[8]}"
                 
                 # [加固] 确保 Reality 模式下的流量控制字段非空 (v2rayN 要求)
                 [ "$is_reality" == "true" ] && [ -z "$flow" ] && flow="xtls-rprx-vision"
@@ -5707,15 +5709,13 @@ _view_nodes() {
                 fi
                 ;;
             "trojan")
-                # [资源优化] 合并3次jq为1次
-                local _trojan_fields
-                _trojan_fields=$(echo "$node" | jq -r '[.users[0].password, (.transport.type // ""), (.transport.path // "")] | @tsv')
-                local password transport_type ws_path
-                IFS=$'\t' read -r password transport_type ws_path <<< "$_trojan_fields"
+                local -a _trojan_fields
+                mapfile -d '' -t _trojan_fields < <(printf '%s' "$node" | jq -j '[.users[0].password, (.transport.type // ""), (.transport.path // "")][] | ., "\u0000"')
+                local password="${_trojan_fields[0]}" transport_type="${_trojan_fields[1]}" ws_path="${_trojan_fields[2]}"
                 
                 if [ "$transport_type" == "ws" ]; then
                     local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
-                    url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
+                    url="trojan://$(_url_encode "$password")@${link_ip}:${port}?security=tls&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
                     
                     # Argo 节点元数据已迁移到 argo_metadata.json
                     local argo_domain=""
@@ -5724,11 +5724,11 @@ _view_nodes() {
                     fi
                     if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
                         local argo_ws_path=$(_ws_path_with_early_data "$ws_path")
-                        url="trojan://${password}@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$argo_ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
+                        url="trojan://$(_url_encode "$password")@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$argo_ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
                     fi
                 else
                     local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
-                    url="trojan://${password}@${link_ip}:${port}?security=tls&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
+                    url="trojan://$(_url_encode "$password")@${link_ip}:${port}?security=tls&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
                 fi
                 ;;
             "hysteria2")
@@ -5745,29 +5745,28 @@ _view_nodes() {
                 local hy2_skip=$(_node_skip_verify "$proxy_name_to_find" "$node")
                 local hy2_insecure="&insecure=1"
                 [ "$hy2_skip" = "true" ] || hy2_insecure=""
-                url="hysteria2://${pw}@${link_ip}:${port}?sni=${sn}${hy2_insecure}${obfs_param}${hop_param}#$(_url_encode "$display_name")"
+                url="hysteria2://$(_url_encode "$pw")@${link_ip}:${port}?sni=${sn}${hy2_insecure}${obfs_param}${hop_param}#$(_url_encode "$display_name")"
                 ;;
             "tuic")
-                # [资源优化] 合并2次jq为1次
-                local uuid pw
-                IFS=$'\t' read -r uuid pw <<< "$(echo "$node" | jq -r '[.users[0].uuid, .users[0].password] | @tsv')"
+                local -a _tuic_fields
+                mapfile -d '' -t _tuic_fields < <(printf '%s' "$node" | jq -j '[.users[0].uuid, .users[0].password][] | ., "\u0000"')
+                local uuid="${_tuic_fields[0]}" pw="${_tuic_fields[1]}"
                 local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
                 local tuic_skip=$(_node_skip_verify "$proxy_name_to_find" "$node")
                 local tuic_insecure="&allow_insecure=1"
                 [ "$tuic_skip" = "true" ] || tuic_insecure=""
-                url="tuic://${uuid}:${pw}@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native${tuic_insecure}#$(_url_encode "$display_name")"
+                url="tuic://${uuid}:$(_url_encode "$pw")@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native${tuic_insecure}#$(_url_encode "$display_name")"
                 ;;
             "anytls")
-                # [资源优化] 合并2次jq为1次
-                local pw sn
-                # [加固] 允许 server_name 回溯
-                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r '[.users[0].password, (.tls.server_name // "www.amd.com")] | @tsv')"
+                local -a _anytls_fields
+                mapfile -d '' -t _anytls_fields < <(printf '%s' "$node" | jq -j '[.users[0].password, (.tls.server_name // "www.amd.com")][] | ., "\u0000"')
+                local pw="${_anytls_fields[0]}" sn="${_anytls_fields[1]}"
                 local skip_verify=$(_get_proxy_field "$proxy_name_to_find" ".skip-cert-verify")
                 local insecure_param=""
                 if [ "$skip_verify" == "true" ]; then
                     insecure_param="&insecure=1"
                 fi
-                url="anytls://${pw}@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
+                url="anytls://$(_url_encode "$pw")@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
                 ;;
             "shadowsocks")
                 # [资源优化] 合并2次jq为1次
@@ -6047,6 +6046,23 @@ _output_base64_subscription() {
     return 0
 }
 
+# SNI 与 Caddy 伪装域名不一致时，回落站点会因证书不匹配而暴露。
+_batch_sni_camouflage_warning() {
+    local new_sni="$1" domain
+    [ -n "${CADDY_STATE_FILE:-}" ] && [ -s "$CADDY_STATE_FILE" ] || return 0
+    domain=$(_camouflage_state_field '.domain')
+    [ -n "$domain" ] || return 0
+    _info "当前 Caddy 伪装域名：${domain}"
+    [ "$new_sni" = "$domain" ] && return 0
+    _warn "该域名属于 Caddy 伪装站的回落证书。"
+    _warn "把 Reality 切换到 ${new_sni} 后，回落站点会因证书不匹配而暴露。"
+    _warn "如需更换域名，请通过 [21] 的“更换伪装域名”执行。"
+    local confirm
+    read -r -p "仍要继续？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    return 0
+}
+
 # 在事务保护下执行批量换 SNI：状态锁 + 快照 + 组合校验 + 单次重启 + 失败回滚
 _batch_change_sni_apply() (
     local sni="$1" regen="$2" plan_file="$3"
@@ -6065,22 +6081,6 @@ _batch_change_sni_apply() (
         _error "无法完整创建 SNI 变更事务快照，操作尚未开始。"
         rm -rf -- "$backup_dir"
 
-# SNI 与 Caddy 伪装域名不一致时，回落站点会因证书不匹配而暴露。
-_batch_sni_camouflage_warning() {
-    local new_sni="$1" domain
-    [ -n "${CADDY_STATE_FILE:-}" ] && [ -s "$CADDY_STATE_FILE" ] || return 0
-    domain=$(_camouflage_state_field '.domain')
-    [ -n "$domain" ] || return 0
-    _info "当前 Caddy 伪装域名：${domain}"
-    [ "$new_sni" = "$domain" ] && return 0
-    _warn "该域名属于 Caddy 伪装站的回落证书。"
-    _warn "把 Reality 切换到 ${new_sni} 后，回落站点会因证书不匹配而暴露。"
-    _warn "如需更换域名，请通过 [21] 的“更换伪装域名”执行。"
-    local confirm
-    read -r -p "仍要继续？[y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || return 1
-    return 0
-}
         if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
         return 1
     fi
@@ -7255,6 +7255,76 @@ _caddy_camouflage_status() {
     fi
 }
 
+_caddy_service_running() {
+    [ -n "${INIT_SYSTEM:-}" ] || _detect_init_system
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet "$CADDY_SERVICE_NAME" ;;
+        openrc) rc-service "$CADDY_SERVICE_NAME" status >/dev/null 2>&1 ;;
+        direct) _is_pid_file_running_cmd "$CADDY_PID_FILE" "$CADDY_BIN" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 校验临时配置后才替换；证书由 Caddy 自行管理，失败时不删除已签发材料。
+_caddy_deploy_site_locked() (
+    local domain="$1" site_port="$2" cert_mode="$3" cert_path="$4" key_path="$5"
+    local snapshot staged scope verify_port validate_err final_cert final_key not_after=""
+    local committed=0 service_attempted=0 was_running=0
+    snapshot=$(mktemp -d "${TMPDIR:-/tmp}/.singbox-caddy-deploy.XXXXXX") || return 1
+    if ! _main_create_tx_snapshot_file "$snapshot" conf "$CADDY_CONF_FILE" \
+        || ! _main_create_tx_snapshot_file "$snapshot" state "$CADDY_STATE_FILE" \
+        || ! _main_create_tx_snapshot_file "$snapshot" index "${CADDY_WEB_ROOT}/index.html"; then
+        rm -rf -- "$snapshot"
+        _error "无法完整备份伪装站配置，部署尚未开始。"
+        return 1
+    fi
+    _caddy_service_running && was_running=1
+    staged=$(mktemp "${CADDY_CONF_FILE}.staged.XXXXXX") || { rm -rf -- "$snapshot"; return 1; }
+    trap 'deploy_rc=$?; trap - EXIT INT TERM; restore_failed=0; if [ "$committed" -ne 1 ]; then _main_create_tx_restore_file "$snapshot" conf "$CADDY_CONF_FILE" || restore_failed=1; _main_create_tx_restore_file "$snapshot" state "$CADDY_STATE_FILE" || restore_failed=1; _main_create_tx_restore_file "$snapshot" index "${CADDY_WEB_ROOT}/index.html" || restore_failed=1; if [ "$service_attempted" -eq 1 ]; then if [ "$was_running" -eq 1 ]; then _caddy_service restart >/dev/null 2>&1 || restore_failed=1; elif [ -f "$snapshot/conf.present" ]; then _caddy_service stop >/dev/null 2>&1 || restore_failed=1; else _caddy_service remove >/dev/null 2>&1 || restore_failed=1; fi; fi; fi; rm -f -- "$staged"; if [ "$restore_failed" -eq 0 ]; then rm -rf -- "$snapshot"; else _error "伪装站回滚不完整，快照已保留: $snapshot"; deploy_rc=1; fi; exit "$deploy_rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    scope=$(_camouflage_default_scope) || return 1
+    (
+        local CADDY_CONF_FILE="$staged"
+        _caddy_write_config "$domain" "$site_port" "$cert_mode" "$cert_path" "$key_path" "$scope"
+    ) || return 1
+    if ! validate_err=$("$CADDY_BIN" validate --config "$staged" --adapter caddyfile 2>&1); then
+        _error "Caddyfile 校验失败："
+        printf '%s\n' "$validate_err"
+        return 1
+    fi
+    if [ ! -s "${CADDY_WEB_ROOT}/index.html" ]; then
+        printf '<!doctype html><html lang="en"><title>Service Status</title><p>Operational</p></html>\n' > "${CADDY_WEB_ROOT}/index.html" || return 1
+        chmod 644 "${CADDY_WEB_ROOT}/index.html" || return 1
+    fi
+    mv -f -- "$staged" "$CADDY_CONF_FILE" || return 1
+    service_attempted=1
+    if { [ "$was_running" -eq 0 ] && ! _caddy_service install; } || ! _caddy_service restart; then
+        _error "Caddy 服务启动失败，正在恢复原状态。"
+        _caddy_log_tail
+        return 1
+    fi
+    if [ "$cert_mode" = acme ]; then
+        _info "正在等待 ACME 签发证书（最长 180 秒）..."
+        _caddy_wait_cert "$domain" 180 || { _error "证书签发失败或超时。"; _caddy_log_tail; return 1; }
+    fi
+    verify_port="$site_port"
+    [ "$scope" != public ] || verify_port=443
+    _caddy_verify_site "$domain" "$verify_port" || { _error "伪装站点自检失败，正在恢复原状态。"; _caddy_log_tail; return 1; }
+    final_cert="$cert_path"; final_key="$key_path"
+    if [ "$cert_mode" = acme ]; then
+        final_cert=$(_caddy_cert_file "$domain") || return 1
+        final_key="${final_cert%.crt}.key"
+    fi
+    if [ -n "$final_cert" ] && [ -f "$final_cert" ]; then
+        not_after=$(openssl x509 -in "$final_cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+    fi
+    _camouflage_state_write "$domain" "$site_port" "$cert_mode" "$final_cert" "$final_key" "" "$not_after" "$scope" \
+        || { _error "伪装站状态写入失败，正在恢复原状态。"; return 1; }
+    committed=1
+    return 0
+)
+
 _caddy_camouflage_deploy() {
     local domain site_port="${CADDY_FALLBACK_PORT:-8443}"
 
@@ -7301,54 +7371,10 @@ _caddy_camouflage_deploy() {
         cert_mode="custom"
     fi
 
-    local scope
-    scope=$(_camouflage_default_scope)
-    _caddy_write_config "$domain" "$site_port" "$cert_mode" "$cert_path" "$key_path" "$scope" || return 1
+    _with_state_lock _caddy_deploy_site_locked "$domain" "$site_port" "$cert_mode" "$cert_path" "$key_path" || return 1
     _caddy_write_index_page || _warn "伪装页写入异常，继续使用现有页面。"
-
-    local validate_err
-    if ! validate_err=$("$CADDY_BIN" validate --config "$CADDY_CONF_FILE" --adapter caddyfile 2>&1); then
-        _error "Caddyfile 校验失败："
-        echo "$validate_err"
-        _caddy_cleanup_partial
-        return 1
-    fi
-    if ! _caddy_service install || ! _caddy_service restart; then
-        _error "Caddy 服务启动失败。"
-        _caddy_log_tail
-        _caddy_cleanup_partial
-        return 1
-    fi
-
-    if [ "$cert_mode" = "acme" ]; then
-        _info "正在等待 ACME 签发证书（最长 180 秒）..."
-        if ! _caddy_wait_cert "$domain" 180; then
-            _error "证书签发失败或超时。"
-            _caddy_log_tail
-            _caddy_cleanup_partial
-            return 1
-        fi
-    fi
-    # public 模式只监听 443，不能再拿回环端口自检，否则必然失败并误回滚。
-    local verify_port="$site_port"
-    [ "$scope" = "public" ] && verify_port="443"
-    if ! _caddy_verify_site "$domain" "$verify_port"; then
-        _error "伪装站点自检失败：https://${domain}:${verify_port}/ 未返回 200。"
-        _caddy_log_tail
-        _caddy_cleanup_partial
-        return 1
-    fi
-
-    local final_cert final_key not_after
-    final_cert=$(_caddy_cert_file "$domain" || true)
-    [ -n "$final_cert" ] || final_cert="$cert_path"
-    final_key="$key_path"
-    not_after=""
-    if [ -n "$final_cert" ] && [ -f "$final_cert" ]; then
-        not_after=$(openssl x509 -in "$final_cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
-    fi
-    _camouflage_state_write "$domain" "$site_port" "$cert_mode" "$final_cert" "$final_key" "" "$not_after" "$scope" \
-        || _warn "伪装站状态文件写入失败，下次进入可能需要重新部署。"
+    local scope
+    scope=$(_camouflage_state_field '.listenScope')
     if [ "$scope" = "public" ]; then
         _success "伪装站点已就绪：https://${domain}/ （Caddy 直接对外监听 443）"
     else
@@ -8023,7 +8049,7 @@ _refresh_modified_node_artifacts() {
     ' --arg tag "$tag" --arg name "$name" --arg variant "$variant" --arg server "$client_server" || return 1
 
     local yaml_enabled
-    yaml_enabled=$(jq -r --arg tag "$tag" '.[$tag].yaml // true' "$METADATA_FILE" 2>/dev/null)
+    yaml_enabled=$(jq -r --arg tag "$tag" 'if .[$tag] | has("yaml") then .[$tag].yaml else true end' "$METADATA_FILE" 2>/dev/null)
     if [ "$yaml_enabled" = "true" ]; then
         [ -n "$proxy_name" ] || { _error "找不到节点对应的 Clash YAML 条目。"; return 1; }
         export OLD_NAME="$proxy_name" NEW_NAME="$name" NODE_SERVER="$client_server" NODE_PORT="$port"
@@ -8100,7 +8126,7 @@ _refresh_modified_node_artifacts() {
             ;;
         any-reality)
             password=$(printf '%s' "$node" | jq -r '.users[0].password')
-            sni=$(printf '%s' "$node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // .tls.reality.handshake.server // empty')
             public_key=$(jq -r --arg tag "$tag" '.[$tag].publicKey // empty' "$METADATA_FILE")
             short_id=$(printf '%s' "$node" | jq -r '.tls.reality.short_id[0] // empty')
             [ -n "$public_key" ] || { _error "Any-Reality 公钥元数据缺失，无法安全重建分享链接。"; return 1; }

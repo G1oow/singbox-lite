@@ -936,31 +936,91 @@ _check_and_fix_xray_listen() {
 XRAY_TX_DIR=""
 _xray_snapshot_state() {
     XRAY_TX_DIR=$(mktemp -d "${TMPDIR:-/tmp}/singboxlite-xray.XXXXXX") || return 1
-    mkdir -p "$XRAY_TX_DIR/certs"
-    if [ -f "$XRAY_CONFIG" ]; then cp -p "$XRAY_CONFIG" "$XRAY_TX_DIR/config.json" && : > "$XRAY_TX_DIR/config.present"; fi
-    if [ -f "$XRAY_METADATA" ]; then cp -p "$XRAY_METADATA" "$XRAY_TX_DIR/metadata.json" && : > "$XRAY_TX_DIR/metadata.present"; fi
-    if [ -f "$CLASH_YAML_FILE" ]; then cp -p "$CLASH_YAML_FILE" "$XRAY_TX_DIR/clash.yaml" && : > "$XRAY_TX_DIR/clash.present"; fi
-    local file
-    for file in "$XRAY_DIR"/*.pem "$XRAY_DIR"/*.key; do
-        [ -f "$file" ] && cp -p "$file" "$XRAY_TX_DIR/certs/"
+    local file key
+    mkdir -p "$XRAY_TX_DIR/certs" || return 1
+    for key in config metadata clash; do
+        case "$key" in
+            config) file="$XRAY_CONFIG" ;;
+            metadata) file="$XRAY_METADATA" ;;
+            clash) file="$CLASH_YAML_FILE" ;;
+        esac
+        if [ -e "$file" ]; then
+            cp -p "$file" "$XRAY_TX_DIR/$key.data" && : > "$XRAY_TX_DIR/$key.present" || return 1
+        else
+            : > "$XRAY_TX_DIR/$key.absent" || return 1
+        fi
     done
-    return 0
+    # 保留原文件名供删除节点时读取；complete 只能在全部备份成功后写入。
+    if [ -f "$XRAY_TX_DIR/config.present" ]; then
+        cp -p "$XRAY_TX_DIR/config.data" "$XRAY_TX_DIR/config.json" || return 1
+    fi
+    : > "$XRAY_TX_DIR/certs.list" || return 1
+    for file in "$XRAY_DIR"/*.pem "$XRAY_DIR"/*.key; do
+        [ -f "$file" ] || continue
+        cp -p "$file" "$XRAY_TX_DIR/certs/" || return 1
+        printf '%s\n' "${file##*/}" >> "$XRAY_TX_DIR/certs.list" || return 1
+    done
+    : > "$XRAY_TX_DIR/complete"
+}
+
+_xray_restore_file() {
+    local source="$1" target="$2" tmp
+    tmp=$(mktemp "${target}.restore.XXXXXX") || return 1
+    if cp -p "$source" "$tmp" && mv -f -- "$tmp" "$target"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
 }
 
 _xray_restore_state() {
-    local snapshot="$1" file
-    [ -d "$snapshot" ] || return 1
-    if [ -f "$snapshot/config.present" ]; then cp -p "$snapshot/config.json" "$XRAY_CONFIG"; else rm -f -- "$XRAY_CONFIG"; fi
-    if [ -f "$snapshot/metadata.present" ]; then cp -p "$snapshot/metadata.json" "$XRAY_METADATA"; else rm -f -- "$XRAY_METADATA"; fi
-    if [ -f "$snapshot/clash.present" ]; then cp -p "$snapshot/clash.yaml" "$CLASH_YAML_FILE"; fi
-    for file in "$XRAY_DIR"/*.pem "$XRAY_DIR"/*.key; do
-        [ -f "$file" ] && rm -f -- "$file"
+    local snapshot="$1" file key target rc=0
+    [ -f "$snapshot/complete" ] && [ -d "$snapshot/certs" ] || return 1
+    # 缺少 present 不代表原文件不存在；先验证完整性再允许任何删除。
+    for key in config metadata clash; do
+        if [ -f "$snapshot/$key.present" ]; then
+            [ -f "$snapshot/$key.data" ] || return 1
+        else
+            [ -f "$snapshot/$key.absent" ] || return 1
+        fi
     done
+    [ -f "$snapshot/certs.list" ] || return 1
+    while IFS= read -r file; do
+        [ -f "$snapshot/certs/$file" ] || return 1
+    done < "$snapshot/certs.list"
+    for key in config metadata clash; do
+        case "$key" in
+            config) target="$XRAY_CONFIG" ;;
+            metadata) target="$XRAY_METADATA" ;;
+            clash) target="$CLASH_YAML_FILE" ;;
+        esac
+        if [ -f "$snapshot/$key.present" ]; then
+            _xray_restore_file "$snapshot/$key.data" "$target" || rc=1
+        else
+            rm -f -- "$target" || rc=1
+        fi
+    done
+    # 先恢复备份证书，失败时不清理现存证书，保留可恢复的材料。
     for file in "$snapshot/certs"/*.pem "$snapshot/certs"/*.key; do
-        [ -f "$file" ] && cp -p "$file" "$XRAY_DIR/"
+        [ -f "$file" ] || continue
+        _xray_restore_file "$file" "$XRAY_DIR/${file##*/}" || rc=1
     done
-    chmod 600 "$XRAY_CONFIG" "$XRAY_METADATA" "$CLASH_YAML_FILE" 2>/dev/null || true
-    return 0
+    [ "$rc" -eq 0 ] || return 1
+    for file in "$XRAY_DIR"/*.pem "$XRAY_DIR"/*.key; do
+        [ -f "$file" ] || continue
+        [ -f "$snapshot/certs/${file##*/}" ] || rm -f -- "$file" || rc=1
+    done
+    return "$rc"
+}
+
+_xray_rollback_state() {
+    local snapshot="$1"
+    if _xray_restore_state "$snapshot" && _manage_xray_service restart; then
+        _xray_drop_snapshot "$snapshot"
+        return 0
+    fi
+    _error "Xray 恢复失败，快照保留在: $snapshot"
+    return 1
 }
 
 _xray_drop_snapshot() {
@@ -980,9 +1040,7 @@ _run_xray_transaction() {
         return 0
     fi
     _error "Xray 变更失败，正在恢复配置、元数据、证书和 Clash 条目。"
-    _xray_restore_state "$snapshot"
-    _manage_xray_service restart >/dev/null 2>&1 || true
-    _xray_drop_snapshot "$snapshot"
+    _xray_rollback_state "$snapshot" || return 1
     return 1
 }
 
@@ -1824,9 +1882,7 @@ _delete_xray_node() {
         _xray_drop_snapshot "$snapshot"
     else
         _error "删除失败，正在恢复原状态。"
-        _xray_restore_state "$snapshot"
-        _manage_xray_service restart >/dev/null 2>&1 || true
-        _xray_drop_snapshot "$snapshot"
+        _xray_rollback_state "$snapshot" || return 1
         return 1
     fi
     _success "节点 [$target_name] 已删除！"
@@ -1855,9 +1911,7 @@ _delete_all_xray_nodes() {
         _xray_drop_snapshot "$snapshot"
     else
         _error "批量删除失败，正在恢复原状态。"
-        _xray_restore_state "$snapshot"
-        _manage_xray_service restart >/dev/null 2>&1 || true
-        _xray_drop_snapshot "$snapshot"
+        _xray_rollback_state "$snapshot" || return 1
         return 1
     fi
     _success "全部 ${count} 个节点已删除！"
@@ -1928,9 +1982,7 @@ _modify_xray_port() {
     fi
     if [ "$change_ok" -ne 1 ] || ! _manage_xray_service restart; then
         _error "修改端口失败，正在恢复原状态。"
-        _xray_restore_state "$snapshot"
-        _manage_xray_service restart >/dev/null 2>&1 || true
-        _xray_drop_snapshot "$snapshot"
+        _xray_rollback_state "$snapshot" || return 1
         return 1
     fi
     _xray_drop_snapshot "$snapshot"

@@ -161,6 +161,9 @@ standalone_addr=$(bash -c '
 ' _ "$WORK/xray_conn.sh")
 check "独立脚本可用等价实现" "1.2.3.4" "$standalone_addr"
 
+# 事务故障回归复用本测试入口，CI 无需新增任务。
+bash "$ROOT/tests/test_runtime_transactions.sh" || fail=$((fail + 1))
+
 echo
 if [ "$fail" -ne 0 ]; then
     echo "失败 ${fail} 项"
