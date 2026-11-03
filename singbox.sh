@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="114"
+export SCRIPT_VERSION="115"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9759,6 +9759,37 @@ _advanced_features() {
     fi
 }
 
+# --- WARP 出口 (子脚本子命令) ---
+# 出口写在 relay.json 里，因此实现与中转链路同处 advanced_relay.sh，
+# 主脚本只负责入口接线，避免两套 jq 写入逻辑各自漂移。
+_warp_features() {
+    local script_name="advanced_relay.sh"
+    local script_path="${SINGBOX_DIR}/${script_name}"
+
+    if [ -f "$SCRIPT_DIR/$script_name" ]; then
+        script_path="$SCRIPT_DIR/$script_name"
+    fi
+
+    if [ ! -f "$script_path" ]; then
+        _info "本地未检测到进阶脚本，正在尝试下载..."
+        local download_url="${GITHUB_RAW_BASE}/${script_name}"
+        if _download_bash_script_atomic "$download_url" "$script_path" "$script_name"; then
+            _success "下载成功！"
+        else
+            _error "下载失败！请检查网络或确认 GitHub 仓库地址。"
+            rm -f "$script_path"
+            return 1
+        fi
+    fi
+
+    if ! bash -n "$script_path" 2>/dev/null; then
+        _error "进阶脚本未通过 Bash 语法检查，已拒绝执行: ${script_path}"
+        return 1
+    fi
+    chmod 755 "$script_path"
+    bash "$script_path" warp-menu
+}
+
 # --- Xray 节点管理 (子脚本) ---
 _xray_features() {
     # 前置检查：Xray 核心必须已安装
@@ -9961,13 +9992,14 @@ _main_menu() {
         echo -e "    ${GREEN}[19]${NC} Xray 节点管理"
         echo -e "    ${GREEN}[20]${NC} 一键换 SNI/重签证书"
         echo -e "    ${GREEN}[21]${NC} 伪装域名（Caddy）"
+        echo -e "    ${GREEN}[22]${NC} WARP 出口（分流/出口 IP）"
         echo ""
         
         echo -e "  ─────────────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-21]: " choice
+        read -p "  请输入选项 [0-22]: " choice
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -9991,6 +10023,7 @@ _main_menu() {
             19) _xray_features ;;
             20) _require_singbox && _batch_change_sni ;;
             21) _require_singbox && _caddy_camouflage_menu ;;
+            22) _require_singbox && _warp_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac

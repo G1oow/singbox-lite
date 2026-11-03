@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v114`、`advanced_relay.sh v21`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v115`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -94,6 +94,7 @@ sb
 |  | 19 | Xray 节点管理 |
 |  | 20 | 一键更换所有节点 SNI、重签脚本自签证书并输出聚合 Base64 订阅 |
 |  | 21 | 一键部署 Caddy 伪装域名（按需安装 Caddy，域名校验通过后托管伪装站；无 Reality 节点时直接对外监听 443，其他 TLS 协议可复用该域名与证书） |
+|  | 22 | WARP 出口（注册 WARP 设备，按节点或域名/IP 分流，纯出站不接管系统路由） |
 | 退出 | 0 | 退出脚本 |
 
 `[5] 修改节点` 会按实际协议显示可用项目。所有主节点均可修改名称、客户端连接地址、端口和认证信息；Reality 可更新伪装域名并轮换密钥，TLS 类节点可更新 SNI、自签证书或自定义证书，WebSocket/gRPC 可修改传输路径，Hysteria2 还可调整混淆、端口跳跃和客户端带宽。保存时会统一校验 sing-box 配置并同步元数据、分享链接与 Clash/Mihomo 配置，失败则自动回滚。
@@ -111,6 +112,15 @@ sb
 - **与 `[20]` 的关系**：`[20] 一键更换所有节点 SNI` 会检测到伪装站存在；若新 SNI 与该域名不一致，会提示回落证书将不匹配并要求二次确认（默认 N）。切换 SNI 时 Reality 的 `handshake` 指向会保持不变，避免打断已部署的伪装站。
 
 菜单入口另有子菜单支持重新部署、更换域名、重新输出订阅和卸载伪装站。**同步作用域是所有节点**：有 Reality 节点时，菜单第 2 项在迁移 443 的同时，把其他 TLS 类节点（VLESS-WS/gRPC、Trojan-WS、AnyTLS、Hysteria2、TUIC）也一并同步到该域名——`server_name` 指向该域名、`certificate_path` / `key_path` 换成伪装站证书，并把客户端 `skip-cert-verify` 关掉（证书公网可信）；Hysteria2 的跳跃子入站会跟随主节点同步。**没有 Reality 节点时**，第 2 项只做这批 TLS 类节点的同步。新建或修改 TLS 节点时，若填写的伪装域名与伪装站一致，证书选择菜单会多出"复用伪装站证书"选项。
+
+`[22] WARP 出口` 把 Cloudflare WARP 作为**出站**接入，让指定流量经 WARP 出口出去（例如让某些站点使用 WARP 的 IP），不创建 TUN、不改系统路由与防火墙。
+
+- **凭据**：脚本用 `sing-box generate wg-keypair` 在本地生成密钥对，再向 Cloudflare 注册接口换取 peer 配置，不下载也不执行任何第三方二进制。注册信息写入 `${SINGBOX_DIR}/warp/registration.json`（`0600`），设备私钥不会出现在任何菜单输出里。
+- **语法要求**：sing-box 1.11 起 `wireguard` outbound 已废弃，出口以 `endpoints` 形态写入 `relay.json`，低于 v1.11 的核心会在进入菜单时直接拒绝。出口上的 `domain_strategy` 在 1.12 废弃、1.13 起会直接拒绝启动，因此「出口地址族」改为控制 `address` 与 `peers[].allowed_ips`（双栈 / 仅 IPv4 / 仅 IPv6）。
+- **分流方式**：`[3] 节点分流` 让整条节点的流量强制走 WARP；`[4] 域名 / IP 分流` 让命中的域名后缀或 IP 段走 WARP。规则顺序固定为「节点规则 → 域名规则 → IP 规则」，所以节点分流的语义就是「该节点出口 = WARP」，不受域名规则影响。
+- **与中转互斥**：同一入站不能既作为中转入口又绑定 WARP，两个方向都会在写入前拒绝，避免两条规则并存却只有一条生效。
+- **事务与自检**：每次改动都会快照 `relay.json`、执行组合配置校验、重启服务，再用临时 sing-box 进程访问 `cdn-cgi/trace` 校验返回 `warp=on`，任一步失败整体回滚。`[2] 查看状态` 会做同样的探测并查询账号额度。
+- **卸载**：`[6] 卸载 WARP 出口` 只摘除 endpoint 与 `warp-*` 规则，保留注册信息与分流清单以便直接重新启用；`[17] 卸载脚本` 才会清理整个目录。
 
 ## 节点命名规则
 
@@ -308,6 +318,9 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 | `/usr/local/etc/sing-box/machine-id` | 节点命名使用的机器ID |
 | `/usr/local/etc/sing-box/core-version.lock` | 固定版 `1.13.21` 的持久升级锁 |
 | `/usr/local/etc/sing-box/relay.d/` | 中转、端口转发和辅助状态 |
+| `/usr/local/etc/sing-box/warp/registration.json` | WARP 设备注册信息（私钥与 token，`0600`） |
+| `/usr/local/etc/sing-box/warp/rules.json` | WARP 域名 / IP 分流清单 |
+| `/usr/local/etc/sing-box/warp/nodes.json` | 绑定到 WARP 出口的入站节点 |
 | `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
 | `/var/log/sing-box.log` | sing-box 日志 |
 | `/var/log/singbox_argo.log` | Argo 日志 |
@@ -555,3 +568,11 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 修复 `[20]` 告警函数定义位置、`yaml:false` 被默认值覆盖，以及 VLESS 回退导出因空字段错位丢失 TLS/WS 的问题。
 - 分享链接的密码按 URI 字段编码；AnyTLS-Reality 客户端 SNI 优先取节点域名，不使用本机回落地址。
 - 新增离线故障注入与真实菜单、导出行为回归，通过现有测试入口运行，不依赖真实服务或外网。
+
+### v115：WARP 出口
+
+- 新增 `[22] WARP 出口`：脚本内生成 WireGuard 密钥并向 Cloudflare 注册，出口以 `endpoints`（sing-box 1.11+）写入 `relay.json`，不创建 TUN、不改系统路由与防火墙。
+- 支持按节点强制分流与按域名 / IP 分流，规则顺序固定为「节点规则 → 域名规则 → IP 规则」；同一入站与中转入口互斥，两个方向都在写入前拒绝。
+- 出口地址族用 `address` 与 `peers[].allowed_ips` 表达（双栈 / 仅 IPv4 / 仅 IPv6），不使用 1.12 废弃、1.13 起拒绝启动的 `domain_strategy`。
+- 每次改动走「快照 → 组合校验 → 重启 → 出口自检 → 失败回滚」；卸载只摘除 endpoint 与 `warp-*` 规则，保留注册信息。
+- 新增 `tests/test_warp_outbound.sh` 并接入 CI；`SCRIPT_VERSION` 递增到 115。
