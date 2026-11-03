@@ -1831,6 +1831,14 @@ _finalize_relay_setup() {
     local tag_suffix="${listen_port}"
     local inbound_tag="${relay_type}-in-${tag_suffix}"
     local outbound_tag="relay-out-${tag_suffix}"
+
+    # 反向冲突检测：该入站已被 WARP 节点分流占用时不再创建中转入口，
+    # 否则两条规则会并存且只有先匹配的一条生效，菜单看不出静默失效。
+    if _warp_inbound_bound_to_warp "$inbound_tag"; then
+        _error "入站 ${inbound_tag} 已绑定 WARP 出口，不能再作为中转入口"
+        _warn "请先在主菜单【进阶功能】-> [22] WARP 出口 -> [3] 解除该节点绑定"
+        return 1
+    fi
     
     # 更新 outbound_json 中的 tag
     outbound_json=$(echo "$outbound_json" | jq --arg t "$outbound_tag" '.tag = $t')
@@ -3955,7 +3963,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v21)                  ║"
+        echo "  ║                (v22)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 
@@ -4013,6 +4021,718 @@ _menu() {
         esac
     done
 }
+# --- WARP 出口 ---
+# 参考 sing-box-yg 的分流思路，但不引入任何第三方二进制：密钥由
+# `sing-box generate wg-keypair` 本地生成，凭据直接向 Cloudflare 注册接口换取。
+# sing-box 1.11 起 wireguard outbound 已废弃，因此出口以 endpoint 形态写入
+# relay.json（覆盖层），不创建 TUN、不改系统路由与防火墙，卸载即完全回退。
+# 注意：endpoint 上的 domain_strategy 在 1.12 废弃、1.13 直接 FATAL 拒绝，
+# 所以地址族只能靠 address 与 peers[].allowed_ips 表达，不能用该字段。
+WARP_DIR="${SINGBOX_DIR}/warp"
+WARP_REG_FILE="${WARP_DIR}/registration.json"
+WARP_RULES_FILE="${WARP_DIR}/rules.json"
+WARP_NODES_FILE="${WARP_DIR}/nodes.json"
+WARP_TAG="warp"
+WARP_MIN_VERSION="1.11.0"
+# WARP 入口是任播地址；用字面 IP 可以完全不依赖 DNS 解析。
+WARP_PEER_DEFAULT_HOST="162.159.192.1"
+WARP_PEER_DEFAULT_PORT="2408"
+WARP_API_REG_URL="https://api.cloudflareclient.com/v0a2158/reg"
+WARP_API_CLIENT_VERSION="a-6.10-2158"
+WARP_TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
+
+_warp_version_ge() { # 实测版本 最低版本
+    local have="$1" need="$2" i ha he
+    for i in 1 2 3; do
+        ha=$(printf '%s' "$have" | cut -d. -f"$i")
+        he=$(printf '%s' "$need" | cut -d. -f"$i")
+        ha=${ha%%[!0-9]*}; he=${he%%[!0-9]*}
+        [ -n "$ha" ] || ha=0
+        [ -n "$he" ] || he=0
+        [ "$ha" -gt "$he" ] && return 0
+        [ "$ha" -lt "$he" ] && return 1
+    done
+    return 0
+}
+
+_warp_core_version() {
+    [ -x "$SINGBOX_BIN" ] || return 1
+    "$SINGBOX_BIN" version 2>/dev/null | sed -n 's/^sing-box version \([0-9][0-9.]*\).*/\1/p' | head -n 1
+}
+
+# 版本门槛前置：endpoints 语法在 1.11 之前不存在，硬写只会得到难懂的解析报错。
+_warp_require_core() {
+    local ver
+    if ! ver=$(_warp_core_version) || [ -z "$ver" ]; then
+        _error "未检测到可用的 sing-box 核心: ${SINGBOX_BIN}"
+        return 1
+    fi
+    if ! _warp_version_ge "$ver" "$WARP_MIN_VERSION"; then
+        _error "WARP 出口需要 sing-box >= v${WARP_MIN_VERSION}，当前 v${ver}"
+        _warn "请先通过主菜单【核心管理】-> [15] 安装或更新 Sing-box 核心"
+        return 1
+    fi
+    return 0
+}
+
+# 带额外 jq 参数的原子写入：_atomic_modify_json 不支持 --arg/--argjson，
+# 而 WARP 的过滤表达式必须靠参数注入 JSON，避免拼接引号出错。
+_warp_jq_apply() { # 文件 过滤表达式 [jq 参数...]
+    local file="$1" filter="$2"
+    shift 2
+    [ -f "$file" ] || return 1
+    local acquired="false" tmp rc=0
+    if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
+        _state_lock_acquire || return 1
+        acquired="true"
+    fi
+    tmp=$(_make_same_dir_tmp "$file") || rc=1
+    if [ "$rc" -eq 0 ] && jq "$@" "$filter" "$file" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$file"; then
+        :
+    else
+        _error "修改 WARP 配置失败: $file"
+        [ -n "$tmp" ] && rm -f -- "$tmp"
+        rc=1
+    fi
+    [ "$acquired" = "true" ] && _state_lock_release
+    return "$rc"
+}
+
+_warp_random_id() { # 长度
+    tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c "$1"
+}
+
+# Cloudflare 的 client_id 是 3 字节二进制经 base64 编码的结果，
+# WARP 的三元组 reserved 必须与之一致，否则握手会被丢包。
+_warp_reserved_from_client_id() {
+    local cid="$1" bytes
+    if [ -z "$cid" ]; then echo '[]'; return 0; fi
+    bytes=$(printf '%s' "$cid" | base64 -d 2>/dev/null | od -An -tu1 | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+    if [ -z "$bytes" ]; then echo '[]'; return 0; fi
+    printf '[%s]' "$(printf '%s' "$bytes" | tr ' ' ',')"
+}
+
+_warp_gen_keypair() {
+    local kp
+    kp=$("$SINGBOX_BIN" generate wg-keypair 2>/dev/null) || return 1
+    WARP_PRIV_KEY=$(printf '%s\n' "$kp" | sed -n 's/^PrivateKey:[[:space:]]*//p' | head -n 1)
+    WARP_PUB_KEY=$(printf '%s\n' "$kp" | sed -n 's/^PublicKey:[[:space:]]*//p' | head -n 1)
+    [ -n "$WARP_PRIV_KEY" ] && [ -n "$WARP_PUB_KEY" ]
+}
+
+# 独立成函数是为了让测试用替身覆盖：CI 不允许访问外网。
+_warp_api_register() { # 公钥 -> stdout 输出注册响应
+    local pub_key="$1" install_id fcm_token tos body
+    install_id=$(_warp_random_id 22)
+    fcm_token="${install_id}:APA91b$(_warp_random_id 134)"
+    tos=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+    body=$(jq -cn --arg key "$pub_key" --arg iid "$install_id" --arg fcm "$fcm_token" --arg tos "$tos" \
+        '{key:$key, install_id:$iid, fcm_token:$fcm, tos:$tos, model:"Linux", serial_number:$iid, locale:"zh_CN"}') || return 1
+    curl --silent --show-error --location --max-time 30 \
+        --request POST "$WARP_API_REG_URL" \
+        --header 'User-Agent: okhttp/3.12.1' \
+        --header "CF-Client-Version: ${WARP_API_CLIENT_VERSION}" \
+        --header 'Content-Type: application/json' \
+        --data "$body"
+}
+
+_warp_valid_domain() {
+    local d="$1"
+    [ -n "$d" ] || return 1
+    [ "${#d}" -le 253 ] || return 1
+    [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
+}
+
+_warp_valid_cidr() {
+    local c="$1" addr prefix octet colons
+    local -a octets
+    [ -n "$c" ] || return 1
+    addr="$c"
+    prefix=""
+    if [[ "$c" == */* ]]; then
+        addr="${c%%/*}"
+        prefix="${c##*/}"
+        [[ "$prefix" =~ ^[0-9]{1,3}$ ]] || return 1
+    fi
+    if [[ "$addr" == *:* ]]; then
+        [[ "$addr" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+        colons="${addr//[^:]/}"
+        [ "${#colons}" -le 7 ] || return 1
+        [ -z "$prefix" ] || [ "$prefix" -le 128 ] || return 1
+        return 0
+    fi
+    IFS='.' read -r -a octets <<< "$addr"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+        [ "$octet" -le 255 ] || return 1
+    done
+    [ -z "$prefix" ] || [ "$prefix" -le 32 ] || return 1
+    return 0
+}
+
+_warp_ensure_state_files() {
+    mkdir -p "$WARP_DIR" && chmod 700 "$WARP_DIR" 2>/dev/null || {
+        _error "无法创建 WARP 状态目录: $WARP_DIR"
+        return 1
+    }
+    [ -s "$WARP_RULES_FILE" ] || { _atomic_write_json "$WARP_RULES_FILE" '{"domain_suffix":[],"ip_cidr":[]}' || return 1; }
+    [ -s "$WARP_NODES_FILE" ] || { _atomic_write_json "$WARP_NODES_FILE" '[]' || return 1; }
+    return 0
+}
+# 由注册信息推导 endpoint。地址族只改 address 与 allowed_ips；
+# 绝不写 domain_strategy（1.12 废弃、1.13 FATAL）。
+_warp_build_endpoint_json() {
+    [ -s "$WARP_REG_FILE" ] || { echo 'null'; return 0; }
+    jq -c --arg tag "$WARP_TAG" '
+        . as $r
+        | ($r.address_family // "both") as $af
+        | ($r.peer_address // "162.159.192.1") as $host
+        | (($r.peer_port // 2408) | tonumber) as $port
+        | {
+            type: "wireguard",
+            tag: $tag,
+            private_key: $r.private_key,
+            mtu: 1280,
+            address: (
+                (if ($af != "ipv6") and (($r.address_v4 // "") != "") then [($r.address_v4 + "/32")] else [] end)
+                + (if ($af != "ipv4") and (($r.address_v6 // "") != "") then [($r.address_v6 + "/128")] else [] end)
+            ),
+            peers: [{
+                address: $host,
+                port: $port,
+                public_key: $r.peer_public_key,
+                reserved: ($r.reserved // [0,0,0]),
+                allowed_ips: (
+                    (if $af != "ipv6" then ["0.0.0.0/0"] else [] end)
+                    + (if $af != "ipv4" then ["::/0"] else [] end)
+                )
+            }]
+          }
+    ' "$WARP_REG_FILE" 2>/dev/null
+}
+
+_warp_candidate_inbounds() {
+    [ -s "$MAIN_CONFIG_FILE" ] || return 0
+    jq -r '(.inbounds // [])[].tag // empty' "$MAIN_CONFIG_FILE" 2>/dev/null | grep -vE '^(argo-|pf-in-)' | sort -u
+}
+
+_warp_endpoint_installed() {
+    [ -s "$RELAY_CONFIG_FILE" ] || return 1
+    jq -e --arg t "$WARP_TAG" '[.endpoints[]? | select(.tag == $t)] | length > 0' "$RELAY_CONFIG_FILE" >/dev/null 2>&1
+}
+
+# 同一入站不能既做中转入口又做 WARP 节点分流：
+# 规则按顺序首条命中生效，并存会造成菜单显示两条、实际只有一条生效。
+_warp_inbound_bound_to_relay() {
+    local in_tag="$1"
+    [ -s "$RELAY_CONFIG_FILE" ] || return 1
+    jq -e --arg in "$in_tag" '
+        [ (.route.rules // [])[]
+          | select(((.outbound // "") | startswith("relay-out-")))
+          | (.inbound // [])
+          | (if type == "array" then .[] else . end) ]
+        | index($in) != null
+    ' "$RELAY_CONFIG_FILE" >/dev/null 2>&1
+}
+
+_warp_inbound_bound_to_warp() {
+    local in_tag="$1"
+    [ -s "$WARP_NODES_FILE" ] || return 1
+    jq -e --arg in "$in_tag" 'index($in) != null' "$WARP_NODES_FILE" >/dev/null 2>&1
+}
+
+_warp_pick_free_port() {
+    local i p
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        p=$(( (RANDOM % 20000) + 40000 ))
+        if command -v ss >/dev/null 2>&1; then
+            if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":${p}$"; then
+                printf '%s' "$p"
+                return 0
+            fi
+        else
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 重建 relay.json 中的 WARP 部分：先摘掉全部 warp 归属对象再按状态文件重排。
+# 规则顺序为「其他规则 → 节点规则 → 域名规则 → IP 规则」，节点规则优先，
+# 保证「整条节点流量走 WARP」的语义不受域名规则影响。
+_warp_sync_relay() { # [drop] 强行摘除该出口（卸载时用）
+    local mode="${1:-keep}" ep_json rules_json nodes_json cands
+    if [ "$mode" = "drop" ]; then
+        ep_json="null"
+    else
+        ep_json=$(_warp_build_endpoint_json 2>/dev/null)
+        [ -n "$ep_json" ] || ep_json="null"
+        # 地址族可能把该账号唯一可用的地址排除掉，此时写空的 address
+        # 会让 endpoint 无法启动，必须在落盘前拦住。
+        if [ "$ep_json" != "null" ] \
+            && [ "$(printf '%s' "$ep_json" | jq -r '.address | length' 2>/dev/null)" = "0" ]; then
+            _error "当前出口地址族没有任何可用地址，请先在 [5] 切换地址族"
+            return 1
+        fi
+    fi
+    rules_json=$(jq -c '{domain_suffix: ((.domain_suffix // []) | map(select(type == "string"))), ip_cidr: ((.ip_cidr // []) | map(select(type == "string")))}' "$WARP_RULES_FILE" 2>/dev/null)
+    [ -n "$rules_json" ] || rules_json='{"domain_suffix":[],"ip_cidr":[]}'
+    nodes_json=$(jq -c '[.[]? | select(type == "string")]' "$WARP_NODES_FILE" 2>/dev/null)
+    [ -n "$nodes_json" ] || nodes_json='[]'
+    cands=$(_warp_candidate_inbounds | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)
+    [ -n "$cands" ] || cands='[]'
+    _warp_jq_apply "$RELAY_CONFIG_FILE" '
+        ($ep // null) as $e
+        | ($rules.domain_suffix // []) as $ds
+        | ($rules.ip_cidr // []) as $ip
+        | ([ $nodes[]? | select(. as $n | ($cands | index($n)) != null) ]) as $ns
+        | .route = (.route // {"rules": []})
+        | .route.rules = [ (.route.rules // [])[] | select(((.outbound // "") == $tag) | not) ]
+        | .endpoints = [ (.endpoints // [])[] | select((.tag // "") != $tag) ]
+        | .route.rules as $base
+        | if $e == null then .
+          else
+            .endpoints = (.endpoints + [$e])
+            | .route.rules = (
+                $base
+                + [ $ns[] | {inbound: [.], outbound: $tag} ]
+                + (if ($ds | length) > 0 then [{"domain_suffix": $ds, "outbound": $tag}] else [] end)
+                + (if ($ip | length) > 0 then [{"ip_cidr": $ip, "outbound": $tag}] else [] end)
+              )
+          end
+    ' --arg tag "$WARP_TAG" --argjson ep "$ep_json" --argjson rules "$rules_json" --argjson nodes "$nodes_json" --argjson cands "$cands"
+}
+# 出口自检：用临时 sing-box 进程实际拨号并回读 cdn-cgi/trace。
+# `sing-box check` 只校验结构、不校验 outbound 引用，因此不能替代真实探测。
+_warp_selfcheck() { # [verbose]
+    local verbose="${1:-}" dir conf errtxt port pid i trace rc=1
+    local ep_json
+    [ -x "$SINGBOX_BIN" ] || return 1
+    [ -s "$WARP_REG_FILE" ] || return 1
+    ep_json=$(_warp_build_endpoint_json 2>/dev/null)
+    [ -n "$ep_json" ] && [ "$ep_json" != "null" ] || return 1
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/singboxlite-warp-probe.XXXXXX") || return 1
+    conf="${dir}/probe.json"
+    errtxt="${dir}/probe.err"
+    if ! port=$(_warp_pick_free_port); then
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! jq -n --argjson ep "$ep_json" --argjson port "$port" '
+        {
+          log: {level: "warn"},
+          dns: {servers: [{type: "local", tag: "dns-local"}], final: "dns-local", strategy: "prefer_ipv4"},
+          inbounds: [{type: "socks", tag: "warp-probe-in", listen: "127.0.0.1", listen_port: $port}],
+          endpoints: [$ep],
+          route: {rules: [], final: $ep.tag}
+        }' > "$conf"; then
+        _error "无法生成 WARP 自检配置"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! "$SINGBOX_BIN" check -c "$conf" >/dev/null 2>"$errtxt"; then
+        _error "WARP 自检配置校验失败: $(head -n 2 "$errtxt" 2>/dev/null | tr '\n' ' ')"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    "$SINGBOX_BIN" run -c "$conf" >>"$errtxt" 2>&1 &
+    pid=$!
+    for i in $(seq 1 12); do
+        sleep 1
+        trace=$(curl -s --max-time 4 --socks5-hostname "127.0.0.1:${port}" "$WARP_TRACE_URL" 2>/dev/null)
+        if printf '%s' "$trace" | grep -qE '^warp=(on|plus)'; then
+            rc=0
+            break
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    if [ "$rc" -eq 0 ]; then
+        WARP_TRACE_RESULT=$(printf '%s' "$trace" | grep -E '^(warp|ip|loc)=' | tr '\n' ' ')
+        [ "$verbose" = "verbose" ] && _info "出口自检通过: ${WARP_TRACE_RESULT}"
+    else
+        _error "WARP 出口自检失败：无法经 WARP 访问 ${WARP_TRACE_URL}"
+        if [ -s "$errtxt" ]; then
+            _warn "sing-box 输出: $(grep -iE 'error|fatal' "$errtxt" 2>/dev/null | head -n 2 | tr '\n' ' ')"
+        fi
+    fi
+    rm -rf -- "$dir"
+    return "$rc"
+}
+
+_warp_commit() { # [yes|no] 是否执行出口自检 [keep|drop] 是否摘除出口
+    local want_check="${1:-yes}" sync_mode="${2:-keep}" txn_dir rc=0
+    _state_lock_acquire || return 1
+    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
+    if ! _txn_snapshot_file "$txn_dir" relay "$RELAY_CONFIG_FILE"; then
+        _error "无法创建 WARP 状态快照，已取消本次操作"
+        _txn_cleanup "$txn_dir"
+        _state_lock_release
+        return 1
+    fi
+    if ! _warp_sync_relay "$sync_mode"; then
+        _error "写入 WARP 出口配置失败"
+        rc=1
+    elif ! _check_combined_config 2>/dev/null; then
+        _error "sing-box 组合配置校验失败"
+        rc=1
+    elif ! _manage_service restart; then
+        _error "sing-box 服务重启失败"
+        rc=1
+    elif [ "$want_check" = "yes" ] && ! _warp_selfcheck; then
+        rc=1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
+        _manage_service restart >/dev/null 2>&1 || true
+        _txn_cleanup "$txn_dir"
+        _state_lock_release
+        _error "WARP 出口更新失败，已恢复原配置"
+        return 1
+    fi
+    _txn_cleanup "$txn_dir"
+    _state_lock_release
+    return 0
+}
+
+_warp_register_device() {
+    local resp reg_json reserved
+    mkdir -p "$WARP_DIR" && chmod 700 "$WARP_DIR" 2>/dev/null || {
+        _error "无法创建 WARP 状态目录: $WARP_DIR"
+        return 1
+    }
+    _info "正在生成 WireGuard 密钥对..."
+    if ! _warp_gen_keypair; then
+        _error "生成 WireGuard 密钥对失败"
+        return 1
+    fi
+    _info "正在向 Cloudflare 注册 WARP 设备..."
+    if ! resp=$(_warp_api_register "$WARP_PUB_KEY"); then
+        _error "WARP 注册请求失败：无法访问 Cloudflare 注册接口"
+        return 1
+    fi
+    if ! printf '%s' "$resp" | jq -e '.config.peers[0].public_key' >/dev/null 2>&1; then
+        _error "WARP 注册失败：服务端未返回有效的 peer 配置（可能被限流或接口已变更）"
+        [ -n "$resp" ] && _warn "响应摘要: $(printf '%s' "$resp" | head -c 200)"
+        return 1
+    fi
+    reserved=$(_warp_reserved_from_client_id "$(printf '%s' "$resp" | jq -r '.config.client_id // ""')")
+    [ "$reserved" = "[]" ] && reserved='[0,0,0]'
+    if ! reg_json=$(printf '%s' "$resp" | jq -c \
+        --arg priv "$WARP_PRIV_KEY" \
+        --argjson reserved "$reserved" \
+        --arg host "$WARP_PEER_DEFAULT_HOST" \
+        --argjson port "$WARP_PEER_DEFAULT_PORT" \
+        --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        {
+          private_key: $priv,
+          peer_public_key: .config.peers[0].public_key,
+          peer_address: $host,
+          peer_port: $port,
+          registered_endpoint: (.config.peers[0].endpoint.host // ""),
+          address_v4: (.config.interface.addresses.v4 // ""),
+          address_v6: (.config.interface.addresses.v6 // ""),
+          reserved: $reserved,
+          client_id: (.config.client_id // ""),
+          device_id: (.id // ""),
+          token: (.token // ""),
+          address_family: "both",
+          registered_at: $now
+        }'); then
+        _error "解析 WARP 注册响应失败"
+        return 1
+    fi
+    # 该文件等价于设备身份，必须是 0600。
+    if ! _atomic_write_json "$WARP_REG_FILE" "$reg_json"; then
+        _error "写入 WARP 注册信息失败: $WARP_REG_FILE"
+        return 1
+    fi
+    _warp_ensure_state_files || return 1
+    return 0
+}
+
+_warp_family_label() {
+    case "$(jq -r '.address_family // "both"' "$WARP_REG_FILE" 2>/dev/null)" in
+        ipv4) echo "仅 IPv4" ;;
+        ipv6) echo "仅 IPv6" ;;
+        *) echo "双栈（IPv4 + IPv6）" ;;
+    esac
+}
+
+_warp_print_summary() {
+    local v4 v6
+    v4=$(jq -r '.address_v4 // ""' "$WARP_REG_FILE" 2>/dev/null)
+    v6=$(jq -r '.address_v6 // ""' "$WARP_REG_FILE" 2>/dev/null)
+    echo -e "  出口地址族: ${CYAN}$(_warp_family_label)${NC}"
+    [ -n "$v4" ] && echo -e "  WARP IPv4: ${CYAN}${v4}${NC}"
+    [ -n "$v6" ] && echo -e "  WARP IPv6: ${CYAN}${v6}${NC}"
+    echo -e "  ${YELLOW}提示${NC}: 走 WARP 需要先在 [3] 或 [4] 里指定分流范围"
+}
+
+_warp_install() {
+    local ans
+    _warp_require_core || return 1
+    if [ -s "$WARP_REG_FILE" ]; then
+        _warn "已存在 WARP 注册信息（注册于 $(jq -r '.registered_at // "未知"' "$WARP_REG_FILE" 2>/dev/null)）"
+        read -r -p "  重新注册会获得新的 WARP 身份，确认继续？(y/N): " ans
+        [ "$ans" = "y" ] || { _info "已取消"; return 0; }
+    fi
+    _warp_register_device || return 1
+    _info "正在校验配置并重启服务..."
+    if ! _warp_commit yes; then
+        _warn "注册信息已保留（${WARP_REG_FILE}），排除故障后可从菜单 [1] 重试"
+        return 1
+    fi
+    _success "WARP 出口已启用"
+    _warp_print_summary
+}
+_warp_quota_line() {
+    local device token
+    [ -s "$WARP_REG_FILE" ] || return 1
+    device=$(jq -r '.device_id // empty' "$WARP_REG_FILE" 2>/dev/null)
+    token=$(jq -r '.token // empty' "$WARP_REG_FILE" 2>/dev/null)
+    [ -n "$device" ] && [ -n "$token" ] || return 1
+    curl -s --max-time 10 -H 'User-Agent: okhttp/3.12.1' -H "Authorization: Bearer ${token}" \
+        "https://api.cloudflareclient.com/v0a884/reg/${device}" 2>/dev/null \
+        | jq -r '"WARP+ 状态: \(if .account.warp_plus then "已启用" else "未启用" end)    账号额度: \(.account.quota // 0) GB"' 2>/dev/null
+}
+
+_warp_status() {
+    local ver
+    ver=$(_warp_core_version)
+    [ -n "$ver" ] || ver="未安装"
+    echo -e "\\n  ${CYAN}【WARP 出口状态】${NC}"
+    echo -e "  sing-box 核心: ${CYAN}v${ver}${NC}（WARP 需要 >= v${WARP_MIN_VERSION}）"
+    if [ -s "$WARP_REG_FILE" ]; then
+        echo -e "  注册信息: ${GREEN}已注册${NC}    注册时间: $(jq -r '.registered_at // "未知"' "$WARP_REG_FILE" 2>/dev/null)"
+        echo -e "  出口地址族: ${CYAN}$(_warp_family_label)${NC}"
+        echo -e "  WARP 内网地址: $(jq -r '.address_v4 // "-"' "$WARP_REG_FILE" 2>/dev/null) / $(jq -r '.address_v6 // "-"' "$WARP_REG_FILE" 2>/dev/null)"
+        echo -e "  peer 端点: $(jq -r '.peer_address // "-"' "$WARP_REG_FILE" 2>/dev/null):$(jq -r '.peer_port // "-"' "$WARP_REG_FILE" 2>/dev/null)"
+        # 设备私钥等价于身份，任何菜单输出都不回显。
+        echo -e "  设备私钥: ******（已隐藏）"
+        local quota
+        if quota=$(_warp_quota_line); then
+            echo -e "  账号信息: ${CYAN}${quota}${NC}"
+        else
+            echo -e "  账号信息: ${YELLOW}查询失败（不影响出口本身）${NC}"
+        fi
+    else
+        echo -e "  注册信息: ${YELLOW}未注册${NC}"
+    fi
+    if _warp_endpoint_installed; then
+        echo -e "  出口状态: ${GREEN}已写入 relay.json${NC}"
+    else
+        echo -e "  出口状态: ${YELLOW}未启用${NC}"
+    fi
+    local -a node_list
+    mapfile -t node_list < <(jq -r '.[]?' "$WARP_NODES_FILE" 2>/dev/null)
+    if [ "${#node_list[@]}" -gt 0 ]; then
+        echo -e "  节点分流: ${CYAN}${node_list[*]}${NC}"
+    else
+        echo -e "  节点分流: 未配置"
+    fi
+    local ds ip
+    ds=$(jq -r '(.domain_suffix // []) | join(", ")' "$WARP_RULES_FILE" 2>/dev/null)
+    ip=$(jq -r '(.ip_cidr // []) | join(", ")' "$WARP_RULES_FILE" 2>/dev/null)
+    echo -e "  域名分流: ${ds:-未配置}"
+    echo -e "  IP  分流: ${ip:-未配置}"
+    if _warp_endpoint_installed; then
+        echo ""
+        _info "正在执行出口自检（约需 10 秒）..."
+        if _warp_selfcheck verbose; then
+            _success "出口可用"
+        else
+            _warn "出口当前不可用，可尝试菜单 [1] 重新注册"
+        fi
+    fi
+}
+
+_warp_node_menu() {
+    local -a tags
+    local i=1 t choice bound
+    mapfile -t tags < <(_warp_candidate_inbounds)
+    if [ "${#tags[@]}" -eq 0 ]; then
+        _warn "当前没有可用的入站节点，请先创建节点"
+        return 0
+    fi
+    echo -e "\\n  ${CYAN}【节点分流】整条节点流量强制走 WARP${NC}"
+    for t in "${tags[@]}"; do
+        bound=""
+        if _warp_inbound_bound_to_warp "$t"; then
+            bound=" ${GREEN}[已绑定]${NC}"
+        fi
+        echo -e "    ${GREEN}[$i]${NC} ${t}${bound}"
+        i=$((i + 1))
+    done
+    echo -e "    ${YELLOW}[0]${NC} 返回"
+    read -r -p "  请输入选项（选择已绑定的节点将解除绑定）: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _error "无效输入"; return 1; }
+    [ "$choice" -eq 0 ] && return 0
+    [ "$choice" -le "${#tags[@]}" ] || { _error "无效输入"; return 1; }
+    t="${tags[$((choice - 1))]}"
+    if _warp_inbound_bound_to_warp "$t"; then
+        _warp_jq_apply "$WARP_NODES_FILE" 'map(select(. != $in))' --arg in "$t" || return 1
+        _info "已解除节点绑定: $t"
+    else
+        if _warp_inbound_bound_to_relay "$t"; then
+            _error "节点 $t 已作为中转入口，不能同时走 WARP"
+            _warn "请先在【进阶功能】-> [5] 删除该中转链路"
+            return 1
+        fi
+        if [ ! -s "$WARP_REG_FILE" ]; then
+            _error "尚未安装 WARP 出口，请先执行 [1]"
+            return 1
+        fi
+        _warp_jq_apply "$WARP_NODES_FILE" 'if index($in) == null then . + [$in] else . end' --arg in "$t" || return 1
+        _info "已绑定节点: $t"
+    fi
+    _warp_commit yes || return 1
+    _success "节点分流已更新"
+}
+
+_warp_domain_menu() {
+    local choice entry added skipped item key prompt
+    while true; do
+        echo -e "\\n  ${CYAN}【域名 / IP 分流】${NC}"
+        echo -e "  域名后缀: ${CYAN}$(jq -r '(.domain_suffix // []) | join(", ")' "$WARP_RULES_FILE" 2>/dev/null)${NC}"
+        echo -e "  IP 段  : ${CYAN}$(jq -r '(.ip_cidr // []) | join(", ")' "$WARP_RULES_FILE" 2>/dev/null)${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 添加域名后缀"
+        echo -e "    ${GREEN}[2]${NC} 添加 IP / CIDR"
+        echo -e "    ${RED}[3]${NC} 清空全部分流条目"
+        echo -e "    ${YELLOW}[0]${NC} 返回"
+        read -r -p "  请输入选项 [0-3]: " choice
+        case "$choice" in
+            0) return 0 ;;
+            1|2)
+                key="domain_suffix"
+                prompt="  请输入域名后缀（多个用空格或逗号分隔，如 openai.com）: "
+                if [ "$choice" = "2" ]; then
+                    key="ip_cidr"
+                    prompt="  请输入 IP 或 CIDR（多个用空格或逗号分隔，如 1.1.1.1 或 203.0.113.0/24）: "
+                fi
+                read -r -p "$prompt" entry
+                entry=$(printf '%s' "$entry" | tr ',，' '  ')
+                [ -n "$(printf '%s' "$entry" | tr -d ' ')" ] || { _error "输入为空"; continue; }
+                added=0
+                skipped=0
+                for item in $entry; do
+                    if [ "$key" = "domain_suffix" ]; then
+                        if ! _warp_valid_domain "$item"; then
+                            _warn "忽略非法域名: $item"
+                            skipped=$((skipped + 1))
+                            continue
+                        fi
+                    else
+                        if ! _warp_valid_cidr "$item"; then
+                            _warn "忽略非法 IP/CIDR: $item"
+                            skipped=$((skipped + 1))
+                            continue
+                        fi
+                    fi
+                    _warp_jq_apply "$WARP_RULES_FILE" \
+                        ".${key} = (((.${key} // []) + [\$item]) | unique)" --arg item "$item" || return 1
+                    added=$((added + 1))
+                done
+                if [ "$added" -eq 0 ]; then
+                    _error "没有有效条目"
+                    continue
+                fi
+                _warp_commit yes || return 1
+                _success "已添加 ${added} 条分流条目（跳过 ${skipped} 条）"
+                ;;
+            3)
+                read -r -p "  确认清空全部分流条目？(y/N): " entry
+                [ "$entry" = "y" ] || continue
+                _atomic_write_json "$WARP_RULES_FILE" '{"domain_suffix":[],"ip_cidr":[]}' || return 1
+                _warp_commit yes || return 1
+                _success "分流条目已清空"
+                ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
+_warp_family_menu() {
+    local choice family
+    echo -e "\\n  ${CYAN}【WARP 出口地址族】${NC}"
+    echo -e "  当前: ${CYAN}$(_warp_family_label)${NC}"
+    echo ""
+    echo -e "    ${GREEN}[1]${NC} 双栈（IPv4 + IPv6）"
+    echo -e "    ${GREEN}[2]${NC} 仅 IPv4"
+    echo -e "    ${GREEN}[3]${NC} 仅 IPv6"
+    echo -e "    ${YELLOW}[0]${NC} 返回"
+    read -r -p "  请输入选项 [0-3]: " choice
+    case "$choice" in
+        0) return 0 ;;
+        1) family="both" ;;
+        2) family="ipv4" ;;
+        3) family="ipv6" ;;
+        *) _error "无效输入"; return 1 ;;
+    esac
+    _warp_require_core || return 1
+    [ -s "$WARP_REG_FILE" ] || { _error "尚未安装 WARP 出口，请先执行 [1]"; return 1; }
+    _atomic_modify_json "$WARP_REG_FILE" ".address_family = \"${family}\"" || return 1
+    _warp_commit yes || return 1
+    _success "出口地址族已切换为 $(_warp_family_label)"
+}
+
+_warp_uninstall() {
+    local ans
+    if ! _warp_endpoint_installed && [ ! -s "$WARP_REG_FILE" ]; then
+        _info "尚未安装 WARP 出口"
+        return 0
+    fi
+    _warn "卸载只摘除 WARP 出口与分流规则，注册信息会保留以便重新启用"
+    read -r -p "  确认卸载 WARP 出口？(y/N): " ans
+    [ "$ans" = "y" ] || { _info "已取消"; return 0; }
+    _warp_require_core || return 1
+    if ! _warp_commit no drop; then
+        _error "卸载 WARP 出口失败"
+        return 1
+    fi
+    _success "WARP 出口已卸载（注册信息保留于 ${WARP_REG_FILE}）"
+}
+
+_warp_menu() {
+    local choice
+    if ! _warp_require_core; then
+        return 1
+    fi
+    _warp_ensure_state_files || return 1
+    while true; do
+        echo ""
+        echo -e "  ${CYAN}【WARP 出口】${NC}"
+        echo -e "    ${GREEN}[1]${NC} 安装 / 重新注册 WARP"
+        echo -e "    ${GREEN}[2]${NC} 查看状态"
+        echo -e "    ${GREEN}[3]${NC} 节点分流（整条节点走 WARP）"
+        echo -e "    ${GREEN}[4]${NC} 域名 / IP 分流"
+        echo -e "    ${GREEN}[5]${NC} 出口地址族（IPv4 / IPv6 / 双栈）"
+        echo -e "    ${RED}[6]${NC} 卸载 WARP 出口"
+        echo ""
+        echo -e "  ─────────────────────────────────────────"
+        echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+        echo ""
+        read -r -p "  请输入选项 [0-6]: " choice
+        case "$choice" in
+            1) _warp_install ;;
+            2) _warp_status ;;
+            3) _warp_node_menu ;;
+            4) _warp_domain_menu ;;
+            5) _warp_family_menu ;;
+            6) _warp_uninstall ;;
+            0) return 0 ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+        echo ""
+        read -r -p "  按回车键继续..." _ || true
+    done
+}
+# --- WARP 出口结束 ---
+
 # 命令行参数解析：支持 cron 定时任务直接调用刷新函数
 case "${1:-}" in
     pf-dns-refresh)
@@ -4023,6 +4743,12 @@ case "${1:-}" in
         refresh_status=$?
         _state_lock_release
         exit "$refresh_status"
+        ;;
+    warp-menu)
+        _check_root || exit 1
+        _check_deps || exit 1
+        _warp_menu
+        exit $?
 esac
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
