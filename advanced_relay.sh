@@ -4035,6 +4035,10 @@ WARP_NODES_FILE="${WARP_DIR}/nodes.json"
 WARP_TAG="warp"
 WARP_MIN_VERSION="1.11.0"
 # WARP 入口是任播地址；用字面 IP 可以完全不依赖 DNS 解析。
+# IPv4 与 IPv6 入口服务同一账号，但「传输」能不能通取决于本机：
+# 纯 IPv6 或 CGNAT 出口的主机往 IPv4 的 UDP 2408 常被运营商直接丢弃。
+WARP_PEER_CANDIDATES_V4="162.159.192.1 162.159.193.1 188.114.97.1"
+WARP_PEER_CANDIDATES_V6="2606:4700:d0::a29f:c001 2606:4700:d1::a29f:c001"
 WARP_PEER_DEFAULT_HOST="162.159.192.1"
 WARP_PEER_DEFAULT_PORT="2408"
 WARP_API_REG_URL="https://api.cloudflareclient.com/v0a2158/reg"
@@ -4259,6 +4263,78 @@ _warp_pick_free_port() {
     return 1
 }
 
+_warp_global_ipv4() {
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -4 addr show scope global 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -n 1
+}
+
+_warp_global_ipv6() {
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -6 addr show scope global 2>/dev/null | sed -n 's/.*inet6 \([0-9a-fA-F:]*\)\/.*/\1/p' \
+        | grep -v '^fe80' | head -n 1
+}
+
+# 私网 / CGNAT 的 IPv4 说明出站要过运营商 NAT，
+# WARP 的 UDP 2408 在这种链路上经常被直接丢弃（实测可复现）。
+_warp_ipv4_is_private() {
+    case "$1" in
+        10.*|192.168.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 传输地址族与「隧道内地址族」是两件独立的事，这里只决定往哪连。
+# 纯 IPv6 主机直接用 IPv6 入口；IPv4 为 CGNAT/私网且有原生 IPv6 时优先 IPv6；
+# 其余情况先试 IPv4，再兜底试 IPv6。
+_warp_peer_candidates() {
+    local v4 v6 cand
+    v4=$(_warp_global_ipv4)
+    v6=$(_warp_global_ipv6)
+    if [ -z "$v4" ]; then
+        for cand in $WARP_PEER_CANDIDATES_V6; do printf '%s\n' "$cand"; done
+        return 0
+    fi
+    if [ -n "$v6" ] && _warp_ipv4_is_private "$v4"; then
+        for cand in $WARP_PEER_CANDIDATES_V6 $WARP_PEER_CANDIDATES_V4; do printf '%s\n' "$cand"; done
+        return 0
+    fi
+    for cand in $WARP_PEER_CANDIDATES_V4; do printf '%s\n' "$cand"; done
+    if [ -n "$v6" ]; then
+        for cand in $WARP_PEER_CANDIDATES_V6; do printf '%s\n' "$cand"; done
+    fi
+    return 0
+}
+
+# 逐个尝试入口地址，把第一个真正能握手的写回注册信息。
+# 不依赖「有 IPv4 地址就等于 UDP 可用」这类假设，以实测为准。
+_warp_select_peer() {
+    local cand original chosen=""
+    original=$(jq -r '.peer_address // empty' "$WARP_REG_FILE" 2>/dev/null)
+    _info "正在探测可用的 WARP 入口地址..."
+    while IFS= read -r cand; do
+        [ -n "$cand" ] || continue
+        _warp_jq_apply "$WARP_REG_FILE" '.peer_address = $h' --arg h "$cand" || {
+            [ -n "$original" ] && _warp_jq_apply "$WARP_REG_FILE" '.peer_address = $h' --arg h "$original"
+            return 1
+        }
+        if WARP_PROBE_TRIES=6 _warp_selfcheck; then
+            chosen="$cand"
+            break
+        fi
+        _warn "入口 ${cand} 不可达，尝试下一个"
+    done < <(_warp_peer_candidates)
+    if [ -z "$chosen" ]; then
+        [ -n "$original" ] && _warp_jq_apply "$WARP_REG_FILE" '.peer_address = $h' --arg h "$original"
+        _error "所有 WARP 入口地址均不可达：本机可能无法出站访问 Cloudflare 的 UDP 2408"
+        _warn "请确认主机允许出站 UDP，或换一台机器再试"
+        return 1
+    fi
+    _success "已选用 WARP 入口: ${chosen}"
+    return 0
+}
+
 # 重建 relay.json 中的 WARP 部分：先摘掉全部 warp 归属对象再按状态文件重排。
 # 规则顺序为「其他规则 → 节点规则 → 域名规则 → IP 规则」，节点规则优先，
 # 保证「整条节点流量走 WARP」的语义不受域名规则影响。
@@ -4307,7 +4383,7 @@ _warp_sync_relay() { # [drop] 强行摘除该出口（卸载时用）
 # 出口自检：用临时 sing-box 进程实际拨号并回读 cdn-cgi/trace。
 # `sing-box check` 只校验结构、不校验 outbound 引用，因此不能替代真实探测。
 _warp_selfcheck() { # [verbose]
-    local verbose="${1:-}" dir conf errtxt port pid i trace rc=1
+    local verbose="${1:-}" dir conf errtxt port pid i trace rc=1 tries="${WARP_PROBE_TRIES:-12}"
     local ep_json
     [ -x "$SINGBOX_BIN" ] || return 1
     [ -s "$WARP_REG_FILE" ] || return 1
@@ -4339,7 +4415,7 @@ _warp_selfcheck() { # [verbose]
     fi
     "$SINGBOX_BIN" run -c "$conf" >>"$errtxt" 2>&1 &
     pid=$!
-    for i in $(seq 1 12); do
+    for i in $(seq 1 "$tries"); do
         sleep 1
         trace=$(curl -s --max-time 4 --socks5-hostname "127.0.0.1:${port}" "$WARP_TRACE_URL" 2>/dev/null)
         if printf '%s' "$trace" | grep -qE '^warp=(on|plus)'; then
@@ -4466,7 +4542,8 @@ _warp_print_summary() {
     local v4 v6
     v4=$(jq -r '.address_v4 // ""' "$WARP_REG_FILE" 2>/dev/null)
     v6=$(jq -r '.address_v6 // ""' "$WARP_REG_FILE" 2>/dev/null)
-    echo -e "  出口地址族: ${CYAN}$(_warp_family_label)${NC}"
+    echo -e "  隧道内地址族: ${CYAN}$(_warp_family_label)${NC}"
+    echo -e "  入口线路: ${CYAN}$(jq -r '.peer_address // "-"' "$WARP_REG_FILE" 2>/dev/null):$(jq -r '.peer_port // "-"' "$WARP_REG_FILE" 2>/dev/null)${NC}"
     [ -n "$v4" ] && echo -e "  WARP IPv4: ${CYAN}${v4}${NC}"
     [ -n "$v6" ] && echo -e "  WARP IPv6: ${CYAN}${v6}${NC}"
     echo -e "  ${YELLOW}提示${NC}: 走 WARP 需要先在 [3] 或 [4] 里指定分流范围"
@@ -4481,6 +4558,12 @@ _warp_install() {
         [ "$ans" = "y" ] || { _info "已取消"; return 0; }
     fi
     _warp_register_device || return 1
+    # 注册只给出「隧道内地址」；能不能连上取决于本机的出站传输能力，
+    # 必须在写配置前把入口地址试出来，否则会拿到一份连不通的配置。
+    if ! _warp_select_peer; then
+        _warn "注册信息已保留（${WARP_REG_FILE}），排除故障后可从菜单 [1] 重试"
+        return 1
+    fi
     _info "正在校验配置并重启服务..."
     if ! _warp_commit yes; then
         _warn "注册信息已保留（${WARP_REG_FILE}），排除故障后可从菜单 [1] 重试"
@@ -4659,22 +4742,33 @@ _warp_domain_menu() {
 _warp_family_menu() {
     local choice family
     echo -e "\\n  ${CYAN}【WARP 出口地址族】${NC}"
-    echo -e "  当前: ${CYAN}$(_warp_family_label)${NC}"
+    echo -e "  隧道内地址族: ${CYAN}$(_warp_family_label)${NC}"
+    echo -e "  当前入口线路: ${CYAN}$(jq -r '.peer_address // "未知"' "$WARP_REG_FILE" 2>/dev/null)${NC}"
     echo ""
     echo -e "    ${GREEN}[1]${NC} 双栈（IPv4 + IPv6）"
     echo -e "    ${GREEN}[2]${NC} 仅 IPv4"
     echo -e "    ${GREEN}[3]${NC} 仅 IPv6"
+    echo -e "    ${CYAN}[4]${NC} 重新探测入口线路（换 IPv4 / IPv6 传输）"
     echo -e "    ${YELLOW}[0]${NC} 返回"
-    read -r -p "  请输入选项 [0-3]: " choice
+    read -r -p "  请输入选项 [0-4]: " choice
     case "$choice" in
         0) return 0 ;;
         1) family="both" ;;
         2) family="ipv4" ;;
         3) family="ipv6" ;;
+        4) family="" ;;
         *) _error "无效输入"; return 1 ;;
     esac
     _warp_require_core || return 1
     [ -s "$WARP_REG_FILE" ] || { _error "尚未安装 WARP 出口，请先执行 [1]"; return 1; }
+    # [4] 只重探入口线路：本机出站能力变化后（换网络、换机器镜像）
+    # 不必重新注册就能换到能通的传输上。
+    if [ -z "$family" ]; then
+        _warp_select_peer || return 1
+        _warp_commit yes || return 1
+        _success "入口线路已更新为 $(jq -r '.peer_address' "$WARP_REG_FILE")"
+        return 0
+    fi
     _atomic_modify_json "$WARP_REG_FILE" ".address_family = \"${family}\"" || return 1
     _warp_commit yes || return 1
     _success "出口地址族已切换为 $(_warp_family_label)"
@@ -4710,7 +4804,7 @@ _warp_menu() {
         echo -e "    ${GREEN}[2]${NC} 查看状态"
         echo -e "    ${GREEN}[3]${NC} 节点分流（整条节点走 WARP）"
         echo -e "    ${GREEN}[4]${NC} 域名 / IP 分流"
-        echo -e "    ${GREEN}[5]${NC} 出口地址族（IPv4 / IPv6 / 双栈）"
+        echo -e "    ${GREEN}[5]${NC} 出口地址族 / 入口线路"
         echo -e "    ${RED}[6]${NC} 卸载 WARP 出口"
         echo ""
         echo -e "  ─────────────────────────────────────────"

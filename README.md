@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v115`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v116`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -117,6 +117,7 @@ sb
 
 - **凭据**：脚本用 `sing-box generate wg-keypair` 在本地生成密钥对，再向 Cloudflare 注册接口换取 peer 配置，不下载也不执行任何第三方二进制。注册信息写入 `${SINGBOX_DIR}/warp/registration.json`（`0600`），设备私钥不会出现在任何菜单输出里。
 - **语法要求**：sing-box 1.11 起 `wireguard` outbound 已废弃，出口以 `endpoints` 形态写入 `relay.json`，低于 v1.11 的核心会在进入菜单时直接拒绝。出口上的 `domain_strategy` 在 1.12 废弃、1.13 起会直接拒绝启动，因此「出口地址族」改为控制 `address` 与 `peers[].allowed_ips`（双栈 / 仅 IPv4 / 仅 IPv6）。
+- **入口线路**：WARP 的 IPv4 与 IPv6 入口服务同一账号，但「传输」能否连通取决于本机——纯 IPv6 主机与 CGNAT 出口的主机往 IPv4 的 UDP 2408 常被运营商直接丢弃（已在实机复现）。脚本按「纯 IPv6 → 只用 IPv6 入口 / CGNAT+原生 IPv6 → 优先 IPv6 / 其余 → 优先 IPv4」排出候选并逐个实测握手，把能通的写回注册信息，全部不通则恢复原值并报错。`[5] 出口地址族 / 入口线路` 的第 4 项可在换网络后只重探入口、不必重新注册。
 - **分流方式**：`[3] 节点分流` 让整条节点的流量强制走 WARP；`[4] 域名 / IP 分流` 让命中的域名后缀或 IP 段走 WARP。规则顺序固定为「节点规则 → 域名规则 → IP 规则」，所以节点分流的语义就是「该节点出口 = WARP」，不受域名规则影响。
 - **与中转互斥**：同一入站不能既作为中转入口又绑定 WARP，两个方向都会在写入前拒绝，避免两条规则并存却只有一条生效。
 - **事务与自检**：每次改动都会快照 `relay.json`、执行组合配置校验、重启服务，再用临时 sing-box 进程访问 `cdn-cgi/trace` 校验返回 `warp=on`，任一步失败整体回滚。`[2] 查看状态` 会做同样的探测并查询账号额度。
@@ -569,10 +570,11 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 分享链接的密码按 URI 字段编码；AnyTLS-Reality 客户端 SNI 优先取节点域名，不使用本机回落地址。
 - 新增离线故障注入与真实菜单、导出行为回归，通过现有测试入口运行，不依赖真实服务或外网。
 
-### v115：WARP 出口
+### v116：WARP 出口
 
 - 新增 `[22] WARP 出口`：脚本内生成 WireGuard 密钥并向 Cloudflare 注册，出口以 `endpoints`（sing-box 1.11+）写入 `relay.json`，不创建 TUN、不改系统路由与防火墙。
 - 支持按节点强制分流与按域名 / IP 分流，规则顺序固定为「节点规则 → 域名规则 → IP 规则」；同一入站与中转入口互斥，两个方向都在写入前拒绝。
 - 出口地址族用 `address` 与 `peers[].allowed_ips` 表达（双栈 / 仅 IPv4 / 仅 IPv6），不使用 1.12 废弃、1.13 起拒绝启动的 `domain_strategy`。
 - 每次改动走「快照 → 组合校验 → 重启 → 出口自检 → 失败回滚」；卸载只摘除 endpoint 与 `warp-*` 规则，保留注册信息。
-- 新增 `tests/test_warp_outbound.sh` 并接入 CI；`SCRIPT_VERSION` 递增到 115。
+- 入口线路按本机传输能力自动选择：纯 IPv6 与 CGNAT 主机走 IPv6 入口，逐个实测握手并跳过不可达地址，全部不通时恢复原值并报错。
+- 新增 `tests/test_warp_outbound.sh` 并接入 CI；`SCRIPT_VERSION` 递增到 116。
