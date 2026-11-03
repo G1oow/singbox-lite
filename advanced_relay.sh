@@ -4037,10 +4037,13 @@ WARP_MIN_VERSION="1.11.0"
 # WARP 入口是任播地址；用字面 IP 可以完全不依赖 DNS 解析。
 # IPv4 与 IPv6 入口服务同一账号，但「传输」能不能通取决于本机：
 # 纯 IPv6 或 CGNAT 出口的主机往 IPv4 的 UDP 2408 常被运营商直接丢弃。
+WARP_PEER_PORTS="2408 4500 500"
 WARP_PEER_CANDIDATES_V4="162.159.192.1 162.159.193.1 188.114.97.1"
 WARP_PEER_CANDIDATES_V6="2606:4700:d0::a29f:c001 2606:4700:d1::a29f:c001"
 WARP_PEER_DEFAULT_HOST="162.159.192.1"
 WARP_PEER_DEFAULT_PORT="2408"
+# 端到端首包超过该值就当作「能握手但不好用」，继续找更快的入口。
+WARP_SLOW_MS="${WARP_SLOW_MS:-2000}"
 WARP_API_REG_URL="https://api.cloudflareclient.com/v0a2158/reg"
 WARP_API_CLIENT_VERSION="a-6.10-2158"
 WARP_TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
@@ -4288,50 +4291,102 @@ _warp_ipv4_is_private() {
 # 传输地址族与「隧道内地址族」是两件独立的事，这里只决定往哪连。
 # 纯 IPv6 主机直接用 IPv6 入口；IPv4 为 CGNAT/私网且有原生 IPv6 时优先 IPv6；
 # 其余情况先试 IPv4，再兜底试 IPv6。
+# 端口同样是候选维度：实测有主机丢 2408 但 500/4500 正常，只试 2408 会误判为不可用。
 _warp_peer_candidates() {
-    local v4 v6 cand
+    local v4 v6 ip port
     v4=$(_warp_global_ipv4)
     v6=$(_warp_global_ipv6)
     if [ -z "$v4" ]; then
-        for cand in $WARP_PEER_CANDIDATES_V6; do printf '%s\n' "$cand"; done
+        for ip in $WARP_PEER_CANDIDATES_V6; do
+            for port in $WARP_PEER_PORTS; do printf '%s %s\n' "$ip" "$port"; done
+        done
         return 0
     fi
     if [ -n "$v6" ] && _warp_ipv4_is_private "$v4"; then
-        for cand in $WARP_PEER_CANDIDATES_V6 $WARP_PEER_CANDIDATES_V4; do printf '%s\n' "$cand"; done
+        for ip in $WARP_PEER_CANDIDATES_V6 $WARP_PEER_CANDIDATES_V4; do
+            for port in $WARP_PEER_PORTS; do printf '%s %s\n' "$ip" "$port"; done
+        done
         return 0
     fi
-    for cand in $WARP_PEER_CANDIDATES_V4; do printf '%s\n' "$cand"; done
+    for ip in $WARP_PEER_CANDIDATES_V4; do
+        for port in $WARP_PEER_PORTS; do printf '%s %s\n' "$ip" "$port"; done
+    done
     if [ -n "$v6" ]; then
-        for cand in $WARP_PEER_CANDIDATES_V6; do printf '%s\n' "$cand"; done
+        for ip in $WARP_PEER_CANDIDATES_V6; do
+            for port in $WARP_PEER_PORTS; do printf '%s %s\n' "$ip" "$port"; done
+        done
     fi
     return 0
 }
 
-# 逐个尝试入口地址，把第一个真正能握手的写回注册信息。
+_warp_set_peer() { # 地址 端口
+    _warp_jq_apply "$WARP_REG_FILE" '.peer_address = $h | .peer_port = $p' \
+        --arg h "$1" --argjson p "$2"
+}
+
+# 逐个尝试「地址 × 端口」，把第一个既能握手、转发又不异常慢的写回注册信息。
 # 不依赖「有 IPv4 地址就等于 UDP 可用」这类假设，以实测为准。
+# 只握手成功但转发极慢的入口（实测出现过 3 秒首包）先记为备选，继续找更快的。
 _warp_select_peer() {
-    local cand original chosen=""
-    original=$(jq -r '.peer_address // empty' "$WARP_REG_FILE" 2>/dev/null)
-    _info "正在探测可用的 WARP 入口地址..."
-    while IFS= read -r cand; do
-        [ -n "$cand" ] || continue
-        _warp_jq_apply "$WARP_REG_FILE" '.peer_address = $h' --arg h "$cand" || {
-            [ -n "$original" ] && _warp_jq_apply "$WARP_REG_FILE" '.peer_address = $h' --arg h "$original"
+    local host port orig_addr orig_port chosen_addr="" chosen_port="" cands
+    local slow_addr="" slow_port="" slow_ms="" ms first pref_v6="false" cur_v6="false"
+    orig_addr=$(jq -r '.peer_address // empty' "$WARP_REG_FILE" 2>/dev/null)
+    orig_port=$(jq -r '.peer_port // empty' "$WARP_REG_FILE" 2>/dev/null)
+    cands=$(_warp_peer_candidates)
+    first=$(printf '%s\n' "$cands" | head -n 1)
+    case "$first" in *:*) pref_v6="true" ;; esac
+    case "$orig_addr" in *:*) cur_v6="true" ;; esac
+    # 已记录的组合先试：重探多半只是网络变了，常见情况可从十几秒压到 1 秒。
+    # 但只在它与当前首选地址族一致时才提前——否则一次「强制 IPv4」的探测
+    # 会把 IPv4 入口粘住，压过「CGNAT 主机应优先 IPv6」的偏好。
+    if [ -n "$orig_addr" ] && [ -n "$orig_port" ] \
+        && [ "$pref_v6" = "$cur_v6" ] \
+        && printf '%s\n' "$cands" | grep -qxF -- "${orig_addr} ${orig_port}"; then
+        cands=$(printf '%s\n' "${orig_addr} ${orig_port}"; printf '%s\n' "$cands" | grep -vxF -- "${orig_addr} ${orig_port}")
+    fi
+    _info "正在探测可用的 WARP 入口（地址 × 端口）..."
+    while read -r host port; do
+        [ -n "$host" ] || continue
+        if ! _warp_set_peer "$host" "$port"; then
+            [ -n "$orig_addr" ] && _warp_set_peer "$orig_addr" "${orig_port:-2408}"
             return 1
-        }
-        if WARP_PROBE_TRIES=6 _warp_selfcheck; then
-            chosen="$cand"
-            break
         fi
-        _warn "入口 ${cand} 不可达，尝试下一个"
-    done < <(_warp_peer_candidates)
-    if [ -z "$chosen" ]; then
-        [ -n "$original" ] && _warp_jq_apply "$WARP_REG_FILE" '.peer_address = $h' --arg h "$original"
-        _error "所有 WARP 入口地址均不可达：本机可能无法出站访问 Cloudflare 的 UDP 2408"
-        _warn "请确认主机允许出站 UDP，或换一台机器再试"
+        # 探测期把单次预算压短：握手要么几秒内完成，要么就不通，
+        # 否则 15 个候选在失败路径上会累积成几分钟。
+        if WARP_PROBE_TRIES="${WARP_SELECT_PROBE_TRIES:-3}" \
+            WARP_PROBE_MAX_TIME="${WARP_SELECT_MAX_TIME:-3}" _warp_selfcheck; then
+            ms="${WARP_TRACE_MS:-0}"
+            if [ "$ms" -le "$WARP_SLOW_MS" ]; then
+                chosen_addr="$host"
+                chosen_port="$port"
+                break
+            fi
+            _warn "入口 ${host}:${port} 可握手但转发很慢（${ms}ms），继续找更快的"
+            if [ -z "$slow_addr" ]; then
+                slow_addr="$host"
+                slow_port="$port"
+                slow_ms="$ms"
+            fi
+        else
+            _warn "入口 ${host}:${port} 不可达，尝试下一个"
+        fi
+    done <<< "$cands"
+    # 没有低延迟入口时退而用能握手的那个，总比完全不可用强。
+    if [ -z "$chosen_addr" ] && [ -n "$slow_addr" ]; then
+        chosen_addr="$slow_addr"
+        chosen_port="$slow_port"
+        _warn "未找到低延迟入口，改用 ${chosen_addr}:${chosen_port}（首包 ${slow_ms}ms）"
+    fi
+    if [ -z "$chosen_addr" ]; then
+        [ -n "$orig_addr" ] && _warp_set_peer "$orig_addr" "${orig_port:-2408}"
+        _error "所有 WARP 入口（地址 × 端口）均不可达"
+        _warn "请确认主机允许出站 UDP 2408/4500/500，或换一台机器再试"
         return 1
     fi
-    _success "已选用 WARP 入口: ${chosen}"
+    if ! _warp_set_peer "$chosen_addr" "$chosen_port"; then
+        return 1
+    fi
+    _success "已选用 WARP 入口: ${chosen_addr}:${chosen_port}"
     return 0
 }
 
@@ -4384,6 +4439,7 @@ _warp_sync_relay() { # [drop] 强行摘除该出口（卸载时用）
 # `sing-box check` 只校验结构、不校验 outbound 引用，因此不能替代真实探测。
 _warp_selfcheck() { # [verbose]
     local verbose="${1:-}" dir conf errtxt port pid i trace rc=1 tries="${WARP_PROBE_TRIES:-12}"
+    local elapsed="" max_t="${WARP_PROBE_MAX_TIME:-4}"
     local ep_json
     [ -x "$SINGBOX_BIN" ] || return 1
     [ -s "$WARP_REG_FILE" ] || return 1
@@ -4417,7 +4473,9 @@ _warp_selfcheck() { # [verbose]
     pid=$!
     for i in $(seq 1 "$tries"); do
         sleep 1
-        trace=$(curl -s --max-time 4 --socks5-hostname "127.0.0.1:${port}" "$WARP_TRACE_URL" 2>/dev/null)
+        elapsed=$(curl -s --max-time "$max_t" --socks5-hostname "127.0.0.1:${port}" \
+            -o "${dir}/trace.out" -w '%{time_total}' "$WARP_TRACE_URL" 2>/dev/null)
+        trace=$(cat "${dir}/trace.out" 2>/dev/null)
         if printf '%s' "$trace" | grep -qE '^warp=(on|plus)'; then
             rc=0
             break
@@ -4428,7 +4486,10 @@ _warp_selfcheck() { # [verbose]
     wait "$pid" 2>/dev/null
     if [ "$rc" -eq 0 ]; then
         WARP_TRACE_RESULT=$(printf '%s' "$trace" | grep -E '^(warp|ip|loc)=' | tr '\n' ' ')
-        [ "$verbose" = "verbose" ] && _info "出口自检通过: ${WARP_TRACE_RESULT}"
+        # 首包耗时用于判断「能握手但转发慢」，供入口选择排掉慢入口。
+        WARP_TRACE_MS=$(awk -v t="${elapsed:-0}" 'BEGIN { printf "%d", t * 1000 }' 2>/dev/null)
+        [ -n "$WARP_TRACE_MS" ] || WARP_TRACE_MS=0
+        [ "$verbose" = "verbose" ] && _info "出口自检通过: ${WARP_TRACE_RESULT}（首包 ${WARP_TRACE_MS}ms）"
     else
         _error "WARP 出口自检失败：无法经 WARP 访问 ${WARP_TRACE_URL}"
         if [ -s "$errtxt" ]; then
