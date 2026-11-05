@@ -324,6 +324,122 @@ check_rc "越界 IPv4 被拒绝" 1 "$?"
 _warp_valid_cidr "hello"
 check_rc "非 IP 文本被拒绝" 1 "$?"
 
+# --- 入口线路选择（地址族 × 端口）---------------------------------------
+# 纯 IPv6 与 CGNAT 主机的 IPv4 可能连不通，且有主机只丢某个端口，
+# 入口候选必须同时覆盖地址族与端口两个维度。
+STUB_V4=""
+STUB_V6=""
+_warp_global_ipv4() { [ -n "$STUB_V4" ] && printf '%s\n' "$STUB_V4"; }
+_warp_global_ipv6() { [ -n "$STUB_V6" ] && printf '%s\n' "$STUB_V6"; }
+
+STUB_V4=""; STUB_V6="2602:db8:1::1"
+check "纯 IPv6 主机只用 IPv6 入口" "2606:4700:d0::a29f:c001 2408" \
+    "$(_warp_peer_candidates | head -n 1)"
+check "纯 IPv6 主机候选覆盖全部端口" "6" "$(_warp_peer_candidates | wc -l | tr -d ' ')"
+
+STUB_V4="100.64.16.7"; STUB_V6="2602:db8:1::1"
+check "CGNAT + 原生 IPv6 时优先 IPv6 入口" "2606:4700:d0::a29f:c001 2408" \
+    "$(_warp_peer_candidates | head -n 1)"
+
+STUB_V4="198.51.100.7"; STUB_V6="2602:db8:1::1"
+check "公网 IPv4 + IPv6 时优先 IPv4 入口" "162.159.192.1 2408" \
+    "$(_warp_peer_candidates | head -n 1)"
+
+STUB_V4="198.51.100.7"; STUB_V6=""
+check "只有公网 IPv4 时不试 IPv6 入口" "9" "$(_warp_peer_candidates | wc -l | tr -d ' ')"
+
+# 端口维度：2408 被丢时仍应落到 4500/500
+check "候选按 2408→4500→500 排序" "2408 4500 500" \
+    "$(_warp_peer_candidates | awk '{print $2}' | head -n 3 | tr '\n' ' ' | sed 's/ $//')"
+check "同一地址的端口候选连续" "162.159.192.1 162.159.192.1 162.159.192.1" \
+    "$(STUB_V4=198.51.100.7; STUB_V6=''; _warp_peer_candidates | awk '{print $1}' | head -n 3 | tr '\n' ' ' | sed 's/ $//')"
+
+check_rc "IPv4 私网判定 - 10/8" 0 "$(_warp_ipv4_is_private '10.1.2.3'; echo $?)"
+check_rc "IPv4 私网判定 - 192.168" 0 "$(_warp_ipv4_is_private '192.168.1.1'; echo $?)"
+check_rc "IPv4 私网判定 - CGNAT 100.64" 0 "$(_warp_ipv4_is_private '100.64.0.1'; echo $?)"
+check_rc "IPv4 私网判定 - 公网地址" 1 "$(_warp_ipv4_is_private '198.51.100.1'; echo $?)"
+
+# 前几个入口不通时必须继续换，并把能通的「地址 + 端口」写回注册信息
+reset_state
+_warp_register_device >/dev/null 2>&1
+STUB_V4=""; STUB_V6="2602:db8:1::1"
+WARP_SELECT_LOG="$WORK/select.log"
+_warp_selfcheck() {
+    printf '%s:%s\n' "$(jq -r '.peer_address' "$WARP_REG_FILE")" "$(jq -r '.peer_port' "$WARP_REG_FILE")" >> "$WARP_SELECT_LOG"
+    WARP_TRACE_MS=50
+    # 只让第 3 个候选（2408 之外的第一个端口）成功
+    [ "$(jq -r '.peer_port' "$WARP_REG_FILE")" = "500" ]
+}
+_warp_select_peer >/dev/null 2>&1
+check_rc "逐个尝试入口直到握手成功" 0 "$?"
+check "不可达入口会被跳过" "2606:4700:d0::a29f:c001:2408" "$(sed -n '1p' "$WARP_SELECT_LOG")"
+check "端口候选被实际尝试" "2606:4700:d0::a29f:c001:4500" "$(sed -n '2p' "$WARP_SELECT_LOG")"
+check "地址与端口一起写回注册信息" "2606:4700:d0::a29f:c001:500" \
+    "$(jq -r '.peer_address' "$WARP_REG_FILE"):$(jq -r '.peer_port' "$WARP_REG_FILE")"
+
+
+# 已记录且仍在候选中的组合必须排在最前，避免每次重探都从头扫
+reset_state
+_warp_register_device >/dev/null 2>&1
+STUB_V4=""; STUB_V6="2602:db8:1::1"
+_warp_set_peer "2606:4700:d1::a29f:c001" 4500
+rm -f "$WARP_SELECT_LOG"
+_warp_selfcheck() {
+    printf '%s:%s\n' "$(jq -r '.peer_address' "$WARP_REG_FILE")" "$(jq -r '.peer_port' "$WARP_REG_FILE")" >> "$WARP_SELECT_LOG"
+    WARP_TRACE_MS=40
+    return 0
+}
+_warp_select_peer >/dev/null 2>&1
+check "已记录的入口优先探测" "2606:4700:d1::a29f:c001:4500" "$(sed -n '1p' "$WARP_SELECT_LOG")"
+check "优先命中时只探测一次" "1" "$(wc -l < "$WARP_SELECT_LOG" | tr -d ' ')"
+_warp_selfcheck() { return 0; }
+
+# 但当前记录属于非首选地址族时不得提前复用，否则会被一次异常探测粘住
+reset_state
+_warp_register_device >/dev/null 2>&1
+STUB_V4="100.64.16.7"; STUB_V6="2602:db8:1::1"
+_warp_set_peer "162.159.192.1" 4500
+rm -f "$WARP_SELECT_LOG"
+_warp_selfcheck() {
+    printf '%s:%s\n' "$(jq -r '.peer_address' "$WARP_REG_FILE")" "$(jq -r '.peer_port' "$WARP_REG_FILE")" >> "$WARP_SELECT_LOG"
+    WARP_TRACE_MS=40
+    return 0
+}
+_warp_select_peer >/dev/null 2>&1
+check "非首选地址族的记录不提前复用" "2606:4700:d0::a29f:c001:2408" "$(sed -n '1p' "$WARP_SELECT_LOG")"
+STUB_V4=""; STUB_V6="2602:db8:1::1"
+
+# 能握手但转发极慢的入口应被跳过，改用后续更快的入口
+reset_state
+_warp_register_device >/dev/null 2>&1
+rm -f "$WARP_SELECT_LOG"
+_warp_selfcheck() {
+    local host port
+    host=$(jq -r '.peer_address' "$WARP_REG_FILE"); port=$(jq -r '.peer_port' "$WARP_REG_FILE")
+    printf '%s:%s\n' "$host" "$port" >> "$WARP_SELECT_LOG"
+    WARP_TRACE_MS=3000
+    # 第一个入口极慢，第二个入口正常
+    [ "$port" = "4500" ] && WARP_TRACE_MS=80
+    return 0
+}
+_warp_select_peer >/dev/null 2>&1
+check_rc "慢入口不会导致失败" 0 "$?"
+check "慢入口被跳过并选中下一个" "2606:4700:d0::a29f:c001:4500" \
+    "$(jq -r '.peer_address' "$WARP_REG_FILE"):$(jq -r '.peer_port' "$WARP_REG_FILE")"
+check "慢入口确实被探测过" "2606:4700:d0::a29f:c001:2408" "$(sed -n '1p' "$WARP_SELECT_LOG")"
+
+# 全部入口不通时必须失败并恢复原值，不能留下不可用的配置
+reset_state
+_warp_register_device >/dev/null 2>&1
+orig_addr=$(jq -r '.peer_address' "$WARP_REG_FILE")
+orig_port=$(jq -r '.peer_port' "$WARP_REG_FILE")
+_warp_selfcheck() { return 1; }
+_warp_select_peer >/dev/null 2>&1
+check_rc "所有入口不可达时返回失败" 1 "$?"
+check "失败后恢复原入口地址" "$orig_addr:$orig_port" \
+    "$(jq -r '.peer_address' "$WARP_REG_FILE"):$(jq -r '.peer_port' "$WARP_REG_FILE")"
+_warp_selfcheck() { return 0; }
+
 # --- 主脚本接线 ---------------------------------------------------------
 grep -q '22) _require_singbox && _warp_features ;;' "$ROOT/singbox.sh"
 check_rc "主菜单 [22] 已接线" 0 "$?"
@@ -344,7 +460,7 @@ check_rc "创建中转入口前会检测 WARP 绑定冲突" 0 "$?"
 
 # 版本号与 README 必须同步（README 断言在伪装域名测试里，这里只保证递增过）
 script_version=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$ROOT/singbox.sh" | head -n 1)
-if [ "${script_version:-0}" -ge 115 ]; then
+if [ "${script_version:-0}" -ge 117 ]; then
     printf 'ok    %s\n' "WARP 功能已递增 SCRIPT_VERSION（当前 ${script_version}）"
 else
     printf 'FAIL  %s\n' "SCRIPT_VERSION 未递增（当前 ${script_version}）"
