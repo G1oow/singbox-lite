@@ -21,7 +21,7 @@ export CLASH_YAML_FILE="$SINGBOX_DIR/clash.yaml"
 export METADATA_FILE="$SINGBOX_DIR/metadata.json"
 export ARGO_METADATA_FILE="$SINGBOX_DIR/argo_metadata.json"
 export YQ_BINARY="$(command -v yq)"
-export DEFAULT_SNI="www.amd.com"
+export DEFAULT_SNI="example.org"
 # 关闭颜色，便于断言 Base64 输出
 RED='' GREEN='' YELLOW='' CYAN='' NC='' ORANGE=''
 
@@ -30,6 +30,9 @@ sed -n '/^# --- 一键换 SNI 与聚合订阅 ---/,/^# --- 一键换 SNI 与聚�
     "$ROOT/singbox.sh" > "$WORK/sni.sh"
 # shellcheck disable=SC1090
 . "$WORK/sni.sh"
+for fn in _main_tx_begin _main_tx_commit _main_tx_cleanup; do
+    source <(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/singbox.sh")
+done
 
 fail=0
 check() { # 描述 期望 实际

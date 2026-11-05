@@ -48,10 +48,12 @@ awk '/^# --- WARP 出口 ---$/,/^# --- WARP 出口结束 ---$/' "$ROOT/advanced_
 
 # 这些基础设施是被测代码的真实依赖（原子写、事务快照），必须用真实实现。
 for fn in _make_same_dir_tmp _atomic_modify_json _atomic_write_json \
-          _txn_begin _txn_snapshot_file _txn_restore_file _txn_cleanup; do
+          _restart_checked; do
     sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/advanced_relay.sh" > "$WORK/${fn}.sh"
     [ -s "$WORK/${fn}.sh" ] || { echo "抽取 ${fn} 失败" >&2; exit 1; }
 done
+awk '/^# --- 中转持久事务 ---$/,/^# --- 中转持久事务结束 ---$/' "$ROOT/advanced_relay.sh" > "$WORK/transactions.sh"
+[ -s "$WORK/transactions.sh" ] || { echo "抽取中转事务块失败" >&2; exit 1; }
 
 SINGBOX_DIR="$WORK/etc"
 RELAY_CONFIG_FILE="$WORK/etc/relay.json"
@@ -70,7 +72,7 @@ _state_lock_release() { return 0; }
 
 # shellcheck disable=SC1090
 for f in _make_same_dir_tmp _atomic_modify_json _atomic_write_json \
-         _txn_begin _txn_snapshot_file _txn_restore_file _txn_cleanup warp_block; do
+         _restart_checked transactions warp_block; do
     . "$WORK/${f}.sh"
 done
 
@@ -104,6 +106,7 @@ SINGBOX_BIN="$WORK/bin/sing-box"
 
 _manage_service() { echo "service:$1" >> "$WORK/service_calls"; return 0; }
 _check_combined_config() { return 0; }
+WARP_REAL_SELFCHECK=$(declare -f _warp_selfcheck)
 _warp_selfcheck() { return 0; }
 _warp_api_register() {
     cat <<'EOJ'
@@ -127,6 +130,7 @@ reset_main() { # 入站 tag 列表
     printf '%s' "{\"inbounds\": $tags}" > "$MAIN_CONFIG_FILE"
 }
 reset_state() {
+    RELAY_TX_ACTIVE="" RELAY_TX_BLOCKED=0 RELAY_TX_RECOVERING=0
     rm -rf "$SINGBOX_DIR"
     mkdir -p "$SINGBOX_DIR"
     reset_relay
@@ -302,11 +306,148 @@ fi
 reset_state
 _warp_register_device >/dev/null 2>&1
 before=$(jq -c '.' "$RELAY_CONFIG_FILE")
-_check_combined_config() { return 1; }
+_check_combined_config() {
+    if [ ! -f "$WORK/check-failed" ]; then
+        : > "$WORK/check-failed"
+        return 1
+    fi
+    return 0
+}
 _warp_commit yes >/dev/null 2>&1
 check_rc "组合校验失败时事务返回失败" 1 "$?"
 check "relay.json 已回滚到操作前" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
 _check_combined_config() { return 0; }
+
+# 菜单操作失败后，状态文件和运行配置必须一起恢复，后续操作不能重放失败的解绑。
+reset_state
+_warp_register_device >/dev/null 2>&1
+printf '%s\n' '["vless-reality-in-1"]' > "$WARP_NODES_FILE"
+_warp_sync_relay >/dev/null 2>&1
+before=$(jq -c '.' "$RELAY_CONFIG_FILE")
+_manage_service() {
+    [ "$1" != status ] || return 0
+    if [ ! -f "$WORK/restart-failed" ]; then
+        : > "$WORK/restart-failed"
+        return 1
+    fi
+    return 0
+}
+node_choice=$(_warp_candidate_inbounds | grep -nx 'vless-reality-in-1' | cut -d: -f1)
+printf '%s\n' "$node_choice" | _warp_node_menu >/dev/null 2>&1
+check_rc "解绑重启失败返回非零" 1 "$?"
+check "失败解绑恢复节点绑定清单" '["vless-reality-in-1"]' "$(jq -c '.' "$WARP_NODES_FILE")"
+check "失败解绑恢复运行配置" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+_warp_commit no >/dev/null 2>&1
+check_rc "恢复后下一次提交可成功" 0 "$?"
+check "下一次提交不会重放失败的解绑" "1" "$(jq '[.route.rules[] | select(.outbound == "warp" and .inbound == ["vless-reality-in-1"])] | length' "$RELAY_CONFIG_FILE")"
+_manage_service() { echo "service:$1" >> "$WORK/service_calls"; return 0; }
+
+# 分流与地址族菜单必须在改写源状态之前取得整组快照。
+reset_state
+_warp_register_device >/dev/null 2>&1
+_warp_sync_relay >/dev/null 2>&1
+rules_before=$(jq -c '.' "$WARP_RULES_FILE")
+reg_before=$(jq -c '.' "$WARP_REG_FILE")
+_warp_selfcheck() { return 1; }
+_warp_domain_menu <<< $'1\nexample.org\n' >/dev/null 2>&1
+check_rc "域名菜单自检失败返回非零" 1 "$?"
+check "域名菜单失败恢复分流清单" "$rules_before" "$(jq -c '.' "$WARP_RULES_FILE")"
+_warp_family_menu <<< '2' >/dev/null 2>&1
+check_rc "地址族菜单自检失败返回非零" 1 "$?"
+check "地址族菜单失败恢复注册状态" "$reg_before" "$(jq -c '.' "$WARP_REG_FILE")"
+_warp_selfcheck() { return 0; }
+
+# 读取失败不能被当作空清单提交，否则已有节点会静默退回原出口。
+reset_state
+_warp_register_device >/dev/null 2>&1
+printf '%s\n' '["vless-reality-in-1"]' > "$WARP_NODES_FILE"
+_warp_sync_relay >/dev/null 2>&1
+before=$(jq -c '.' "$RELAY_CONFIG_FILE")
+printf 'invalid-json\n' > "$WARP_NODES_FILE"
+_warp_commit no >/dev/null 2>&1
+check_rc "状态清单损坏时拒绝提交" 1 "$?"
+check "读取失败不会清空已有节点路由" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+
+# 进程内中断要先恢复整组状态，再释放锁退出。
+reset_state
+_warp_register_device >/dev/null 2>&1
+printf '%s\n' '["vless-reality-in-1"]' > "$WARP_NODES_FILE"
+_warp_sync_relay >/dev/null 2>&1
+before=$(jq -c '.' "$RELAY_CONFIG_FILE")
+node_choice=$(_warp_candidate_inbounds | grep -nx 'vless-reality-in-1' | cut -d: -f1)
+(
+    trap '_relay_exit "$?"' EXIT
+    trap '_relay_exit 143' TERM
+    _manage_service() {
+        [ "$1" != status ] || return 0
+        if [ ! -f "$WORK/warp-signal-fired" ]; then
+            : > "$WORK/warp-signal-fired"
+            kill -TERM "$BASHPID"
+        fi
+        cp "$RELAY_CONFIG_FILE" "$WORK/warp-running"
+    }
+    _warp_node_menu <<< "$node_choice"
+) >/dev/null 2>&1
+check_rc "解绑期间 TERM 返回非零" 1 "$?"
+check "TERM 后恢复节点清单" '["vless-reality-in-1"]' "$(jq -c '.' "$WARP_NODES_FILE")"
+check "TERM 后恢复配置" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+check "TERM 后服务加载原配置" "$before" "$(jq -c '.' "$WORK/warp-running")"
+
+# 使用真实自检启动逻辑；只有探测核心和 curl 是替身，中断不能留下后台进程。
+cat > "$WORK/bin/probe-core" <<'EOS'
+#!/usr/bin/env bash
+case "${1:-}" in
+    check) exit 0 ;;
+    run) printf '%s\n' "$$" > "$PROBE_PID_FILE"; exec sleep 60 ;;
+    *) exit 1 ;;
+esac
+EOS
+chmod 755 "$WORK/bin/probe-core"
+export PROBE_PID_FILE="$WORK/probe.pid"
+(
+    trap '_relay_exit "$?"' EXIT
+    trap '_relay_exit 143' TERM
+    eval "$WARP_REAL_SELFCHECK"
+    SINGBOX_BIN="$WORK/bin/probe-core"
+    _warp_pick_free_port() { printf '48000\n'; }
+    probe_owner="$BASHPID"
+    curl() { kill -TERM "$probe_owner"; }
+    _warp_selfcheck
+) >/dev/null 2>&1
+check_rc "自检期间 TERM 返回非零" 1 "$?"
+probe_pid=$(cat "$PROBE_PID_FILE")
+check "自检中断清理后台核心" "stopped" "$(kill -0 "$probe_pid" 2>/dev/null && echo running || echo stopped)"
+kill "$probe_pid" 2>/dev/null || true
+
+# 恢复本身失败时不得清掉最后一份快照或继续接受写入；新进程可重试恢复。
+reset_state
+_warp_register_device >/dev/null 2>&1
+printf '%s\n' '["vless-reality-in-1"]' > "$WARP_NODES_FILE"
+_warp_sync_relay >/dev/null 2>&1
+before=$(jq -c '.' "$RELAY_CONFIG_FILE")
+cp() {
+    [ "${RESTORE_FAIL:-0}" = 1 ] && [[ "${2:-}" == */relay ]] && return 1
+    command cp "$@"
+}
+RESTORE_FAIL=1
+_warp_selfcheck() { return 1; }
+_warp_commit yes keep _warp_change_node vless-reality-in-1 >/dev/null 2>&1
+check_rc "恢复失败返回非零" 1 "$?"
+check "恢复失败阻止后续写入" "1" "${RELAY_TX_BLOCKED:-0}"
+retained="$RELAY_TX_ACTIVE"
+check "恢复失败保留完整快照" "yes" "$([ -f "$retained/complete" ] && echo yes || echo no)"
+after_failure=$(jq -c '.' "$RELAY_CONFIG_FILE")
+_warp_commit no keep _warp_change_node vless-reality-in-1 >/dev/null 2>&1
+check_rc "恢复失败后新的变更被拒绝" 1 "$?"
+check "拒绝变更不会改写配置" "$after_failure" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+unset RESTORE_FAIL
+unset -f cp
+_warp_selfcheck() { return 0; }
+RELAY_TX_ACTIVE="" RELAY_TX_BLOCKED=0
+_relay_recover_pending >/dev/null 2>&1
+check_rc "重新启动后可恢复持久快照" 0 "$?"
+check "持久恢复还原原配置" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+check "持久恢复成功后清理事务" "no" "$([ -d "$retained" ] && echo yes || echo no)"
 
 # --- 校验函数 -----------------------------------------------------------
 _warp_valid_domain "openai.com"
@@ -323,6 +464,122 @@ _warp_valid_cidr "999.1.1.1"
 check_rc "越界 IPv4 被拒绝" 1 "$?"
 _warp_valid_cidr "hello"
 check_rc "非 IP 文本被拒绝" 1 "$?"
+
+# --- 入口线路选择（地址族 × 端口）---------------------------------------
+# 纯 IPv6 与 CGNAT 主机的 IPv4 可能连不通，且有主机只丢某个端口，
+# 入口候选必须同时覆盖地址族与端口两个维度。
+STUB_V4=""
+STUB_V6=""
+_warp_global_ipv4() { [ -n "$STUB_V4" ] && printf '%s\n' "$STUB_V4"; }
+_warp_global_ipv6() { [ -n "$STUB_V6" ] && printf '%s\n' "$STUB_V6"; }
+
+STUB_V4=""; STUB_V6="2602:db8:1::1"
+check "纯 IPv6 主机只用 IPv6 入口" "2606:4700:d0::a29f:c001 2408" \
+    "$(_warp_peer_candidates | head -n 1)"
+check "纯 IPv6 主机候选覆盖全部端口" "6" "$(_warp_peer_candidates | wc -l | tr -d ' ')"
+
+STUB_V4="100.64.16.7"; STUB_V6="2602:db8:1::1"
+check "CGNAT + 原生 IPv6 时优先 IPv6 入口" "2606:4700:d0::a29f:c001 2408" \
+    "$(_warp_peer_candidates | head -n 1)"
+
+STUB_V4="198.51.100.7"; STUB_V6="2602:db8:1::1"
+check "公网 IPv4 + IPv6 时优先 IPv4 入口" "162.159.192.1 2408" \
+    "$(_warp_peer_candidates | head -n 1)"
+
+STUB_V4="198.51.100.7"; STUB_V6=""
+check "只有公网 IPv4 时不试 IPv6 入口" "9" "$(_warp_peer_candidates | wc -l | tr -d ' ')"
+
+# 端口维度：2408 被丢时仍应落到 4500/500
+check "候选按 2408→4500→500 排序" "2408 4500 500" \
+    "$(_warp_peer_candidates | awk '{print $2}' | head -n 3 | tr '\n' ' ' | sed 's/ $//')"
+check "同一地址的端口候选连续" "162.159.192.1 162.159.192.1 162.159.192.1" \
+    "$(STUB_V4=198.51.100.7; STUB_V6=''; _warp_peer_candidates | awk '{print $1}' | head -n 3 | tr '\n' ' ' | sed 's/ $//')"
+
+check_rc "IPv4 私网判定 - 10/8" 0 "$(_warp_ipv4_is_private '10.1.2.3'; echo $?)"
+check_rc "IPv4 私网判定 - 192.168" 0 "$(_warp_ipv4_is_private '192.168.1.1'; echo $?)"
+check_rc "IPv4 私网判定 - CGNAT 100.64" 0 "$(_warp_ipv4_is_private '100.64.0.1'; echo $?)"
+check_rc "IPv4 私网判定 - 公网地址" 1 "$(_warp_ipv4_is_private '198.51.100.1'; echo $?)"
+
+# 前几个入口不通时必须继续换，并把能通的「地址 + 端口」写回注册信息
+reset_state
+_warp_register_device >/dev/null 2>&1
+STUB_V4=""; STUB_V6="2602:db8:1::1"
+WARP_SELECT_LOG="$WORK/select.log"
+_warp_selfcheck() {
+    printf '%s:%s\n' "$(jq -r '.peer_address' "$WARP_REG_FILE")" "$(jq -r '.peer_port' "$WARP_REG_FILE")" >> "$WARP_SELECT_LOG"
+    WARP_TRACE_MS=50
+    # 只让第 3 个候选（2408 之外的第一个端口）成功
+    [ "$(jq -r '.peer_port' "$WARP_REG_FILE")" = "500" ]
+}
+_warp_select_peer >/dev/null 2>&1
+check_rc "逐个尝试入口直到握手成功" 0 "$?"
+check "不可达入口会被跳过" "2606:4700:d0::a29f:c001:2408" "$(sed -n '1p' "$WARP_SELECT_LOG")"
+check "端口候选被实际尝试" "2606:4700:d0::a29f:c001:4500" "$(sed -n '2p' "$WARP_SELECT_LOG")"
+check "地址与端口一起写回注册信息" "2606:4700:d0::a29f:c001:500" \
+    "$(jq -r '.peer_address' "$WARP_REG_FILE"):$(jq -r '.peer_port' "$WARP_REG_FILE")"
+
+
+# 已记录且仍在候选中的组合必须排在最前，避免每次重探都从头扫
+reset_state
+_warp_register_device >/dev/null 2>&1
+STUB_V4=""; STUB_V6="2602:db8:1::1"
+_warp_set_peer "2606:4700:d1::a29f:c001" 4500
+rm -f "$WARP_SELECT_LOG"
+_warp_selfcheck() {
+    printf '%s:%s\n' "$(jq -r '.peer_address' "$WARP_REG_FILE")" "$(jq -r '.peer_port' "$WARP_REG_FILE")" >> "$WARP_SELECT_LOG"
+    WARP_TRACE_MS=40
+    return 0
+}
+_warp_select_peer >/dev/null 2>&1
+check "已记录的入口优先探测" "2606:4700:d1::a29f:c001:4500" "$(sed -n '1p' "$WARP_SELECT_LOG")"
+check "优先命中时只探测一次" "1" "$(wc -l < "$WARP_SELECT_LOG" | tr -d ' ')"
+_warp_selfcheck() { return 0; }
+
+# 但当前记录属于非首选地址族时不得提前复用，否则会被一次异常探测粘住
+reset_state
+_warp_register_device >/dev/null 2>&1
+STUB_V4="100.64.16.7"; STUB_V6="2602:db8:1::1"
+_warp_set_peer "162.159.192.1" 4500
+rm -f "$WARP_SELECT_LOG"
+_warp_selfcheck() {
+    printf '%s:%s\n' "$(jq -r '.peer_address' "$WARP_REG_FILE")" "$(jq -r '.peer_port' "$WARP_REG_FILE")" >> "$WARP_SELECT_LOG"
+    WARP_TRACE_MS=40
+    return 0
+}
+_warp_select_peer >/dev/null 2>&1
+check "非首选地址族的记录不提前复用" "2606:4700:d0::a29f:c001:2408" "$(sed -n '1p' "$WARP_SELECT_LOG")"
+STUB_V4=""; STUB_V6="2602:db8:1::1"
+
+# 能握手但转发极慢的入口应被跳过，改用后续更快的入口
+reset_state
+_warp_register_device >/dev/null 2>&1
+rm -f "$WARP_SELECT_LOG"
+_warp_selfcheck() {
+    local host port
+    host=$(jq -r '.peer_address' "$WARP_REG_FILE"); port=$(jq -r '.peer_port' "$WARP_REG_FILE")
+    printf '%s:%s\n' "$host" "$port" >> "$WARP_SELECT_LOG"
+    WARP_TRACE_MS=3000
+    # 第一个入口极慢，第二个入口正常
+    [ "$port" = "4500" ] && WARP_TRACE_MS=80
+    return 0
+}
+_warp_select_peer >/dev/null 2>&1
+check_rc "慢入口不会导致失败" 0 "$?"
+check "慢入口被跳过并选中下一个" "2606:4700:d0::a29f:c001:4500" \
+    "$(jq -r '.peer_address' "$WARP_REG_FILE"):$(jq -r '.peer_port' "$WARP_REG_FILE")"
+check "慢入口确实被探测过" "2606:4700:d0::a29f:c001:2408" "$(sed -n '1p' "$WARP_SELECT_LOG")"
+
+# 全部入口不通时必须失败并恢复原值，不能留下不可用的配置
+reset_state
+_warp_register_device >/dev/null 2>&1
+orig_addr=$(jq -r '.peer_address' "$WARP_REG_FILE")
+orig_port=$(jq -r '.peer_port' "$WARP_REG_FILE")
+_warp_selfcheck() { return 1; }
+_warp_select_peer >/dev/null 2>&1
+check_rc "所有入口不可达时返回失败" 1 "$?"
+check "失败后恢复原入口地址" "$orig_addr:$orig_port" \
+    "$(jq -r '.peer_address' "$WARP_REG_FILE"):$(jq -r '.peer_port' "$WARP_REG_FILE")"
+_warp_selfcheck() { return 0; }
 
 # --- 主脚本接线 ---------------------------------------------------------
 grep -q '22) _require_singbox && _warp_features ;;' "$ROOT/singbox.sh"
@@ -344,7 +601,7 @@ check_rc "创建中转入口前会检测 WARP 绑定冲突" 0 "$?"
 
 # 版本号与 README 必须同步（README 断言在伪装域名测试里，这里只保证递增过）
 script_version=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$ROOT/singbox.sh" | head -n 1)
-if [ "${script_version:-0}" -ge 115 ]; then
+if [ "${script_version:-0}" -ge 117 ]; then
     printf 'ok    %s\n' "WARP 功能已递增 SCRIPT_VERSION（当前 ${script_version}）"
 else
     printf 'FAIL  %s\n' "SCRIPT_VERSION 未递增（当前 ${script_version}）"

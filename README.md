@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v115`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v118`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -117,9 +117,10 @@ sb
 
 - **凭据**：脚本用 `sing-box generate wg-keypair` 在本地生成密钥对，再向 Cloudflare 注册接口换取 peer 配置，不下载也不执行任何第三方二进制。注册信息写入 `${SINGBOX_DIR}/warp/registration.json`（`0600`），设备私钥不会出现在任何菜单输出里。
 - **语法要求**：sing-box 1.11 起 `wireguard` outbound 已废弃，出口以 `endpoints` 形态写入 `relay.json`，低于 v1.11 的核心会在进入菜单时直接拒绝。出口上的 `domain_strategy` 在 1.12 废弃、1.13 起会直接拒绝启动，因此「出口地址族」改为控制 `address` 与 `peers[].allowed_ips`（双栈 / 仅 IPv4 / 仅 IPv6）。
+- **入口线路**：WARP 的 IPv4 与 IPv6 入口服务同一账号，但「传输」能否连通取决于本机，且候选是**地址 × 端口**两个维度——实测有主机 IPv4 的 UDP 2408 被丢、而同 IP 的 500 / 4500 正常，只试 2408 会把整条 IPv4 路径误判为不可用。脚本按「纯 IPv6 → 只用 IPv6 入口 / CGNAT+原生 IPv6 → 优先 IPv6 / 其余 → 优先 IPv4」排序，每个地址依次试 2408 → 4500 → 500，逐个实测端到端可用性；能握手但首包超过 2 秒的入口记为备选并继续找更快的，全部不通时恢复原值并报错。`[5] 出口地址族 / 入口线路` 的第 4 项可在换网络后只重探入口、不必重新注册。
 - **分流方式**：`[3] 节点分流` 让整条节点的流量强制走 WARP；`[4] 域名 / IP 分流` 让命中的域名后缀或 IP 段走 WARP。规则顺序固定为「节点规则 → 域名规则 → IP 规则」，所以节点分流的语义就是「该节点出口 = WARP」，不受域名规则影响。
 - **与中转互斥**：同一入站不能既作为中转入口又绑定 WARP，两个方向都会在写入前拒绝，避免两条规则并存却只有一条生效。
-- **事务与自检**：每次改动都会快照 `relay.json`、执行组合配置校验、重启服务，再用临时 sing-box 进程访问 `cdn-cgi/trace` 校验返回 `warp=on`，任一步失败整体回滚。`[2] 查看状态` 会做同样的探测并查询账号额度。
+- **事务与自检**：修改前持共享锁，快照 `relay.json`、注册信息、节点绑定和分流清单，执行组合配置校验、重启服务，再用临时 sing-box 进程访问 `cdn-cgi/trace` 校验返回 `warp=on`。失败恢复整组状态；恢复失败保留快照并阻止后续写入。`[2] 查看状态` 会做同样的探测并查询账号额度。
 - **卸载**：`[6] 卸载 WARP 出口` 只摘除 endpoint 与 `warp-*` 规则，保留注册信息与分流清单以便直接重新启用；`[17] 卸载脚本` 才会清理整个目录。
 
 ## 节点命名规则
@@ -321,6 +322,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 | `/usr/local/etc/sing-box/warp/registration.json` | WARP 设备注册信息（私钥与 token，`0600`） |
 | `/usr/local/etc/sing-box/warp/rules.json` | WARP 域名 / IP 分流清单 |
 | `/usr/local/etc/sing-box/warp/nodes.json` | 绑定到 WARP 出口的入站节点 |
+| `/usr/local/etc/sing-box/.transactions/` | 尚未提交或恢复失败的持久化事务快照 |
 | `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
 | `/var/log/sing-box.log` | sing-box 日志 |
 | `/var/log/singbox_argo.log` | Argo 日志 |
@@ -339,6 +341,14 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 敏感配置默认按 root-only 权限保存，临时文件和运行目录会限制权限并清理。
 - VLESS/Trojan 等可能由 Xray 核心运行的自签 TLS 分享链接优先输出 `pcs` 固定证书，不再同时输出新版 Xray 已拒绝的 `insecure` 参数。普通 AnyTLS 由 sing-box 核心运行；v2rayN 7.24.9 导入分享链接时虽读取 `pcs`，生成 sing-box 出站时却不应用它，因此默认自签证书的 AnyTLS 链接使用 `insecure=1`，与 Clash YAML 的 `skip-cert-verify: true` 一致。该方式会跳过证书身份验证；需要验证身份时请使用自有域名与受信任证书，或继续使用 Any-Reality。
 - 第三方解析器只输出最小允许 schema，中转脚本会再次校验字段和值。
+
+操作被中断后，重新运行 `sb` 会先恢复未提交事务，再进入菜单。也可执行 `bash /usr/local/bin/sb recover-pending` 单独恢复；直接运行子脚本时使用 `bash advanced_relay.sh recover-pending` 或 `bash xray_manager.sh recover-pending`。这些入口不重新下载组件。
+
+恢复失败会保留 `.transactions/` 中的完整快照并返回非零，修复磁盘写入或服务启动故障后可再次执行同一命令。请保留匹配版本的全部脚本与快照；快照含节点凭据，不要公开上传。带 `committed` 标记的残留只清理，不会撤销成功操作；不完整的快照保留作诊断，不用于恢复。进程被强制终止后的自动恢复在下次运行脚本时发生，不是开机前置恢复。
+
+临时 Argo 隧道的进程停止后，旧域名无法保证重新取得。恢复时会重新申请域名并更新客户端配置与分享链接；出现对应提示后，请重新导入客户端链接。
+
+`[21]` 卸载时，仍被 TLS 节点引用的伪装站证书会阻止卸载；请先在 `[5]` 为这些节点选择自签或自定义证书。Reality 恢复或 Caddy 停止失败时也会中止卸载，保留恢复材料。
 
 ## 更新日志
 
@@ -569,10 +579,19 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 分享链接的密码按 URI 字段编码；AnyTLS-Reality 客户端 SNI 优先取节点域名，不使用本机回落地址。
 - 新增离线故障注入与真实菜单、导出行为回归，通过现有测试入口运行，不依赖真实服务或外网。
 
-### v115：WARP 出口
+### v117：WARP 出口
 
 - 新增 `[22] WARP 出口`：脚本内生成 WireGuard 密钥并向 Cloudflare 注册，出口以 `endpoints`（sing-box 1.11+）写入 `relay.json`，不创建 TUN、不改系统路由与防火墙。
 - 支持按节点强制分流与按域名 / IP 分流，规则顺序固定为「节点规则 → 域名规则 → IP 规则」；同一入站与中转入口互斥，两个方向都在写入前拒绝。
 - 出口地址族用 `address` 与 `peers[].allowed_ips` 表达（双栈 / 仅 IPv4 / 仅 IPv6），不使用 1.12 废弃、1.13 起拒绝启动的 `domain_strategy`。
 - 每次改动走「快照 → 组合校验 → 重启 → 出口自检 → 失败回滚」；卸载只摘除 endpoint 与 `warp-*` 规则，保留注册信息。
-- 新增 `tests/test_warp_outbound.sh` 并接入 CI；`SCRIPT_VERSION` 递增到 115。
+- 入口候选覆盖「地址 × 端口」：每个地址依次试 2408 / 4500 / 500，并跳过能握手但首包超过 2 秒的入口；纯 IPv6 与 CGNAT 主机优先 IPv6 入口，全部不通时恢复原值并报错。
+- 新增 `tests/test_warp_outbound.sh` 并接入 CI；`SCRIPT_VERSION` 递增到 117。
+
+### v118：操作失败与中断恢复
+
+- Argo 创建和删除使用配置、元数据、YAML 与隧道运行状态的完整事务，失败不再误报成功。
+- Caddy 监听切换先校验暂存配置；失败恢复服务与监听状态，恢复 443 时先恢复旧节点配置。卸载拒绝删除仍被引用的证书。
+- 脚本更新恢复失败时保留旧组件；主节点、Caddy、中转、WARP 与 Xray 的完整事务快照持久化，提供 `recover-pending` 重试入口。
+- 清空端口转发传播删除与持久化失败；WARP 回退覆盖注册信息、分流和节点绑定。
+- Xray 监听迁移失败恢复原状态，元数据写入失败触发回滚，改端口保持分享链接传输参数不变。

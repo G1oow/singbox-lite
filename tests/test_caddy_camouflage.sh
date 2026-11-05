@@ -28,7 +28,7 @@ export CADDY_DATA_DIR="$SINGBOX_DIR/caddy"
 export CADDY_LOG_FILE="$WORK/caddy.log"
 export CADDY_BIN="$WORK/bin/caddy"
 export CADDY_FALLBACK_PORT="8443"
-export DEFAULT_SNI="www.amd.com"
+export DEFAULT_SNI="example.org"
 export GITHUB_RAW_BASE="https://example.invalid/singbox-lite/main"
 RED='' GREEN='' YELLOW='' CYAN='' NC='' ORANGE=''
 
@@ -443,7 +443,7 @@ write_nodes
 _reality_handshake_is_local "vless-in-8443"
 check_true "handshake 指向 127.0.0.1 时判定为本机回落" "$?"
 
-jq '.inbounds[0].tls.reality.handshake.server = "www.amd.com"' "$CONFIG_FILE" > "$CONFIG_FILE.new" \
+jq '.inbounds[0].tls.reality.handshake.server = "example.org"' "$CONFIG_FILE" > "$CONFIG_FILE.new" \
     && mv "$CONFIG_FILE.new" "$CONFIG_FILE"
 _reality_handshake_is_local "vless-in-8443"
 check_false "handshake 指向公网域名时不判定为本机回落" "$?"
@@ -504,8 +504,8 @@ grep -q '_camouflage_apply_tls_nodes' "$ROOT/singbox.sh"
 check_true "[21] 已接入跨协议证书复用" "$?"
 grep -q '_choose_tls_material' "$ROOT/singbox.sh"
 check_true "节点创建已接入证书选择菜单" "$?"
-grep -q '正在复用 ${domain} 的伪装站证书' "$ROOT/singbox.sh"
-check_true "卸载伪装站会提示证书被复用" "$?"
+grep -q '个 TLS 类节点正在复用伪装站证书，已取消卸载' "$ROOT/singbox.sh"
+check_true "卸载伪装站会拒绝删除被复用的证书" "$?"
 grep -q '_caddy_set_scope loopback' "$ROOT/singbox.sh"
 check_true "Reality 迁移 443 前会让 Caddy 退出公网 443" "$?"
 # 卸载脚本必须显式清理 Caddy 产物，否则会留下常驻进程
@@ -614,7 +614,7 @@ _check_port_conflict() {
         *) return 1 ;;
     esac
 }
-for fn in _main_create_tx_snapshot_file _main_create_tx_restore_file; do
+for fn in _main_tx_begin _main_tx_commit _main_tx_cleanup _main_create_tx_snapshot_file _main_create_tx_restore_file; do
     source <(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/singbox.sh")
 done
 _with_state_lock() { "$@"; }

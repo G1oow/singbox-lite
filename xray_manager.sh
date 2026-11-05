@@ -118,14 +118,16 @@ _with_singboxlite_lock() {
         _acquire_singboxlite_lock || return 1
         release_after=1
     fi
-    "$@"
-    rc=$?
+    if [ "$1" != "_xray_recover_pending" ] && \
+       { ! _xray_check_foreign_transactions || ! _xray_recover_pending; }; then
+        rc=1
+    else
+        "$@"
+        rc=$?
+    fi
     [ "$release_after" -eq 1 ] && _release_singboxlite_lock
     return "$rc"
 }
-
-trap '_release_singboxlite_lock' EXIT
-trap '_release_singboxlite_lock; exit 130' INT TERM
 
 # --- URL 编码 ---
 if ! declare -f _url_encode >/dev/null 2>&1; then
@@ -496,9 +498,9 @@ _xray_is_pid_running_cmd() {
     [ -n "$pid" ] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
     if [ -r "/proc/${pid}/cmdline" ]; then
-        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "$pattern"
+        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | LC_ALL=C grep -Fq "$pattern"
     else
-        ps -p "$pid" -o args= 2>/dev/null | grep -Fq "$pattern"
+        ps -p "$pid" -o args= 2>/dev/null | LC_ALL=C grep -Fq "$pattern"
     fi
 }
 
@@ -747,9 +749,10 @@ _install_xray() {
 }
 
 _create_xray_systemd_service() {
-    local mem_limit_mb
+    local mem_limit_mb service_file
     mem_limit_mb=$(_xray_get_mem_limit) || return 1
-    cat > /etc/systemd/system/xray.service <<EOF
+    service_file=$(_xray_service_file) || return 1
+    if ! cat > "$service_file" <<EOF
 [Unit]
 Description=Xray Service
 After=network.target
@@ -765,14 +768,18 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
+    then
+        return 1
+    fi
+    systemctl daemon-reload || return 1
     systemctl enable xray 2>/dev/null
 }
 
 _create_xray_openrc_service() {
-    local mem_limit_mb
+    local mem_limit_mb service_file
     mem_limit_mb=$(_xray_get_mem_limit) || return 1
-    cat > /etc/init.d/xray <<EOF
+    service_file=$(_xray_service_file) || return 1
+    if ! cat > "$service_file" <<EOF
 #!/sbin/openrc-run
 description="Xray Service"
 export GOMEMLIMIT="${mem_limit_mb}MiB"
@@ -786,7 +793,10 @@ start_pre() {
     checkpath --directory --mode 0700 "${XRAY_RUN_DIR}"
 }
 EOF
-    chmod +x /etc/init.d/xray
+    then
+        return 1
+    fi
+    chmod +x "$service_file" || return 1
     rc-update add xray default 2>/dev/null
 }
 
@@ -796,8 +806,7 @@ _create_xray_service() {
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
         _create_xray_openrc_service
     elif [ "$INIT_SYSTEM" == "direct" ]; then
-        mkdir -p "$XRAY_RUN_DIR"
-        chmod 700 "$XRAY_RUN_DIR"
+        mkdir -p "$XRAY_RUN_DIR" && chmod 700 "$XRAY_RUN_DIR" || return 1
         touch /var/log/xray.log 2>/dev/null || true
         chmod 600 /var/log/xray.log 2>/dev/null || true
     fi
@@ -824,8 +833,16 @@ _manage_xray_service() {
             systemctl reset-failed xray >/dev/null 2>&1 || true
         fi
         systemctl "$action" xray 2>/dev/null 8>&- 9>&- 219>&- || rc=$?
+        if [ "$rc" -eq 0 ] && [[ "$action" == start || "$action" == restart ]]; then
+            sleep 1
+            systemctl is-active --quiet xray >/dev/null 2>&1 || rc=1
+        fi
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
         rc-service xray "$action" 2>/dev/null 8>&- 9>&- 219>&- || rc=$?
+        if [ "$rc" -eq 0 ] && [[ "$action" == start || "$action" == restart ]]; then
+            sleep 1
+            rc-service xray status >/dev/null 2>&1 || rc=1
+        fi
     elif [ "$INIT_SYSTEM" == "direct" ]; then
         local pid_file="$XRAY_PID_FILE"
         local log_file="/var/log/xray.log"
@@ -844,16 +861,27 @@ _manage_xray_service() {
                 ;;
             stop)
                 if [ -s "$pid_file" ]; then
-                    local pid
+                    local pid attempt
                     pid=$(cat "$pid_file" 2>/dev/null)
                     if _xray_is_pid_running_cmd "$pid" "$XRAY_BIN"; then
-                        kill "$pid" 2>/dev/null
+                        # kill 报错可能只是目标刚好退出；仍运行时保留 PID，供恢复重试。
+                        if ! kill "$pid" 2>/dev/null && _xray_is_pid_running_cmd "$pid" "$XRAY_BIN"; then
+                            rc=1
+                        else
+                            for ((attempt = 0; attempt < 50; attempt++)); do
+                                _xray_is_pid_running_cmd "$pid" "$XRAY_BIN" || break
+                                sleep 0.1
+                            done
+                            _xray_is_pid_running_cmd "$pid" "$XRAY_BIN" && rc=1
+                        fi
                     fi
                 fi
-                rm -f "$pid_file"
+                if [ "$rc" -eq 0 ]; then
+                    rm -f -- "$pid_file" || rc=$?
+                fi
                 ;;
             restart)
-                _manage_xray_service stop
+                _manage_xray_service stop || return $?
                 sleep 1
                 _manage_xray_service start || rc=$?
                 ;;
@@ -887,9 +915,9 @@ _manage_xray_service() {
 }
 
 _init_xray_config() {
-    mkdir -p "$XRAY_DIR"
+    mkdir -p "$XRAY_DIR" || return 1
     if [ ! -f "$XRAY_CONFIG" ]; then
-        cat > "$XRAY_CONFIG" <<'EOF'
+        if ! cat > "$XRAY_CONFIG" <<'EOF'
 {
   "log": {
     "loglevel": "warning"
@@ -910,10 +938,13 @@ _init_xray_config() {
   }
 }
 EOF
+        then
+            return 1
+        fi
         _success "Xray 配置文件已初始化。"
     fi
-    [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
-    chmod 700 "$XRAY_DIR"
+    [ -f "$XRAY_METADATA" ] || printf '{}\n' > "$XRAY_METADATA" || return 1
+    chmod 700 "$XRAY_DIR" || return 1
     chmod 600 "$XRAY_CONFIG" "$XRAY_METADATA" 2>/dev/null || true
     local sensitive_file
     for sensitive_file in "$XRAY_DIR"/*.key; do [ -f "$sensitive_file" ] && chmod 600 "$sensitive_file"; done
@@ -934,15 +965,52 @@ _check_and_fix_xray_listen() {
 }
 
 XRAY_TX_DIR=""
+XRAY_TX_ACTIVE=""
+XRAY_TX_BLOCKED=0
+
+_xray_service_file() {
+    case "${INIT_SYSTEM:-direct}" in
+        systemd) printf '%s' /etc/systemd/system/xray.service ;;
+        openrc) printf '%s' /etc/init.d/xray ;;
+    esac
+}
+
+_xray_service_running() {
+    case "${INIT_SYSTEM:-direct}" in
+        systemd) systemctl is-active --quiet xray >/dev/null 2>&1 ;;
+        openrc) rc-service xray status >/dev/null 2>&1 ;;
+        direct) _xray_is_pid_file_running_cmd "${XRAY_PID_FILE:-/run/singboxlite/xray.pid}" "${XRAY_BIN:-/usr/local/bin/xray}" ;;
+        *) return 1 ;;
+    esac
+}
+
+_xray_check_foreign_transactions() {
+    local snapshot
+    for snapshot in "${SINGBOX_DIR}/.transactions"/*; do
+        [ -d "$snapshot" ] || continue
+        case "${snapshot##*/}" in xray-*) continue ;; esac
+        if [ -f "$snapshot/complete" ] && [ ! -f "$snapshot/committed" ]; then
+            _error "其他组件存在待恢复事务，请先执行 bash singbox.sh recover-pending。"
+            return 1
+        fi
+    done
+    return 0
+}
+
 _xray_snapshot_state() {
-    XRAY_TX_DIR=$(mktemp -d "${TMPDIR:-/tmp}/singboxlite-xray.XXXXXX") || return 1
-    local file key
+    [ -z "${XRAY_TX_ACTIVE:-}" ] || { _error "已有 Xray 事务正在执行。"; return 1; }
+    _xray_check_foreign_transactions || return 1
+    _xray_recover_pending || return 1
+    local root="${SINGBOX_DIR}/.transactions" file key enabled_state query_status=0
+    mkdir -p "$root" && chmod 700 "$root" || return 1
+    XRAY_TX_DIR=$(mktemp -d "$root/xray-XXXXXX") || return 1
     mkdir -p "$XRAY_TX_DIR/certs" || return 1
-    for key in config metadata clash; do
+    for key in config metadata clash service; do
         case "$key" in
             config) file="$XRAY_CONFIG" ;;
             metadata) file="$XRAY_METADATA" ;;
             clash) file="$CLASH_YAML_FILE" ;;
+            service) file=$(_xray_service_file) ;;
         esac
         if [ -e "$file" ]; then
             cp -p "$file" "$XRAY_TX_DIR/$key.data" && : > "$XRAY_TX_DIR/$key.present" || return 1
@@ -950,17 +1018,41 @@ _xray_snapshot_state() {
             : > "$XRAY_TX_DIR/$key.absent" || return 1
         fi
     done
-    # 保留原文件名供删除节点时读取；complete 只能在全部备份成功后写入。
-    if [ -f "$XRAY_TX_DIR/config.present" ]; then
-        cp -p "$XRAY_TX_DIR/config.data" "$XRAY_TX_DIR/config.json" || return 1
-    fi
     : > "$XRAY_TX_DIR/certs.list" || return 1
     for file in "$XRAY_DIR"/*.pem "$XRAY_DIR"/*.key; do
         [ -f "$file" ] || continue
         cp -p "$file" "$XRAY_TX_DIR/certs/" || return 1
         printf '%s\n' "${file##*/}" >> "$XRAY_TX_DIR/certs.list" || return 1
     done
-    : > "$XRAY_TX_DIR/complete"
+    if _xray_service_running; then
+        printf 'running\n' > "$XRAY_TX_DIR/service.state" || return 1
+    else
+        printf 'stopped\n' > "$XRAY_TX_DIR/service.state" || return 1
+    fi
+    case "${INIT_SYSTEM:-direct}" in
+        systemd)
+            enabled_state=$(systemctl is-enabled xray 2>/dev/null) || query_status=$?
+            [ -n "$enabled_state" ] || { [ "$query_status" -ne 4 ] || enabled_state=not-found; }
+            case "$enabled_state" in
+                enabled|enabled-runtime|disabled|not-found|static|indirect) ;;
+                *) _error "无法备份 Xray 自启状态，拒绝开始变更。"; return 1 ;;
+            esac
+            ;;
+        openrc)
+            enabled_state=$(rc-update show default 2>/dev/null) || return 1
+            if printf '%s\n' "$enabled_state" | LC_ALL=C grep -qE '^[[:space:]]*xray[[:space:]]*\|'; then
+                enabled_state=enabled
+            else
+                enabled_state=disabled
+            fi
+            ;;
+        direct) enabled_state=none ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$enabled_state" > "$XRAY_TX_DIR/service.enabled" || return 1
+    # 所有文件及服务状态齐备后才允许调用方开始修改。
+    : > "$XRAY_TX_DIR/complete" || return 1
+    XRAY_TX_ACTIVE="$XRAY_TX_DIR"
 }
 
 _xray_restore_file() {
@@ -974,26 +1066,57 @@ _xray_restore_file() {
 }
 
 _xray_restore_state() {
-    local snapshot="$1" file key target rc=0
+    local snapshot="$1" file key target rc=0 enabled_state current_enabled query_status=0
     [ -f "$snapshot/complete" ] && [ -d "$snapshot/certs" ] || return 1
     # 缺少 present 不代表原文件不存在；先验证完整性再允许任何删除。
-    for key in config metadata clash; do
+    for key in config metadata clash service; do
         if [ -f "$snapshot/$key.present" ]; then
             [ -f "$snapshot/$key.data" ] || return 1
         else
             [ -f "$snapshot/$key.absent" ] || return 1
         fi
     done
+    case "$(cat "$snapshot/service.state" 2>/dev/null)" in running|stopped) ;; *) return 1 ;; esac
     [ -f "$snapshot/certs.list" ] || return 1
     while IFS= read -r file; do
         [ -f "$snapshot/certs/$file" ] || return 1
     done < "$snapshot/certs.list"
-    for key in config metadata clash; do
+    enabled_state=$(cat "$snapshot/service.enabled" 2>/dev/null) || return 1
+    case "${INIT_SYSTEM:-direct}:$enabled_state" in
+        systemd:enabled|systemd:enabled-runtime|systemd:disabled|systemd:not-found|systemd:static|systemd:indirect|openrc:enabled|openrc:disabled|direct:none) ;;
+        *) return 1 ;;
+    esac
+    # 先撤销本次添加的自启链接，再还原/移除服务文件；OpenRC del 需要服务文件仍存在。
+    case "${INIT_SYSTEM:-direct}:$enabled_state" in
+        systemd:disabled|systemd:not-found|systemd:static|systemd:indirect|systemd:enabled-runtime)
+            current_enabled=$(systemctl is-enabled xray 2>/dev/null) || query_status=$?
+            [ -n "$current_enabled" ] || { [ "$query_status" -ne 4 ] || current_enabled=not-found; }
+            case "$current_enabled" in
+                enabled) systemctl disable xray >/dev/null 2>&1 || return 1 ;;
+                enabled-runtime)
+                    if [ "$enabled_state" != enabled-runtime ]; then
+                        systemctl disable --runtime xray >/dev/null 2>&1 || return 1
+                    fi
+                    ;;
+                disabled|not-found|static|indirect) ;;
+                *) return 1 ;;
+            esac
+            ;;
+        openrc:disabled)
+            current_enabled=$(rc-update show default 2>/dev/null) || return 1
+            if printf '%s\n' "$current_enabled" | LC_ALL=C grep -qE '^[[:space:]]*xray[[:space:]]*\|'; then
+                rc-update del xray default >/dev/null 2>&1 || return 1
+            fi
+            ;;
+    esac
+    for key in config metadata clash service; do
         case "$key" in
             config) target="$XRAY_CONFIG" ;;
             metadata) target="$XRAY_METADATA" ;;
             clash) target="$CLASH_YAML_FILE" ;;
+            service) target=$(_xray_service_file) ;;
         esac
+        [ -n "$target" ] || continue
         if [ -f "$snapshot/$key.present" ]; then
             _xray_restore_file "$snapshot/$key.data" "$target" || rc=1
         else
@@ -1015,19 +1138,81 @@ _xray_restore_state() {
 
 _xray_rollback_state() {
     local snapshot="$1"
-    if _xray_restore_state "$snapshot" && _manage_xray_service restart; then
-        _xray_drop_snapshot "$snapshot"
-        return 0
+    if _xray_restore_state "$snapshot"; then
+        local service_ok=1
+        if [ "${INIT_SYSTEM:-direct}" = systemd ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || service_ok=0
+        fi
+        case "${INIT_SYSTEM:-direct}:$(cat "$snapshot/service.enabled")" in
+            systemd:enabled) systemctl enable xray >/dev/null 2>&1 || service_ok=0 ;;
+            systemd:enabled-runtime) systemctl enable --runtime xray >/dev/null 2>&1 || service_ok=0 ;;
+            openrc:enabled) rc-update add xray default >/dev/null 2>&1 || service_ok=0 ;;
+        esac
+        if [ "$service_ok" -eq 1 ]; then
+            if [ "$(cat "$snapshot/service.state")" = running ]; then
+                _manage_xray_service restart || service_ok=0
+            elif _xray_service_running; then
+                _manage_xray_service stop || service_ok=0
+            fi
+        fi
+        if [ "$service_ok" -eq 1 ] && _xray_commit_state "$snapshot"; then return 0; fi
     fi
+    XRAY_TX_ACTIVE=""
+    XRAY_TX_BLOCKED=1
     _error "Xray 恢复失败，快照保留在: $snapshot"
     return 1
 }
 
 _xray_drop_snapshot() {
+    local snapshot="$1" resolved root
+    [ -d "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+    resolved=$(cd -- "$snapshot" && pwd -P) || return 1
+    root=$(cd -- "${SINGBOX_DIR}/.transactions" && pwd -P) || return 1
+    [ "${resolved%/*}" = "$root" ] || return 1
+    case "${resolved##*/}" in xray-*) ;; *) return 1 ;; esac
+    if [ -f "$resolved/committed" ]; then
+        # 先撤销恢复资格，避免递归清理先删 committed 后中断而误恢复部分快照。
+        rm -f -- "$resolved/complete" || return 1
+    fi
+    rm -rf -- "$resolved"
+}
+
+_xray_commit_state() {
     local snapshot="$1"
-    case "$snapshot" in
-        "${TMPDIR:-/tmp}"/singboxlite-xray.*) [ -d "$snapshot" ] && rm -rf -- "$snapshot" ;;
-    esac
+    # 提交标记先于清理；中断发生在清理阶段时，下次只清理，不能回退已成功的操作。
+    : > "$snapshot/committed" || return 1
+    [ "${XRAY_TX_ACTIVE:-}" != "$snapshot" ] || XRAY_TX_ACTIVE=""
+    _xray_drop_snapshot "$snapshot" || _warn "Xray 事务已结束，快照将在下次恢复检查时清理: $snapshot"
+    return 0
+}
+
+_xray_recover_pending() {
+    [ "${SINGBOXLITE_LOCK_HELD:-0}" = 1 ] || { _error "恢复 Xray 事务必须持有共享状态锁。"; return 1; }
+    local snapshot root="${SINGBOX_DIR}/.transactions"
+    for snapshot in "$root"/xray-*; do
+        [ -d "$snapshot" ] || continue
+        [ ! -L "$snapshot" ] || { XRAY_TX_BLOCKED=1; return 1; }
+        if [ -f "$snapshot/committed" ]; then
+            _xray_drop_snapshot "$snapshot" || _warn "无法清理已结束的 Xray 快照: $snapshot"
+            continue
+        fi
+        # complete 之前不会开始写入运行状态；部分快照只保留作诊断，不得用于恢复。
+        [ -f "$snapshot/complete" ] || continue
+        _warn "发现未完成的 Xray 事务，正在恢复原状态。"
+        _xray_rollback_state "$snapshot" || return 1
+    done
+    XRAY_TX_BLOCKED=0
+    return 0
+}
+
+_xray_exit_handler() {
+    local rc="${1:-0}" snapshot="${XRAY_TX_ACTIVE:-}"
+    trap - EXIT INT TERM
+    if [ -n "$snapshot" ] && [ -f "$snapshot/complete" ] && [ ! -f "$snapshot/committed" ]; then
+        _xray_rollback_state "$snapshot" || rc=1
+    fi
+    _release_singboxlite_lock
+    exit "$rc"
 }
 
 _run_xray_transaction() {
@@ -1035,8 +1220,7 @@ _run_xray_transaction() {
     shift
     _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
     local snapshot="$XRAY_TX_DIR"
-    if "$operation" "$@" && _validate_xray_config && _manage_xray_service restart; then
-        _xray_drop_snapshot "$snapshot"
+    if "$operation" "$@" && _validate_xray_config && _manage_xray_service restart && _xray_commit_state "$snapshot"; then
         return 0
     fi
     _error "Xray 变更失败，正在恢复配置、元数据、证书和 Clash 条目。"
@@ -1117,7 +1301,7 @@ _generate_reality_keys() {
 # 通用的 Reality streamSettings JSON 生成
 _build_reality_stream() {
     local network="$1" sni="$2" private_key="$3" short_id="$4"
-    local extra_settings="$5"
+    local extra_settings="${5:-}"
     jq -n --arg net "$network" --arg sni "$sni" --arg pk "$private_key" --arg sid "$short_id" \
         '{
             "network": $net,
@@ -1162,8 +1346,10 @@ _save_xray_meta() {
         rm -f -- "$tmp"
         return 1
     fi
-    chmod 600 "$tmp"
-    mv -f -- "$tmp" "$XRAY_METADATA"
+    if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$XRAY_METADATA"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
     
     # 追加额外的键值对
     for pair in "$@"; do
@@ -1174,14 +1360,17 @@ _save_xray_meta() {
             tmp2=$(mktemp "${XRAY_METADATA}.tmp.XXXXXX") || return 1
             if jq --arg t "$tag" --arg k "$key" --arg v "$val" \
                 '.[$t][$k] = $v' "$XRAY_METADATA" > "$tmp2" 2>/dev/null; then
-                chmod 600 "$tmp2"
-                mv -f -- "$tmp2" "$XRAY_METADATA"
+                if ! chmod 600 "$tmp2" || ! mv -f -- "$tmp2" "$XRAY_METADATA"; then
+                    rm -f -- "$tmp2"
+                    return 1
+                fi
             else
                 rm -f -- "$tmp2"
                 return 1
             fi
         fi
     done
+    return 0
 }
 
 # ============================================================
@@ -1877,9 +2066,10 @@ _delete_xray_node() {
     if { [ -z "$target_name" ] || [ "$target_name" = "null" ] || _xray_remove_node_from_yaml "$target_name" "$target_port"; } && \
        _xray_atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select(.tag == \"$target_tag\"))" && \
        _xray_atomic_modify_json "$XRAY_METADATA" "del(.\"$target_tag\")" && \
-       _manage_xray_service restart; then
-        rm -f -- "${XRAY_DIR}/${target_tag}.pem" "${XRAY_DIR}/${target_tag}.key"
-        _xray_drop_snapshot "$snapshot"
+       _manage_xray_service restart && \
+       rm -f -- "${XRAY_DIR}/${target_tag}.pem" "${XRAY_DIR}/${target_tag}.key" && \
+       _xray_commit_state "$snapshot"; then
+        :
     else
         _error "删除失败，正在恢复原状态。"
         _xray_rollback_state "$snapshot" || return 1
@@ -1905,10 +2095,13 @@ _delete_all_xray_nodes() {
        _xray_atomic_modify_json "$XRAY_CONFIG" '.inbounds = []' && \
        _xray_atomic_modify_json "$XRAY_METADATA" '{} ' && \
        _manage_xray_service restart; then
-        for tag in $(jq -r '.inbounds[].tag' "$snapshot/config.json" 2>/dev/null); do
-            rm -f -- "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key"
+        for tag in $(jq -r '.inbounds[].tag' "$snapshot/config.data" 2>/dev/null); do
+            rm -f -- "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key" || cleanup_ok=0
         done
-        _xray_drop_snapshot "$snapshot"
+        if [ "$cleanup_ok" -ne 1 ] || ! _xray_commit_state "$snapshot"; then
+            _xray_rollback_state "$snapshot" || return 1
+            return 1
+        fi
     else
         _error "批量删除失败，正在恢复原状态。"
         _xray_rollback_state "$snapshot" || return 1
@@ -1958,7 +2151,18 @@ _modify_xray_port() {
     local old_link=$(jq -r --arg t "$target_tag" '.[$t].share_link // empty' "$XRAY_METADATA" 2>/dev/null)
     local new_link=""
     if [ -n "$old_link" ]; then
-        new_link=$(echo "$old_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g; s/(-${old_port})([?&#\/]|$)/-${new_port}\2/g; s/#[^#]*$/#$(_url_encode "$new_name")/g")
+        # 只拆 authority；query 和 path 可能包含与端口相同的服务名，必须逐字保留。
+        local link_base="${old_link%%#*}" link_query="" link_body link_endpoint link_path link_prefix
+        link_query="${link_base#"${link_base%%\?*}"}"
+        link_base="${link_base%%\?*}"
+        [[ "$link_base" == *://* ]] || { _error "原分享链接格式无效。"; return 1; }
+        link_body="${link_base#*://}"
+        link_endpoint="${link_body#*@}"
+        link_prefix="${link_body%"$link_endpoint"}"
+        link_path="${link_endpoint#"${link_endpoint%%/*}"}"
+        link_endpoint="${link_endpoint%%/*}"
+        [[ "$link_endpoint" == *":${old_port}" ]] || { _error "原分享链接端口与节点不一致。"; return 1; }
+        new_link="${link_base%%://*}://${link_prefix}${link_endpoint%:"$old_port"}:${new_port}${link_path}${link_query}#$(_url_encode "$new_name")"
     fi
     _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
     local snapshot="$XRAY_TX_DIR" change_ok=1
@@ -1977,15 +2181,17 @@ _modify_xray_port() {
             jq --arg t "$target_tag" --arg n "$new_name" --arg l "$new_link" \
                 '.[$t].name = $n | if $l != "" then .[$t].share_link = $l else . end' \
                 "$XRAY_METADATA" > "$meta_tmp" 2>/dev/null || change_ok=0
-            if [ "$change_ok" -eq 1 ]; then chmod 600 "$meta_tmp"; mv -f -- "$meta_tmp" "$XRAY_METADATA"; else rm -f -- "$meta_tmp"; fi
+            if [ "$change_ok" -eq 1 ]; then
+                chmod 600 "$meta_tmp" && mv -f -- "$meta_tmp" "$XRAY_METADATA" || change_ok=0
+            fi
+            [ "$change_ok" -eq 1 ] || rm -f -- "$meta_tmp"
         fi
     fi
-    if [ "$change_ok" -ne 1 ] || ! _manage_xray_service restart; then
+    if [ "$change_ok" -ne 1 ] || ! _manage_xray_service restart || ! _xray_commit_state "$snapshot"; then
         _error "修改端口失败，正在恢复原状态。"
         _xray_rollback_state "$snapshot" || return 1
         return 1
     fi
-    _xray_drop_snapshot "$snapshot"
     _success "节点 [$new_name] 端口已改为 ${new_port}！"
 }
 
@@ -2034,18 +2240,19 @@ _xray_add_node_menu() {
 }
 
 _initialize_xray_runtime() {
-    local listen_fix_status
-    _init_xray_config || return 1
-    _ensure_xray_clash_yaml || return 1
-    _create_xray_service || return 1
-    _check_and_fix_xray_listen
-    listen_fix_status=$?
-    if [ "$listen_fix_status" -eq 0 ]; then
-        _manage_xray_service "restart" || return 1
-    elif [ "$listen_fix_status" -gt 1 ]; then
-        return 1
+    _xray_snapshot_state || { _error "无法创建初始化快照。"; return 1; }
+    local snapshot="$XRAY_TX_DIR" listen_fix_status=2
+    if _init_xray_config && _ensure_xray_clash_yaml && _create_xray_service; then
+        _check_and_fix_xray_listen
+        listen_fix_status=$?
     fi
-    return 0
+    if [ "$listen_fix_status" -eq 1 ] || \
+       { [ "$listen_fix_status" -eq 0 ] && _validate_xray_config && _manage_xray_service restart; }; then
+        _xray_commit_state "$snapshot" && return 0
+    fi
+    _error "Xray 初始化或监听迁移失败，正在恢复原状态。"
+    _xray_rollback_state "$snapshot" || return 1
+    return 1
 }
 
 _xray_menu() {
@@ -2054,6 +2261,7 @@ _xray_menu() {
         return 1
     fi
     _ensure_xray_dependencies || return 1
+    _with_singboxlite_lock _xray_recover_pending || return 1
     # 独立运行时也允许安装核心，不再依赖主脚本的隐藏入口。
     if [ ! -f "$XRAY_BIN" ]; then
         _warn "Xray 核心尚未安装。"
@@ -2066,6 +2274,7 @@ _xray_menu() {
     _with_singboxlite_lock _initialize_xray_runtime || return 1
 
     while true; do
+        _with_singboxlite_lock _xray_recover_pending || return 1
         clear
         echo ""
         echo -e "  ${GREEN}Xray-core 节点管理 v${XRAY_SCRIPT_VERSION}${NC}"
@@ -2102,9 +2311,9 @@ _xray_menu() {
         echo "  =============================="
         read -p "请选择 [0-99]: " choice
         case $choice in
-            1) _manage_xray_service "start"; read -p "按回车键继续..." ;;
-            2) _manage_xray_service "stop"; read -p "按回车键继续..." ;;
-            3) _manage_xray_service "restart"; read -p "按回车键继续..." ;;
+            1) _with_singboxlite_lock _manage_xray_service "start"; read -p "按回车键继续..." ;;
+            2) _with_singboxlite_lock _manage_xray_service "stop"; read -p "按回车键继续..." ;;
+            3) _with_singboxlite_lock _manage_xray_service "restart"; read -p "按回车键继续..." ;;
             4) _manage_xray_service "status"; read -p "按回车键继续..." ;;
             5) _view_xray_log ;;
             6) _xray_add_node_menu ;;
@@ -2121,4 +2330,15 @@ _xray_menu() {
 # ============================================================
 #                       入口
 # ============================================================
-_xray_menu
+_xray_entrypoint() {
+    case "${1:-}" in
+        recover-pending) _with_singboxlite_lock _xray_recover_pending ;;
+        "") _xray_menu ;;
+        *) _error "未知 Xray 管理命令。"; return 2 ;;
+    esac
+}
+
+trap '_xray_exit_handler $?' EXIT
+trap '_xray_exit_handler 130' INT
+trap '_xray_exit_handler 143' TERM
+_xray_entrypoint "$@"
