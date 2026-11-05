@@ -60,6 +60,9 @@ RUN_DIR="/run/singboxlite"
 SINGBOX_PID_FILE="${RUN_DIR}/sing-box.pid"
 STATE_LOCK_FD=""
 STATE_LOCK_OWNED="false"
+RELAY_TX_ACTIVE=""
+RELAY_TX_BLOCKED=0
+RELAY_TX_RECOVERING=0
 
 _valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
@@ -153,8 +156,13 @@ fi
 
 # 所有脚本共用同一把状态锁。父脚本持锁调用时通过环境变量避免二次加锁。
 _state_lock_acquire() {
+    [ "${RELAY_TX_BLOCKED:-0}" = 0 ] || {
+        _error "中转状态尚未恢复，请先运行 recover-pending"
+        return 1
+    }
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" = "1" ]; then
-        return 0
+        _relay_recover_pending_locked
+        return $?
     fi
     if ! command -v flock >/dev/null 2>&1; then
         _error "缺少 flock，无法安全修改共享配置"
@@ -171,6 +179,10 @@ _state_lock_acquire() {
     fi
     export SINGBOXLITE_LOCK_HELD=1
     STATE_LOCK_OWNED="true"
+    if ! _relay_recover_pending_locked; then
+        _state_lock_release
+        return 1
+    fi
 }
 
 _state_lock_release() {
@@ -182,8 +194,9 @@ _state_lock_release() {
     unset SINGBOXLITE_LOCK_HELD
 }
 
-trap '_state_lock_release' EXIT
-trap '_state_lock_release; exit 130' INT TERM
+trap '_relay_exit "$?"' EXIT
+trap '_relay_exit 130' INT
+trap '_relay_exit 143' TERM
 
 _secure_state_file() {
     [ -e "$1" ] && chmod 600 "$1" 2>/dev/null || true
@@ -537,6 +550,7 @@ _save_nftables_rules() {
 # 原子修改 JSON (与主脚本 singbox.sh 保持一致，不静默吞掉 jq 错误)
 _atomic_modify_json() {
     local file="$1" filter="$2"
+    [ "${RELAY_TX_BLOCKED:-0}" = 0 ] || return 1
     [ ! -f "$file" ] && return 1
     local acquired="false" tmp rc=0
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
@@ -557,6 +571,7 @@ _atomic_modify_json() {
 
 _atomic_write_json() {
     local file="$1" payload="$2"
+    [ "${RELAY_TX_BLOCKED:-0}" = 0 ] || return 1
     local acquired="false" tmp rc=0
     printf '%s' "$payload" | jq -e . >/dev/null 2>&1 || return 1
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
@@ -577,6 +592,7 @@ _atomic_write_json() {
 # 单个原子修改 YAML
 _atomic_modify_yaml() {
     local file="$1" filter="$2"
+    [ "${RELAY_TX_BLOCKED:-0}" = 0 ] || return 1
     [ ! -f "$file" ] && return 1
     local acquired="false" tmp rc=0
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
@@ -608,41 +624,299 @@ _check_combined_config() {
     "$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" >/dev/null
 }
 
+# --- 中转持久事务 ---
 _txn_begin() {
-    mktemp -d /tmp/singboxlite-relay-txn.XXXXXX
+    local root="${SINGBOX_DIR}/.transactions"
+    [ "${RELAY_TX_BLOCKED:-0}" = 0 ] && [ -z "${RELAY_TX_ACTIVE:-}" ] || return 1
+    _relay_recover_pending_locked || return 1
+    _relay_assert_no_foreign_pending || return 1
+    [ ! -L "$root" ] || return 1
+    mkdir -p "$root" && chmod 700 "$root" || return 1
+    mktemp -d "$root/relay-XXXXXX"
+}
+
+_relay_assert_no_foreign_pending() {
+    local dir
+    for dir in "${SINGBOX_DIR}/.transactions"/*; do
+        [ -d "$dir" ] || continue
+        case "${dir##*/}" in relay-*) continue ;; esac
+        if [ -f "$dir/complete" ] && [ ! -f "$dir/committed" ]; then
+            _error "其他模块仍有待恢复事务，已拒绝中转写入: $dir"
+            return 1
+        fi
+    done
+    return 0
 }
 
 _txn_snapshot_file() {
     local dir="$1" key="$2" file="$3"
     if [ -e "$file" ]; then
-        cp -p "$file" "$dir/$key"
+        cp -p "$file" "$dir/$key" || return 1
     else
-        : > "$dir/${key}.absent"
+        : > "$dir/${key}.absent" || return 1
     fi
+    printf '%s\n' "$file" > "$dir/${key}.path"
 }
 
 _txn_restore_file() {
-    local dir="$1" key="$2" file="$3"
+    local dir="$1" key="$2" file="$3" tmp
     if [ -e "$dir/${key}.absent" ]; then
         rm -f -- "$file"
     elif [ -e "$dir/$key" ]; then
-        cp -p "$dir/$key" "$file" || return 1
-        _secure_state_file "$file"
+        mkdir -p "$(dirname "$file")" || return 1
+        tmp=$(mktemp "${file}.restore.XXXXXX") || return 1
+        if ! cp -p "$dir/$key" "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$file"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    else
+        return 1
     fi
 }
 
 _txn_cleanup() {
-    local dir="$1"
+    local dir="$1" file
     case "$dir" in
-        /tmp/singboxlite-relay-txn.*)
-            rm -f -- \
-                "$dir/relay" "$dir/relay.absent" \
-                "$dir/links" "$dir/links.absent" \
-                "$dir/clash" "$dir/clash.absent" \
-                "$dir/pf" "$dir/pf.absent" 2>/dev/null || true
-            rmdir -- "$dir" 2>/dev/null || true
+        "${SINGBOX_DIR}/.transactions"/relay-*) ;;
+        *) return 1 ;;
+    esac
+    [ ! -L "$dir" ] || return 1
+    [ -d "$dir" ] || return 0
+    # 只清理私有事务目录中的普通文件；未知目录项保留并报告失败。
+    for file in "$dir"/*; do
+        [ -e "$file" ] || continue
+        case "${file##*/}" in complete|committed) continue ;; esac
+        [ -f "$file" ] && [ ! -L "$file" ] && rm -f -- "$file" || return 1
+    done
+    rm -f -- "$dir/complete" && rm -f -- "$dir/committed" || return 1
+    rmdir -- "$dir"
+}
+
+_txn_activate() {
+    local dir="$1" type="$2"
+    printf '%s\n' "$type" > "$dir/type" || return 1
+    if _manage_service status >/dev/null 2>&1; then
+        printf 'running\n' > "$dir/service.state" || return 1
+    else
+        printf 'stopped\n' > "$dir/service.state" || return 1
+    fi
+    RELAY_TX_ACTIVE="$dir"
+    : > "$dir/complete" || { RELAY_TX_ACTIVE=""; return 1; }
+}
+
+_txn_snapshot_nft() {
+    local dir="$1" tables
+    _txn_snapshot_file "$dir" nft-persist "$NFT_PERSIST_FILE" &&
+        _txn_snapshot_file "$dir" nft-config "${NFT_CONFIG_FILE:-/etc/nftables.conf}" || return 1
+    tables=$(nft list tables 2>/dev/null) || return 1
+    if grep -Fxq "table inet $NFT_TABLE" <<< "$tables"; then
+        nft list table inet "$NFT_TABLE" > "$dir/nft-table" || return 1
+    else
+        : > "$dir/nft-table.absent" || return 1
+    fi
+    printf '%s\n' "$NFT_TABLE" > "$dir/nft-table-name" &&
+        : > "$dir/with-nft"
+}
+
+_txn_restore_nft() {
+    local dir="$1" tables table_name
+    [ -f "$dir/with-nft" ] || return 0
+    table_name=$(cat "$dir/nft-table-name") || return 1
+    [[ "$table_name" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || return 1
+    tables=$(nft list tables 2>/dev/null) || return 1
+    : > "$dir/nft-restore" || return 1
+    if grep -Fxq "table inet $table_name" <<< "$tables"; then
+        printf 'delete table inet %s\n' "$table_name" >> "$dir/nft-restore" || return 1
+    fi
+    if [ -f "$dir/nft-table" ]; then
+        cat "$dir/nft-table" >> "$dir/nft-restore" || return 1
+    elif [ ! -f "$dir/nft-table.absent" ]; then
+        return 1
+    fi
+    [ ! -s "$dir/nft-restore" ] || nft -f "$dir/nft-restore"
+}
+
+_txn_restore_state() {
+    local dir="$1" type path key file original_service_state rc=0 config_rc=0 count=0
+    [ -f "$dir/complete" ] && [ ! -f "$dir/committed" ] || return 1
+    type=$(cat "$dir/type") || return 1
+    original_service_state=$(cat "$dir/service.state") || return 1
+    case "$original_service_state" in running|stopped) ;; *) return 1 ;; esac
+    local -a required
+    case "$type" in
+        relay) required=(relay links clash) ;;
+        pf) required=(relay pf) ;;
+        warp) required=(relay warp-reg warp-rules warp-nodes) ;;
+        *) return 1 ;;
+    esac
+    if [ -f "$dir/with-nft" ]; then
+        required+=(nft-persist nft-config)
+        [ -f "$dir/nft-table-name" ] &&
+            { [ -f "$dir/nft-table" ] || [ -f "$dir/nft-table.absent" ]; } || return 1
+    fi
+    for key in "${required[@]}"; do
+        [ -s "$dir/$key.path" ] || return 1
+    done
+    # 先检查快照完整性，不能把缺少副本误解释成“原文件不存在”。
+    for path in "$dir"/*.path; do
+        [ -f "$path" ] || continue
+        key="${path##*/}"; key="${key%.path}"
+        [ -f "$dir/$key" ] || [ -f "$dir/$key.absent" ] || return 1
+        count=$((count + 1))
+    done
+    [ "$count" -gt 0 ] || return 1
+    for path in "$dir"/*.path; do
+        key="${path##*/}"; key="${key%.path}"
+        IFS= read -r file < "$path" || { rc=1; continue; }
+        if ! _txn_restore_file "$dir" "$key" "$file"; then
+            rc=1
+            case "$key" in relay|asset-*) config_rc=1 ;; esac
+        fi
+    done
+    _txn_restore_nft "$dir" || rc=1
+    case "$original_service_state" in
+        running)
+            if [ "$config_rc" -eq 0 ]; then _restart_checked || rc=1; fi
+            ;;
+        stopped)
+            if _manage_service status >/dev/null 2>&1; then
+                _manage_service stop || rc=1
+            fi
+            if _manage_service status >/dev/null 2>&1; then
+                _error "原核心处于停止状态，但恢复后仍在运行"
+                rc=1
+            fi
             ;;
     esac
+    return "$rc"
+}
+
+_txn_commit() {
+    local dir="$1"
+    : > "$dir/committed" || return 1
+    [ "${RELAY_TX_ACTIVE:-}" != "$dir" ] || RELAY_TX_ACTIVE=""
+    _txn_cleanup "$dir"
+}
+
+_txn_rollback() {
+    local dir="$1"
+    if [ -f "$dir/committed" ]; then
+        _txn_cleanup "$dir"
+        return $?
+    fi
+    RELAY_TX_ACTIVE="$dir"
+    if ! _txn_restore_state "$dir" || ! _txn_commit "$dir"; then
+        RELAY_TX_BLOCKED=1
+        RELAY_TX_ACTIVE="$dir"
+        _error "中转状态恢复失败，快照保留在: $dir；停止后续写入，请运行 recover-pending"
+        return 1
+    fi
+    RELAY_TX_BLOCKED=0
+}
+
+_txn_finish() {
+    local dir="$1"
+    _txn_commit "$dir" && return 0
+    [ -f "$dir/committed" ] || _txn_rollback "$dir"
+    return 1
+}
+
+_relay_recover_pending_locked() {
+    local dir rc=0
+    [ -z "${RELAY_TX_ACTIVE:-}" ] && [ "${RELAY_TX_RECOVERING:-0}" = 0 ] || {
+        [ "${RELAY_TX_BLOCKED:-0}" = 0 ]
+        return $?
+    }
+    RELAY_TX_RECOVERING=1
+    for dir in "${SINGBOX_DIR}/.transactions"/relay-*; do
+        [ -d "$dir" ] || continue
+        if [ -L "$dir" ]; then
+            rc=1
+        elif [ -f "$dir/committed" ]; then
+            _txn_cleanup "$dir" || rc=1
+        elif [ -f "$dir/complete" ]; then
+            _txn_rollback "$dir" || rc=1
+        fi
+        [ "$rc" -eq 0 ] || break
+    done
+    RELAY_TX_RECOVERING=0
+    RELAY_TX_BLOCKED="$rc"
+    return "$rc"
+}
+
+_relay_exit() {
+    local rc="${1:-0}"
+    trap - EXIT
+    trap '' INT TERM
+    _relay_probe_cleanup || rc=1
+    if [ -n "${RELAY_TX_ACTIVE:-}" ] && [ "${RELAY_TX_BLOCKED:-0}" = 0 ]; then
+        [ "$rc" -ne 0 ] || rc=1
+        if [ -f "$RELAY_TX_ACTIVE/complete" ]; then
+            _txn_rollback "$RELAY_TX_ACTIVE" || rc=1
+        else
+            _txn_cleanup "$RELAY_TX_ACTIVE" || rc=1
+        fi
+    elif [ "${RELAY_TX_BLOCKED:-0}" != 0 ]; then
+        rc=1
+    fi
+    _state_lock_release
+    exit "$rc"
+}
+
+_relay_probe_cleanup() {
+    local pid="${WARP_PROBE_PID:-}" dir="${WARP_PROBE_DIR:-}"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+    WARP_PROBE_PID=""
+    if [ -n "$dir" ]; then
+        rm -f -- "$dir/probe.json" "$dir/probe.err" "$dir/trace.out" &&
+            rmdir -- "$dir" || return 1
+    fi
+    WARP_PROBE_DIR=""
+}
+
+_relay_recover_pending() {
+    local rc=0
+    _state_lock_acquire || return 1
+    _relay_recover_pending_locked || rc=1
+    _state_lock_release
+    return "$rc"
+}
+
+_relay_write_boundary() {
+    local rc=0
+    _state_lock_acquire || return 1
+    _relay_assert_no_foreign_pending || rc=1
+    _state_lock_release
+    return "$rc"
+}
+# --- 中转持久事务结束 ---
+
+_relay_txn_snapshot() {
+    local dir="$1" with_nft="${2:-false}" tag suffix index=0 tags file
+    shift 2
+    _txn_snapshot_file "$dir" relay "$RELAY_CONFIG_FILE" &&
+        _txn_snapshot_file "$dir" links "${RELAY_AUX_DIR}/relay_links.json" &&
+        _txn_snapshot_file "$dir" clash "$RELAY_CLASH_YAML" || return 1
+    tags=$(jq -r '.inbounds[]? | .tag // empty | select(test("^(vless-reality|hysteria2|tuic|anytls|shadowsocks)-in-[0-9]+$"))' "$RELAY_CONFIG_FILE") || return 1
+    while IFS= read -r tag; do
+        [ -n "$tag" ] || continue
+        for suffix in pem key; do
+            index=$((index + 1))
+            _txn_snapshot_file "$dir" "asset-$index" "${RELAY_AUX_DIR}/${tag}.${suffix}" || return 1
+        done
+    done <<< "$tags"
+    # 创建流程的证书尚未提交；恢复时应摘除，而不是把它当作原有资产保留。
+    for file in "$@"; do
+        [ -n "$file" ] || continue
+        index=$((index + 1))
+        : > "$dir/asset-$index.absent" &&
+            printf '%s\n' "$file" > "$dir/asset-$index.path" || return 1
+    done
+    [ "$with_nft" != true ] || _txn_snapshot_nft "$dir" || return 1
+    _txn_activate "$dir" relay
 }
 
 _restart_checked() {
@@ -667,28 +941,52 @@ _manage_service() {
     _info "执行服务操作: $action ($service_pkg)..."
     case "$INIT_SYSTEM" in
         systemd)
+            if [ "$action" = status ]; then
+                systemctl is-active --quiet "$service_pkg"
+                return $?
+            fi
             if [ "$action" = "start" ] || [ "$action" = "restart" ]; then
                 systemctl reset-failed "$service_pkg" >/dev/null 2>&1 || true
             fi
             if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
-                systemctl "$action" "$service_pkg" 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&-
+                systemctl "$action" "$service_pkg" 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&- || return 1
             else
-                systemctl "$action" "$service_pkg" 8>&- 9>&- 219>&-
+                systemctl "$action" "$service_pkg" 8>&- 9>&- 219>&- || return 1
             fi
+            case "$action" in
+                start|restart)
+                    sleep 1
+                    systemctl is-active --quiet "$service_pkg" || return 1
+                    ;;
+                stop)
+                    sleep 1
+                    if systemctl is-active --quiet "$service_pkg"; then return 1; fi
+                    ;;
+            esac
             ;;
         openrc)
             if [ "$STATE_LOCK_OWNED" = "true" ] && [[ "$STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
-                rc-service "$service_pkg" "$action" 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&-
+                rc-service "$service_pkg" "$action" 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&- || return 1
             else
-                rc-service "$service_pkg" "$action" 8>&- 9>&- 219>&-
+                rc-service "$service_pkg" "$action" 8>&- 9>&- 219>&- || return 1
             fi
+            case "$action" in
+                start|restart)
+                    sleep 1
+                    rc-service "$service_pkg" status || return 1
+                    ;;
+                stop)
+                    sleep 1
+                    if rc-service "$service_pkg" status; then return 1; fi
+                    ;;
+            esac
             ;;
         direct)
-            _prepare_run_dir || return 1
             local pid_file="$SINGBOX_PID_FILE"
             local log_file="/var/log/sing-box.log"
             case "$action" in
                 start)
+                    _prepare_run_dir || return 1
                     if _is_pid_file_running_cmd "$pid_file" "$SINGBOX_BIN"; then
                         return 0
                     fi
@@ -713,7 +1011,12 @@ _manage_service() {
                         local pid
                         pid=$(cat "$pid_file" 2>/dev/null)
                         if _is_pid_running_cmd "$pid" "$SINGBOX_BIN"; then
-                            kill "$pid" 2>/dev/null
+                            kill "$pid" 2>/dev/null || return 1
+                            sleep 1
+                            if _is_pid_running_cmd "$pid" "$SINGBOX_BIN"; then
+                                _error "sing-box 进程尚未停止，保留 PID 文件"
+                                return 1
+                            fi
                         fi
                     fi
                     rm -f -- "$pid_file"
@@ -846,6 +1149,10 @@ _init_relay_dirs() {
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
         _state_lock_acquire || return 1
         acquired="true"
+    fi
+    if ! _relay_assert_no_foreign_pending; then
+        [ "$acquired" != true ] || _state_lock_release
+        return 1
     fi
     # 确保辅助目录存在
     if [ ! -d "$RELAY_AUX_DIR" ]; then
@@ -1700,10 +2007,6 @@ _landing_config() {
 _cleanup_pending_relay_assets() {
     local inbound_tag="$1" listen_port="$2" port_range="$3" cert_path="$4" key_path="$5"
     rm -f -- "$cert_path" "$key_path"
-    if [[ "$port_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-        _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$listen_port" "singboxlite-relay-hop-${inbound_tag}"
-        _save_nftables_rules
-    fi
 }
 
 # --- 通用：完成中转配置 (Inbound + Outbound写入) ---
@@ -1713,6 +2016,7 @@ _finalize_relay_setup() {
     local dest_addr="$2"
     local dest_port="$3"
     local outbound_json="$4"
+    _relay_write_boundary || return 1
     
     if ! _valid_port "$dest_port" || ! _valid_server_address "$dest_addr"; then
         _error "落地节点服务器地址或端口无效"
@@ -1935,16 +2239,7 @@ _finalize_relay_setup() {
                 fi
                 
                 if [ -n "$port_range" ]; then
-                    local nft_comment="singboxlite-relay-hop-${inbound_tag}"
-                    if _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$listen_port" "$nft_comment"; then
-                        hop_str="&mport=${port_range}"
-                        _save_nftables_rules
-                        _info "已注入底层 nftables 高效端口映射: UDP ${port_range} -> ${listen_port}"
-                    else
-                        _warn "环境受限：原生容器 (LXC/Docker) 缺失必需的系统级 nftables NAT 操作权限。"
-                        _warn "高级中转为了节点本身的绝对稳定，不支持易崩溃的 JSON 多实例监听平替，现已安全截停并取消本次跳跃设定。"
-                        port_range=""
-                    fi
+                    hop_str="&mport=${port_range}"
                 fi
             else
                 _warn "跳跃端口格式错误，已取消该功能。"
@@ -2030,12 +2325,11 @@ _finalize_relay_setup() {
     _info "正在事务写入中转配置..."
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    local txn_dir tmp metadata combined_filter
+    local txn_dir tmp metadata combined_filter with_nft=false
+    [[ "${port_range:-}" =~ ^[0-9]+-[0-9]+$ ]] && with_nft=true
     _state_lock_acquire || { _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"; return 1; }
     txn_dir=$(_txn_begin) || { _state_lock_release; _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+    if ! _relay_txn_snapshot "$txn_dir" "$with_nft" "$cert_path" "$key_path"; then
         _error "无法创建中转状态快照"
         _txn_cleanup "$txn_dir"
         _state_lock_release
@@ -2045,34 +2339,29 @@ _finalize_relay_setup() {
 
     if _network_port_conflict "$listen_port" "$listen_network"; then
         _error "提交前发现 ${listen_network^^} 端口 ${listen_port} 已被占用"
-        _txn_cleanup "$txn_dir"
+        _txn_rollback "$txn_dir"
         _state_lock_release
-        _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
         return 1
     fi
     export PROXY_NAME="$node_name"
     if "$YQ_BINARY" eval -e '.proxies[] | select(.name == strenv(PROXY_NAME))' "$RELAY_CLASH_YAML" >/dev/null 2>&1; then
         _error "提交前发现 Clash 节点名称已存在: $node_name"
-        _txn_cleanup "$txn_dir"
+        _txn_rollback "$txn_dir"
         _state_lock_release
-        _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
         return 1
     fi
 
     if jq -e --arg tag "$inbound_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
         _error "中转入口 tag 已存在: $inbound_tag"
-        _txn_cleanup "$txn_dir"
+        _txn_rollback "$txn_dir"
         _state_lock_release
-        _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
         return 1
     fi
 
     combined_filter=".inbounds = (.inbounds // []) + [$inbound_json] | .outbounds = [$outbound_json] + (.outbounds // []) | .route = (.route // {\"rules\":[]}) | .route.rules = (.route.rules // []) + [$rule_json]"
     if ! _atomic_modify_json "$CONFIG_FILE" "$combined_filter"; then
-        _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
-        _txn_cleanup "$txn_dir"
+        _txn_rollback "$txn_dir"
         _state_lock_release
-        _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
         return 1
     fi
 
@@ -2085,14 +2374,10 @@ _finalize_relay_setup() {
         || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$LINKS_FILE" || ! _add_node_to_relay_yaml "$proxy_json" \
         || ! _restart_checked; then
         [ -n "$tmp" ] && rm -f -- "$tmp"
-        _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
-        _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-        _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
-        _manage_service restart >/dev/null 2>&1 || true
-        _txn_cleanup "$txn_dir"
+        if _txn_rollback "$txn_dir"; then
+            _error "中转配置提交失败，已恢复原配置"
+        fi
         _state_lock_release
-        _cleanup_pending_relay_assets "$inbound_tag" "$listen_port" "${port_range:-}" "$cert_path" "$key_path"
-        _error "中转配置提交失败，已恢复原配置"
         return 1
     fi
     _secure_state_file "$CONFIG_FILE"
@@ -2100,9 +2385,19 @@ _finalize_relay_setup() {
     _secure_state_file "$RELAY_CLASH_YAML"
     _secure_state_file "$cert_path"
     _secure_state_file "$key_path"
-    _txn_cleanup "$txn_dir"
+    if [ "$with_nft" = true ] &&
+        { ! _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$listen_port" "singboxlite-relay-hop-${inbound_tag}" ||
+          ! _save_nftables_rules; }; then
+        if _txn_rollback "$txn_dir"; then
+            _error "中转端口跳跃提交失败，已恢复原配置"
+        fi
+        _state_lock_release
+        return 1
+    fi
+    local commit_rc=0
+    _txn_finish "$txn_dir" || commit_rc=1
     _state_lock_release
-    _save_nftables_rules
+    [ "$commit_rc" -eq 0 ] || return 1
     _log_operation "CREATE_RELAY" "Type: $relay_type, Port: $listen_port, Landing: ${dest_label}@${dest_addr}:${dest_port}"
     
     echo -e "${YELLOW}═══════════════════ 配置成功 ═══════════════════${NC}"
@@ -2115,7 +2410,8 @@ _finalize_relay_setup() {
     echo -e "分享链接:"
     echo -e "${CYAN}$link${NC}"
     echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
-    read -p "  按回车键返回..."
+    read -p "  按回车键返回..." || true
+    return 0
 }
 
 # --- 2. 中转机配置 (导入 Token) ---
@@ -2259,13 +2555,14 @@ _view_relays() {
 _clear_all_relays() {
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    local txn_dir cleanup_rows relay_tags failed="false"
+    local txn_dir cleanup_rows relay_tags failed="false" with_nft=false
 
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+    if jq -e '[.[] | select((.port_hopping // "") != "")] | length > 0' "$LINKS_FILE" >/dev/null; then
+        with_nft=true
+    fi
+    if ! _relay_txn_snapshot "$txn_dir" "$with_nft"; then
         _error "无法创建中转状态快照，已取消清空"
         _txn_cleanup "$txn_dir"
         _state_lock_release
@@ -2282,7 +2579,7 @@ _clear_all_relays() {
             ((.value.listen_port // ([ $config[0].inbounds[]? | select(.tag == $tag) | .listen_port ][0] // "")) | tostring)
           ]
         | @tsv
-    ' "$LINKS_FILE" 2>/dev/null || true)
+    ' "$LINKS_FILE" 2>/dev/null) || failed=true
 
     while IFS=$'\t' read -r tag node_name hop port; do
         [ -z "$tag" ] && continue
@@ -2297,8 +2594,7 @@ _clear_all_relays() {
     relay_tags=$(jq -c '[
         (.route.rules[]? | select(((.outbound? // "") | startswith("relay-out-"))) | .inbound),
         (.inbounds[]? | select((.tag? // "") | test("^(vless-reality|hysteria2|tuic|anytls|shadowsocks)-in-[0-9]+$")) | .tag)
-    ] | unique' "$CONFIG_FILE" 2>/dev/null)
-    [ -n "$relay_tags" ] || relay_tags='[]'
+    ] | unique' "$CONFIG_FILE" 2>/dev/null) || failed=true
 
     if [ "$failed" != "true" ]; then
         local clear_filter
@@ -2308,13 +2604,10 @@ _clear_all_relays() {
     fi
 
     if [ "$failed" = "true" ] || ! _restart_checked; then
-        _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
-        _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-        _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
-        _manage_service restart >/dev/null 2>&1 || true
-        _txn_cleanup "$txn_dir"
+        if _txn_rollback "$txn_dir"; then
+            _error "清空中转失败，已恢复原配置"
+        fi
         _state_lock_release
-        _error "清空中转失败，已恢复原配置"
         return 1
     fi
 
@@ -2323,18 +2616,27 @@ _clear_all_relays() {
         [ -z "$tag" ] && continue
         [ "$node_name" = "__SINGBOXLITE_EMPTY__" ] && node_name=""
         [ "$hop" = "__SINGBOXLITE_EMPTY__" ] && hop=""
-        rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
+        rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key" || failed=true
         if [[ "$hop" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$port" "singboxlite-relay-hop-${tag}"
+            _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$port" "singboxlite-relay-hop-${tag}" || failed=true
         fi
     done <<< "$cleanup_rows"
     while IFS= read -r tag; do
         [ -n "$tag" ] || continue
-        rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
+        rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key" || failed=true
     done < <(printf '%s' "$relay_tags" | jq -r '.[]' 2>/dev/null)
-    _save_nftables_rules
-    _txn_cleanup "$txn_dir"
+    [ "$with_nft" != true ] || _save_nftables_rules || failed=true
+    if [ "$failed" = true ]; then
+        if _txn_rollback "$txn_dir"; then
+            _error "清空中转资产失败，已恢复原配置"
+        fi
+        _state_lock_release
+        return 1
+    fi
+    local commit_rc=0
+    _txn_finish "$txn_dir" || commit_rc=1
     _state_lock_release
+    [ "$commit_rc" -eq 0 ] || return 1
     _success "全部中转已清空；主节点、Xray 与端口转发配置均已保留"
 }
 
@@ -2422,12 +2724,11 @@ _delete_relay() {
     fi
 
     _info "正在事务删除中转链路: $in_tag -> $out_tag ..."
-    local txn_dir failed="false"
+    local txn_dir failed="false" with_nft=false
+    [[ "$port_hopping" =~ ^[0-9]+-[0-9]+$ ]] && with_nft=true
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+    if ! _relay_txn_snapshot "$txn_dir" "$with_nft"; then
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "无法创建删除前快照"
@@ -2444,24 +2745,29 @@ _delete_relay() {
     fi
 
     if [ "$failed" = "true" ] || ! _restart_checked; then
-        _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
-        _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-        _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
-        _manage_service restart >/dev/null 2>&1 || true
-        _txn_cleanup "$txn_dir"
+        if _txn_rollback "$txn_dir"; then
+            _error "删除失败，已恢复原配置"
+        fi
         _state_lock_release
-        _error "删除失败，已恢复原配置"
         return 1
     fi
 
-    rm -f -- "${RELAY_AUX_DIR}/${in_tag}.pem" "${RELAY_AUX_DIR}/${in_tag}.key"
+    rm -f -- "${RELAY_AUX_DIR}/${in_tag}.pem" "${RELAY_AUX_DIR}/${in_tag}.key" || failed=true
     if [[ "$port_hopping" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-        _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$relay_port" "singboxlite-relay-hop-${in_tag}"
-        _save_nftables_rules
-        _info "已卸载绑定的 nftables UDP 端口跳跃范围转发规则 (${port_hopping})"
+        _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$relay_port" "singboxlite-relay-hop-${in_tag}" || failed=true
+        _save_nftables_rules || failed=true
     fi
-    _txn_cleanup "$txn_dir"
+    if [ "$failed" = true ]; then
+        if _txn_rollback "$txn_dir"; then
+            _error "删除中转资产失败，已恢复原配置"
+        fi
+        _state_lock_release
+        return 1
+    fi
+    local commit_rc=0
+    _txn_finish "$txn_dir" || commit_rc=1
     _state_lock_release
+    [ "$commit_rc" -eq 0 ] || return 1
     _success "已移除中转链路 [$in_tag]。"
 }
 
@@ -2537,12 +2843,11 @@ _modify_relay_port() {
         new_link=$(printf '%s' "$current_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g")
     fi
 
-    local txn_dir tmp failed="false"
+    local txn_dir tmp failed="false" with_nft=false
+    [[ "$hop_info" =~ ^[0-9]+-[0-9]+$ ]] && with_nft=true
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
+    if ! _relay_txn_snapshot "$txn_dir" "$with_nft"; then
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "无法创建修改前快照"
@@ -2576,39 +2881,34 @@ _modify_relay_port() {
     fi
 
     if [ "$failed" = "true" ] || ! _restart_checked; then
-        _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
-        _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-        _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
-        _manage_service restart >/dev/null 2>&1 || true
-        _txn_cleanup "$txn_dir"
+        if _txn_rollback "$txn_dir"; then
+            _error "端口修改失败，已恢复原配置"
+        fi
         _state_lock_release
-        _error "端口修改失败，已恢复原配置"
         return 1
     fi
 
     if [[ "$hop_info" =~ ^([0-9]+)-([0-9]+)$ ]]; then
         local hop_start="${BASH_REMATCH[1]}" hop_end="${BASH_REMATCH[2]}"
-        if ! _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$new_port" "singboxlite-relay-hop-${in_tag}"; then
-            _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
-            _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-            _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
-            _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$old_port" "singboxlite-relay-hop-${in_tag}" >/dev/null 2>&1 || true
-            _manage_service restart >/dev/null 2>&1 || true
-            _save_nftables_rules
-            _txn_cleanup "$txn_dir"
+        if ! _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$new_port" "singboxlite-relay-hop-${in_tag}" ||
+            ! _save_nftables_rules; then
+            if _txn_rollback "$txn_dir"; then
+                _error "端口跳跃规则更新失败，已恢复原端口"
+            fi
             _state_lock_release
-            _error "端口跳跃规则更新失败，已恢复原端口"
             return 1
         fi
-        _save_nftables_rules
         _info "已将端口跳跃映射从 ${old_port} 联动更新到 ${new_port}"
     fi
 
-    _txn_cleanup "$txn_dir"
+    local commit_rc=0
+    _txn_finish "$txn_dir" || commit_rc=1
     _state_lock_release
+    [ "$commit_rc" -eq 0 ] || return 1
     _log_operation "MODIFY_RELAY_PORT" "Tag: $in_tag, Old Port: $old_port, New Port: $new_port"
     _success "中转端口已修改并通过组合配置校验"
-    read -p "  按回车键继续..."
+    read -p "  按回车键继续..." || true
+    return 0
 }
 
 
@@ -3209,18 +3509,10 @@ _pf_add() {
     local target_family=""
     local resolved_ip=""
     local target_is_domain="false"
-    local txn_dir apply_ok="false"
+    local txn_dir apply_ok="false" with_nft=false
+    [ "$PF_ENGINE" != nftables ] || with_nft=true
     _state_lock_acquire || return 1
-    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$RELAY_CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" pf "$PF_METADATA_FILE"; then
-        _txn_cleanup "$txn_dir"
-        _state_lock_release
-        _error "无法创建端口转发状态快照"
-        return 1
-    fi
     if _network_port_conflict "$listen_port" "$network"; then
-        _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "提交前发现 ${network_display} 端口 ${listen_port} 已被占用"
         return 1
@@ -3230,50 +3522,45 @@ _pf_add() {
         resolved_payload=$(_pf_prepare_nft_target "$target_addr")
         if [ $? -ne 0 ] || [ -z "$resolved_payload" ]; then
             _error "目标地址无法解析为可用的 IPv4/IPv6，无法创建 nftables 转发规则"
-            _txn_cleanup "$txn_dir"
             _state_lock_release
-            read -p "  按回车继续..."; return
+            read -p "  按回车继续..." || true
+            return 1
         fi
         IFS=$'\t' read -r target_family resolved_ip target_is_domain <<< "$resolved_payload"
         [ "$target_is_domain" == "true" ] && _success "域名已解析: $target_addr -> $resolved_ip (${target_family})"
-        _pf_enable_forwarding
-        if ! _pf_apply_nft_rules "add" "$listen_port" "$resolved_ip" "$target_port" "$network" "$target_family"; then
-            _error "nftables 规则写入失败"
-            _txn_cleanup "$txn_dir"
-            _state_lock_release
-            read -p "  按回车继续..."; return
+    fi
+    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
+    if ! _pf_txn_snapshot "$txn_dir" "$with_nft"; then
+        _txn_cleanup "$txn_dir"
+        _state_lock_release
+        _error "无法创建端口转发状态快照"
+        return 1
+    fi
+    if [ "$PF_ENGINE" = nftables ]; then
+        if _pf_enable_forwarding &&
+            _pf_apply_nft_rules add "$listen_port" "$resolved_ip" "$target_port" "$network" "$target_family" &&
+            _save_nftables_rules; then
+            apply_ok=true
         fi
-        _save_nftables_rules
-        apply_ok="true"
     else
-        if ! _pf_apply_singbox_rules "add" "$listen_port" "$target_addr" "$target_port" "$network"; then
-            _error "配置写入失败"
-            _txn_cleanup "$txn_dir"
-            _state_lock_release
-            read -p "  按回车继续..."; return
-        fi
-        if _restart_checked; then
+        if _pf_apply_singbox_rules add "$listen_port" "$target_addr" "$target_port" "$network" &&
+            _restart_checked; then
             apply_ok="true"
         fi
     fi
 
     if [ "$apply_ok" != "true" ] || ! _pf_store_metadata "$listen_port" "$PF_ENGINE" "$custom_name" "$target_addr" "$target_port" "$network" "$network_display" "$target_family" "$resolved_ip" "$target_is_domain"; then
-        _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
-        _txn_restore_file "$txn_dir" pf "$PF_METADATA_FILE"
-        if [ "$PF_ENGINE" == "nftables" ]; then
-            _pf_apply_nft_rules "delete" "$listen_port" "$resolved_ip" "$target_port" "$network" "$target_family"
-            _save_nftables_rules
-        else
-            _manage_service restart >/dev/null 2>&1 || true
+        if _txn_rollback "$txn_dir"; then
+            _error "端口转发创建失败，已恢复原配置"
         fi
-        _txn_cleanup "$txn_dir"
         _state_lock_release
-        _error "端口转发创建失败，已恢复原配置"
-        read -p "  按回车继续..."
+        read -p "  按回车继续..." || true
         return 1
     fi
-    _txn_cleanup "$txn_dir"
+    local commit_rc=0
+    _txn_finish "$txn_dir" || commit_rc=1
     _state_lock_release
+    [ "$commit_rc" -eq 0 ] || return 1
 
     echo ""
     _success "端口转发规则已添加并生效！"
@@ -3286,63 +3573,25 @@ _pf_add() {
     fi
     echo ""
     _pf_auto_manage_dns_cron
-    read -p "  按回车继续..."
+    read -p "  按回车继续..." || true
+    return 0
 }
 
 # PF 删除和引擎切换必须同时保存运行表与持久化文件，不能靠重新生成近似规则回滚。
 _pf_txn_snapshot() {
-    local dir="$1" with_nft="$2" tables
+    local dir="$1" with_nft="$2"
     _txn_snapshot_file "$dir" relay "$RELAY_CONFIG_FILE" &&
         _txn_snapshot_file "$dir" pf "$PF_METADATA_FILE" || return 1
-    if [ "$with_nft" = true ]; then
-        _txn_snapshot_file "$dir" nft-persist "$NFT_PERSIST_FILE" &&
-            _txn_snapshot_file "$dir" nft-config "${NFT_CONFIG_FILE:-/etc/nftables.conf}" || return 1
-        tables=$(nft list tables 2>/dev/null) || return 1
-        if grep -Fxq "table inet $NFT_TABLE" <<< "$tables"; then
-            nft list table inet "$NFT_TABLE" > "$dir/nft-table" || return 1
-        else
-            : > "$dir/nft-table.absent" || return 1
-        fi
-        : > "$dir/with-nft" || return 1
-    fi
-    : > "$dir/complete"
+    [ "$with_nft" != true ] || _txn_snapshot_nft "$dir" || return 1
+    _txn_activate "$dir" pf
 }
 
 _pf_txn_restore() {
-    local dir="$1" rc=0 tables
-    [ -f "$dir/complete" ] || return 1
-    _txn_restore_file "$dir" relay "$RELAY_CONFIG_FILE" || rc=1
-    _txn_restore_file "$dir" pf "$PF_METADATA_FILE" || rc=1
-    if [ -f "$dir/with-nft" ]; then
-        # 将删除当前表和加载旧表放在同一 nft batch 中，失败不会先清空运行表。
-        tables=$(nft list tables 2>/dev/null) || rc=1
-        if [ "$rc" -eq 0 ]; then
-            : > "$dir/nft-restore" || return 1
-            if grep -Fxq "table inet $NFT_TABLE" <<< "$tables"; then
-                printf 'delete table inet %s\n' "$NFT_TABLE" >> "$dir/nft-restore" || return 1
-            fi
-            if [ -f "$dir/nft-table" ]; then
-                cat "$dir/nft-table" >> "$dir/nft-restore" || return 1
-            fi
-            nft -f "$dir/nft-restore" || rc=1
-        fi
-        _txn_restore_file "$dir" nft-persist "$NFT_PERSIST_FILE" || rc=1
-        _txn_restore_file "$dir" nft-config "${NFT_CONFIG_FILE:-/etc/nftables.conf}" || rc=1
-    fi
-    _restart_checked || rc=1
-    if [ "$rc" -ne 0 ]; then
-        _error "端口转发恢复失败，快照保留在: $dir"
-    fi
-    return "$rc"
+    _txn_restore_state "$1"
 }
 
 _pf_txn_cleanup() {
-    local dir="$1" key
-    for key in nft-persist nft-config nft-table; do
-        rm -f -- "$dir/$key" "$dir/$key.absent"
-    done
-    rm -f -- "$dir/nft-restore" "$dir/with-nft" "$dir/complete"
-    _txn_cleanup "$dir"
+    _txn_cleanup "$1"
 }
 
 _pf_delete() {
@@ -3404,15 +3653,16 @@ _pf_delete() {
 
     updated_meta=$(jq --arg p "$selected_port" 'del(.[$p])' "$PF_METADATA_FILE") || delete_ok="false"
     if [ "$delete_ok" != "true" ] || ! _atomic_write_json "$PF_METADATA_FILE" "$updated_meta"; then
-        if _pf_txn_restore "$txn_dir"; then
-            _pf_txn_cleanup "$txn_dir"
+        if _txn_rollback "$txn_dir"; then
             _error "端口转发删除失败，已恢复原规则"
         fi
         _state_lock_release
         return 1
     fi
-    _pf_txn_cleanup "$txn_dir"
+    local commit_rc=0
+    _txn_finish "$txn_dir" || commit_rc=1
     _state_lock_release
+    [ "$commit_rc" -eq 0 ] || return 1
 
     _success "已删除端口 ${selected_port} 的转发规则"
     _pf_auto_manage_dns_cron
@@ -3508,95 +3758,69 @@ _pf_modify() {
         fi
     fi
 
-    local old_resolved=$(jq -r ".\"$selected_port\".resolved_ip // empty" "$PF_METADATA_FILE")
-    local old_del_dest="${old_resolved:-$old_addr}"
-    local old_family=$(jq -r ".\"$selected_port\".target_family // empty" "$PF_METADATA_FILE")
-    [ -z "$old_family" ] && old_family=$(_pf_guess_target_family "$old_del_dest")
-
-    local delete_ok="true"
-    if [ "$old_engine" == "nftables" ]; then
-        _pf_apply_nft_rules "delete" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family"
-    else
-        if ! _pf_apply_singbox_rules "delete" "$selected_port"; then
-            delete_ok="false"
-        fi
-    fi
-
-    if [ "$delete_ok" != "true" ]; then
-        _error "旧规则删除失败，已取消修改"
-        read -p "  按回车继续..."; return
-    fi
-
-    local target_family=""
-    local resolved_ip=""
-    local target_is_domain="false"
-    local apply_ok="false"
-    if [ "$PF_ENGINE" == "nftables" ]; then
-        local resolved_payload=""
-        resolved_payload=$(_pf_prepare_nft_target "$new_addr")
-        if [ $? -ne 0 ] || [ -z "$resolved_payload" ]; then
-            _error "目标地址无法解析为可用的 IPv4/IPv6，正在恢复旧规则..."
-            if [ "$old_engine" == "nftables" ]; then
-                _pf_apply_nft_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1
-                _save_nftables_rules
-            else
-                _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1
-            fi
-            _error "修改失败，已恢复旧规则"
-            read -p "  按回车继续..."; return
-        fi
-        IFS=$'\t' read -r target_family resolved_ip target_is_domain <<< "$resolved_payload"
-        [ "$target_is_domain" == "true" ] && _success "域名已解析: $new_addr -> $resolved_ip (${target_family})"
-        if _pf_apply_nft_rules "add" "$selected_port" "$resolved_ip" "$new_tport" "$new_net" "$target_family"; then
-            apply_ok="true"
-            _save_nftables_rules
-        fi
-    else
-        if _pf_apply_singbox_rules "add" "$selected_port" "$new_addr" "$new_tport" "$new_net"; then
-            if _restart_checked; then
-                apply_ok="true"
-            else
-                _pf_apply_singbox_rules "delete" "$selected_port" >/dev/null 2>&1
-            fi
-        fi
-    fi
-
-    if [ "$apply_ok" != "true" ]; then
-        _error "新规则创建失败，正在恢复旧规则..."
-        if [ "$old_engine" == "nftables" ]; then
-            _pf_apply_nft_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1
-            _save_nftables_rules
-        else
-            _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1
-        fi
-        _error "修改失败，已恢复旧规则"
-        read -p "  按回车继续..."; return
-    fi
-
-    if ! _pf_store_metadata "$selected_port" "$PF_ENGINE" "$new_name" "$new_addr" "$new_tport" "$new_net" "$new_net_display" "$target_family" "$resolved_ip" "$target_is_domain"; then
-        _error "metadata 更新失败，正在恢复原规则..."
-        if [ "$PF_ENGINE" == "nftables" ]; then
-            _pf_apply_nft_rules "delete" "$selected_port" "$resolved_ip" "$new_tport" "$new_net" "$target_family" >/dev/null 2>&1 || true
-        else
-            _pf_apply_singbox_rules "delete" "$selected_port" >/dev/null 2>&1 || true
-        fi
-        if [ "$old_engine" == "nftables" ]; then
-            _pf_apply_nft_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1 || true
-            _save_nftables_rules
-        else
-            _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 || true
-            _manage_service restart >/dev/null 2>&1 || true
-        fi
-        _error "修改失败，已恢复原规则"
-        read -p "  按回车继续..."
-        return 1
-    fi
+    local modify_rc=0
+    _state_lock_acquire || return 1
+    _pf_modify_apply "$selected_port" "$new_name" "$new_addr" "$new_tport" "$new_net" "$new_net_display" || modify_rc=1
+    _state_lock_release
+    [ "$modify_rc" -eq 0 ] || return 1
 
     _success "转发规则已修改并生效！"
     echo -e "  【${new_name}】本机端口: ${GREEN}${selected_port}${NC} -> 目标: ${GREEN}${new_addr}:${new_tport}${NC}  [${new_net_display}]"
     [ "$PF_PUBLISH_HINT" == "true" ] && echo -e "  ${YELLOW}提示: Docker/Podman 桥接网络下，请确保宿主机已发布 ${selected_port}/${new_net}${NC}"
     _pf_auto_manage_dns_cron
-    read -p "  按回车继续..."
+    read -p "  按回车继续..." || true
+    return 0
+}
+
+_pf_modify_apply() {
+    local port="$1" name="$2" addr="$3" tport="$4" net="$5" display="$6"
+    local old_engine old_addr old_tport old_net old_dest old_family payload
+    local family="" ip="" is_domain=false with_nft=false txn_dir rc=0
+    payload=$(jq -er --arg p "$port" '.[$p] | select(. != null) |
+        [.engine, .target_addr, (.target_port|tostring), .network,
+         (.resolved_ip // .target_addr), (.target_family // "")] | @tsv' "$PF_METADATA_FILE") || return 1
+    IFS=$'\t' read -r old_engine old_addr old_tport old_net old_dest old_family <<< "$payload"
+    [ -n "$old_family" ] || old_family=$(_pf_guess_target_family "$old_dest")
+    if [ "$PF_ENGINE" = nftables ]; then
+        payload=$(_pf_prepare_nft_target "$addr") || return 1
+        [ -n "$payload" ] || return 1
+        IFS=$'\t' read -r family ip is_domain <<< "$payload"
+    fi
+    if [ "$old_engine" = nftables ] || [ "$PF_ENGINE" = nftables ]; then with_nft=true; fi
+    txn_dir=$(_txn_begin) || return 1
+    if ! _pf_txn_snapshot "$txn_dir" "$with_nft"; then
+        _txn_cleanup "$txn_dir"
+        return 1
+    fi
+    if [ "$old_engine" = nftables ]; then
+        _pf_apply_nft_rules delete "$port" "$old_dest" "$old_tport" "$old_net" "$old_family" || rc=1
+    else
+        _pf_apply_singbox_rules delete "$port" || rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
+        if [ "$PF_ENGINE" = nftables ]; then
+            _pf_enable_forwarding &&
+                _pf_apply_nft_rules add "$port" "$ip" "$tport" "$net" "$family" || rc=1
+        else
+            _pf_apply_singbox_rules add "$port" "$addr" "$tport" "$net" || rc=1
+        fi
+    fi
+    if [ "$rc" -eq 0 ] && { [ "$old_engine" = singbox ] || [ "$PF_ENGINE" = singbox ]; }; then
+        _restart_checked || rc=1
+    fi
+    if [ "$rc" -eq 0 ] && [ "$with_nft" = true ]; then
+        _save_nftables_rules || rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
+        _pf_store_metadata "$port" "$PF_ENGINE" "$name" "$addr" "$tport" "$net" "$display" "$family" "$ip" "$is_domain" || rc=1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        if _txn_rollback "$txn_dir"; then
+            _error "修改失败，已恢复原规则"
+        fi
+        return 1
+    fi
+    _txn_finish "$txn_dir"
 }
 
 _pf_clear() {
@@ -3610,11 +3834,17 @@ _pf_clear() {
     read -p "  (y/N): " confirm
     if [ "$confirm" != "y" ]; then return; fi
 
-    local need_singbox_restart=false failed="false" txn_dir
+    local need_singbox_restart=false with_nft=false failed=false txn_dir rows rc=0
     _state_lock_acquire || return 1
+    rows=$(jq -r 'to_entries[] | [.key, .value.engine, .value.target_addr, (.value.target_port|tostring), .value.network, (.value.resolved_ip // "null"), (.value.target_family // "null")] | @tsv' "$PF_METADATA_FILE") || {
+        _state_lock_release
+        return 1
+    }
+    if jq -e '[.[] | select(.engine == "nftables")] | length > 0' "$PF_METADATA_FILE" >/dev/null; then
+        with_nft=true
+    fi
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$RELAY_CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" pf "$PF_METADATA_FILE"; then
+    if ! _pf_txn_snapshot "$txn_dir" "$with_nft"; then
         _txn_cleanup "$txn_dir"
         _state_lock_release
         return 1
@@ -3628,45 +3858,40 @@ _pf_clear() {
         fi
 
         if [ "$engine" == "nftables" ]; then
-            _pf_apply_nft_rules "delete" "$port" "$del_dest" "$tport" "$net" "$family"
+            _pf_apply_nft_rules "delete" "$port" "$del_dest" "$tport" "$net" "$family" || failed=true
         else
-            _pf_apply_singbox_rules "delete" "$port" || failed="true"
+            _pf_apply_singbox_rules "delete" "$port" || failed=true
             need_singbox_restart=true
         fi
-    done < <(jq -r 'to_entries[] | [.key, .value.engine, .value.target_addr, (.value.target_port|tostring), .value.network, (.value.resolved_ip // "null"), (.value.target_family // "null")] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
+        [ "$failed" = false ] || break
+    done <<< "$rows"
 
-    _atomic_write_json "$PF_METADATA_FILE" '{}' || failed="true"
-    _save_nftables_rules
-    if [ "$need_singbox_restart" = true ]; then
-        _restart_checked || failed="true"
+    if [ "$failed" = false ]; then
+        _atomic_write_json "$PF_METADATA_FILE" '{}' || failed=true
+        if [ "$with_nft" = true ]; then
+            _save_nftables_rules || failed=true
+        fi
+        if [ "$need_singbox_restart" = true ]; then
+            _restart_checked || failed=true
+        fi
     fi
 
     if [ "$failed" = "true" ]; then
-        _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
-        _txn_restore_file "$txn_dir" pf "$PF_METADATA_FILE"
-        while IFS=$'\t' read -r port engine addr tport net resolved family; do
-            [ "$engine" = "nftables" ] || continue
-            local restore_dest="${resolved:-$addr}"
-            [ "$restore_dest" = "null" ] && restore_dest="$addr"
-            if [ -z "$family" ] || [ "$family" = "null" ]; then
-                family=$(_pf_guess_target_family "$restore_dest")
-            fi
-            _pf_apply_nft_rules "add" "$port" "$restore_dest" "$tport" "$net" "$family" >/dev/null 2>&1 || true
-        done < <(jq -r 'to_entries[] | [.key, .value.engine, .value.target_addr, (.value.target_port|tostring), .value.network, (.value.resolved_ip // "null"), (.value.target_family // "null")] | @tsv' "$txn_dir/pf" 2>/dev/null)
-        _save_nftables_rules
-        _manage_service restart >/dev/null 2>&1 || true
-        _txn_cleanup "$txn_dir"
+        if _txn_rollback "$txn_dir"; then
+            _error "清空端口转发失败，已恢复原规则"
+        fi
         _state_lock_release
-        _error "清空端口转发失败，已恢复原规则"
         return 1
     fi
 
-    _txn_cleanup "$txn_dir"
+    _txn_finish "$txn_dir" || rc=1
     _state_lock_release
+    [ "$rc" -eq 0 ] || return 1
 
     _success "所有端口转发规则已清空"
     _pf_auto_manage_dns_cron
-    read -p "  按回车继续..."
+    read -p "  按回车继续..." || true
+    return 0
 }
 
 _pf_dns_log() {
@@ -3674,10 +3899,20 @@ _pf_dns_log() {
 }
 
 _pf_dns_refresh() {
+    local acquired=false rc=0
+    if [ "${SINGBOXLITE_LOCK_HELD:-0}" != 1 ]; then
+        _state_lock_acquire || return 1
+        acquired=true
+    fi
+    _pf_dns_refresh_locked || rc=$?
+    [ "$acquired" != true ] || _state_lock_release
+    return "$rc"
+}
+
+_pf_dns_refresh_locked() {
     [ ! -f "$PF_METADATA_FILE" ] && return 0
-    local updated=false
     local refresh_list=""
-    local refresh_status=0
+    local refresh_status=0 txn_dir
 
     # 不使用“jq | while”管道，避免循环在子 Shell 中运行后丢失 updated 状态。
     refresh_list=$(mktemp /tmp/singboxlite-pf-dns.XXXXXX) || return 1
@@ -3712,36 +3947,36 @@ _pf_dns_refresh() {
         [ "$new_ip" == "$old_ip" ] && continue
 
         _pf_dns_log "域名 $addr 的 IP 已变化: $old_ip -> $new_ip (端口 $port)"
+        txn_dir=$(_txn_begin) || { refresh_status=1; break; }
+        if ! _pf_txn_snapshot "$txn_dir" true; then
+            _txn_cleanup "$txn_dir"
+            refresh_status=1
+            break
+        fi
         if ! _pf_apply_nft_rules "add" "$port" "$new_ip" "$tport" "$network" "$family"; then
             refresh_status=1
             _pf_dns_log "更新端口 $port 的 nftables 规则失败，尝试恢复旧地址 $old_ip"
-            if ! _pf_apply_nft_rules "add" "$port" "$old_ip" "$tport" "$network" "$family" >/dev/null 2>&1; then
-                _pf_dns_log "端口 $port 恢复旧规则也失败，请检查 nftables 权限及规则状态"
-            fi
+            _txn_rollback "$txn_dir" || break
             continue
         fi
 
         local refreshed_meta
         refreshed_meta=$(jq --arg p "$port" --arg ip "$new_ip" '.[$p].resolved_ip = $ip' "$PF_METADATA_FILE")
-        if [ -z "$refreshed_meta" ] || ! _atomic_write_json "$PF_METADATA_FILE" "$refreshed_meta"; then
+        if [ -z "$refreshed_meta" ] || ! _atomic_write_json "$PF_METADATA_FILE" "$refreshed_meta" ||
+            ! _save_nftables_rules; then
             refresh_status=1
-            _pf_dns_log "更新端口 $port 的元数据失败，尝试恢复旧地址 $old_ip"
-            if ! _pf_apply_nft_rules "add" "$port" "$old_ip" "$tport" "$network" "$family" >/dev/null 2>&1; then
-                _pf_dns_log "端口 $port 恢复旧规则也失败，请检查 nftables 权限及规则状态"
-            fi
+            _pf_dns_log "更新端口 $port 的元数据或持久化失败，尝试恢复旧地址 $old_ip"
+            _txn_rollback "$txn_dir" || break
             continue
         fi
 
-        updated=true
+        if ! _txn_finish "$txn_dir"; then
+            refresh_status=1
+            break
+        fi
         _pf_dns_log "端口 $port 已同步到 $new_ip:$tport ($network)"
     done < "$refresh_list"
 
-    if [ "$updated" = true ]; then
-        if ! _save_nftables_rules; then
-            _pf_dns_log "nftables 运行规则已更新，但持久化失败，请检查磁盘空间及配置目录权限"
-            refresh_status=1
-        fi
-    fi
     rm -f "$refresh_list"
     return "$refresh_status"
 }
@@ -3796,13 +4031,12 @@ _pf_switch_engine_apply() {
         fi
     fi
     if [ "$ok" != true ]; then
-        if _pf_txn_restore "$txn_dir"; then
-            _pf_txn_cleanup "$txn_dir"
+        if _txn_rollback "$txn_dir"; then
             _error "引擎切换失败，已恢复原状态"
         fi
         return 1
     fi
-    _pf_txn_cleanup "$txn_dir"
+    _txn_finish "$txn_dir"
 }
 
 _pf_switch_engine() {
@@ -3907,9 +4141,11 @@ _pf_switch_engine_locked() {
 }
 
 _port_forward_menu() {
+    _relay_write_boundary || return 1
     # 进入菜单时同步修复已有 DDNS 规则的 cron 周期和脚本路径。
     _pf_auto_manage_dns_cron
     while true; do
+        _relay_write_boundary || return 1
         clear
         local count=$(_pf_count)
         echo -e "${CYAN}"
@@ -3943,11 +4179,14 @@ _port_forward_menu() {
 
 _menu() {
     _check_root || return 1
+    _relay_recover_pending || return 1
+    _relay_assert_no_foreign_pending || return 1
     _check_deps || return 1
     _install_yq || return 1
     _init_relay_dirs || return 1
 
     while true; do
+        _relay_write_boundary || return 1
         clear
         # ASCII Logo (对齐主脚本)
         echo -e "${CYAN}"
@@ -4086,6 +4325,7 @@ _warp_require_core() {
 # 而 WARP 的过滤表达式必须靠参数注入 JSON，避免拼接引号出错。
 _warp_jq_apply() { # 文件 过滤表达式 [jq 参数...]
     local file="$1" filter="$2"
+    [ "${RELAY_TX_BLOCKED:-0}" = 0 ] || return 1
     shift 2
     [ -f "$file" ] || return 1
     local acquired="false" tmp rc=0
@@ -4220,8 +4460,10 @@ _warp_build_endpoint_json() {
 }
 
 _warp_candidate_inbounds() {
+    local tags
     [ -s "$MAIN_CONFIG_FILE" ] || return 0
-    jq -r '(.inbounds // [])[].tag // empty' "$MAIN_CONFIG_FILE" 2>/dev/null | grep -vE '^(argo-|pf-in-)' | sort -u
+    tags=$(jq -r '(.inbounds // [])[].tag // empty | select(test("^(argo-|pf-in-)") | not)' "$MAIN_CONFIG_FILE" 2>/dev/null) || return 1
+    [ -z "$tags" ] || printf '%s\n' "$tags" | tr -d '\r' | sort -u
 }
 
 _warp_endpoint_installed() {
@@ -4394,12 +4636,17 @@ _warp_select_peer() {
 # 规则顺序为「其他规则 → 节点规则 → 域名规则 → IP 规则」，节点规则优先，
 # 保证「整条节点流量走 WARP」的语义不受域名规则影响。
 _warp_sync_relay() { # [drop] 强行摘除该出口（卸载时用）
-    local mode="${1:-keep}" ep_json rules_json nodes_json cands
+    local mode="${1:-keep}" ep_json rules_json nodes_json cands tags
     if [ "$mode" = "drop" ]; then
         ep_json="null"
+        rules_json='{"domain_suffix":[],"ip_cidr":[]}'
+        nodes_json='[]'
+        cands='[]'
     else
-        ep_json=$(_warp_build_endpoint_json 2>/dev/null)
-        [ -n "$ep_json" ] || ep_json="null"
+        ep_json=$(_warp_build_endpoint_json 2>/dev/null) && [ -n "$ep_json" ] || {
+            _error "无法读取 WARP 注册状态"
+            return 1
+        }
         # 地址族可能把该账号唯一可用的地址排除掉，此时写空的 address
         # 会让 endpoint 无法启动，必须在落盘前拦住。
         if [ "$ep_json" != "null" ] \
@@ -4407,13 +4654,14 @@ _warp_sync_relay() { # [drop] 强行摘除该出口（卸载时用）
             _error "当前出口地址族没有任何可用地址，请先在 [5] 切换地址族"
             return 1
         fi
+        rules_json=$(jq -c '{domain_suffix: ((.domain_suffix // []) | map(select(type == "string"))), ip_cidr: ((.ip_cidr // []) | map(select(type == "string")))}' "$WARP_RULES_FILE" 2>/dev/null) &&
+            nodes_json=$(jq -c '[.[]? | select(type == "string")]' "$WARP_NODES_FILE" 2>/dev/null) &&
+            tags=$(_warp_candidate_inbounds) &&
+            cands=$(printf '%s\n' "$tags" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null) || {
+            _error "无法读取 WARP 分流状态或主配置，已取消同步"
+            return 1
+        }
     fi
-    rules_json=$(jq -c '{domain_suffix: ((.domain_suffix // []) | map(select(type == "string"))), ip_cidr: ((.ip_cidr // []) | map(select(type == "string")))}' "$WARP_RULES_FILE" 2>/dev/null)
-    [ -n "$rules_json" ] || rules_json='{"domain_suffix":[],"ip_cidr":[]}'
-    nodes_json=$(jq -c '[.[]? | select(type == "string")]' "$WARP_NODES_FILE" 2>/dev/null)
-    [ -n "$nodes_json" ] || nodes_json='[]'
-    cands=$(_warp_candidate_inbounds | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)
-    [ -n "$cands" ] || cands='[]'
     _warp_jq_apply "$RELAY_CONFIG_FILE" '
         ($ep // null) as $e
         | ($rules.domain_suffix // []) as $ds
@@ -4446,10 +4694,11 @@ _warp_selfcheck() { # [verbose]
     ep_json=$(_warp_build_endpoint_json 2>/dev/null)
     [ -n "$ep_json" ] && [ "$ep_json" != "null" ] || return 1
     dir=$(mktemp -d "${TMPDIR:-/tmp}/singboxlite-warp-probe.XXXXXX") || return 1
+    WARP_PROBE_DIR="$dir"
     conf="${dir}/probe.json"
     errtxt="${dir}/probe.err"
     if ! port=$(_warp_pick_free_port); then
-        rm -rf -- "$dir"
+        _relay_probe_cleanup
         return 1
     fi
     if ! jq -n --argjson ep "$ep_json" --argjson port "$port" '
@@ -4461,16 +4710,21 @@ _warp_selfcheck() { # [verbose]
           route: {rules: [], final: $ep.tag}
         }' > "$conf"; then
         _error "无法生成 WARP 自检配置"
-        rm -rf -- "$dir"
+        _relay_probe_cleanup
         return 1
     fi
     if ! "$SINGBOX_BIN" check -c "$conf" >/dev/null 2>"$errtxt"; then
         _error "WARP 自检配置校验失败: $(head -n 2 "$errtxt" 2>/dev/null | tr '\n' ' ')"
-        rm -rf -- "$dir"
+        _relay_probe_cleanup
         return 1
     fi
-    "$SINGBOX_BIN" run -c "$conf" >>"$errtxt" 2>&1 &
+    if [ "${STATE_LOCK_OWNED:-false}" = true ] && [[ "${STATE_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
+        "$SINGBOX_BIN" run -c "$conf" >>"$errtxt" 2>&1 8>&- 9>&- 219>&- {STATE_LOCK_FD}>&- &
+    else
+        "$SINGBOX_BIN" run -c "$conf" >>"$errtxt" 2>&1 8>&- 9>&- 219>&- &
+    fi
     pid=$!
+    WARP_PROBE_PID="$pid"
     for i in $(seq 1 "$tries"); do
         sleep 1
         elapsed=$(curl -s --max-time "$max_t" --socks5-hostname "127.0.0.1:${port}" \
@@ -4484,6 +4738,7 @@ _warp_selfcheck() { # [verbose]
     done
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
+    WARP_PROBE_PID=""
     if [ "$rc" -eq 0 ]; then
         WARP_TRACE_RESULT=$(printf '%s' "$trace" | grep -E '^(warp|ip|loc)=' | tr '\n' ' ')
         # 首包耗时用于判断「能握手但转发慢」，供入口选择排掉慢入口。
@@ -4496,21 +4751,29 @@ _warp_selfcheck() { # [verbose]
             _warn "sing-box 输出: $(grep -iE 'error|fatal' "$errtxt" 2>/dev/null | head -n 2 | tr '\n' ' ')"
         fi
     fi
-    rm -rf -- "$dir"
+    _relay_probe_cleanup || rc=1
     return "$rc"
 }
 
 _warp_commit() { # [yes|no] 是否执行出口自检 [keep|drop] 是否摘除出口
     local want_check="${1:-yes}" sync_mode="${2:-keep}" txn_dir rc=0
+    if [ "$#" -ge 2 ]; then shift 2; else shift "$#"; fi
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$RELAY_CONFIG_FILE"; then
+    if ! _txn_snapshot_file "$txn_dir" relay "$RELAY_CONFIG_FILE" ||
+        ! _txn_snapshot_file "$txn_dir" warp-reg "$WARP_REG_FILE" ||
+        ! _txn_snapshot_file "$txn_dir" warp-rules "$WARP_RULES_FILE" ||
+        ! _txn_snapshot_file "$txn_dir" warp-nodes "$WARP_NODES_FILE" ||
+        ! _txn_activate "$txn_dir" warp; then
         _error "无法创建 WARP 状态快照，已取消本次操作"
         _txn_cleanup "$txn_dir"
         _state_lock_release
         return 1
     fi
-    if ! _warp_sync_relay "$sync_mode"; then
+    if ! _warp_ensure_state_files || { [ "$#" -gt 0 ] && ! "$@"; }; then
+        _error "修改 WARP 状态失败"
+        rc=1
+    elif ! _warp_sync_relay "$sync_mode"; then
         _error "写入 WARP 出口配置失败"
         rc=1
     elif ! _check_combined_config 2>/dev/null; then
@@ -4523,16 +4786,15 @@ _warp_commit() { # [yes|no] 是否执行出口自检 [keep|drop] 是否摘除出
         rc=1
     fi
     if [ "$rc" -ne 0 ]; then
-        _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
-        _manage_service restart >/dev/null 2>&1 || true
-        _txn_cleanup "$txn_dir"
+        if _txn_rollback "$txn_dir"; then
+            _error "WARP 出口更新失败，已恢复原状态"
+        fi
         _state_lock_release
-        _error "WARP 出口更新失败，已恢复原配置"
         return 1
     fi
-    _txn_cleanup "$txn_dir"
+    _txn_finish "$txn_dir" || rc=1
     _state_lock_release
-    return 0
+    return "$rc"
 }
 
 _warp_register_device() {
@@ -4618,20 +4880,16 @@ _warp_install() {
         read -r -p "  重新注册会获得新的 WARP 身份，确认继续？(y/N): " ans
         [ "$ans" = "y" ] || { _info "已取消"; return 0; }
     fi
+    _warp_commit yes keep _warp_register_and_select || return 1
+    _success "WARP 出口已启用"
+    _warp_print_summary
+}
+
+_warp_register_and_select() {
     _warp_register_device || return 1
     # 注册只给出「隧道内地址」；能不能连上取决于本机的出站传输能力，
     # 必须在写配置前把入口地址试出来，否则会拿到一份连不通的配置。
-    if ! _warp_select_peer; then
-        _warn "注册信息已保留（${WARP_REG_FILE}），排除故障后可从菜单 [1] 重试"
-        return 1
-    fi
-    _info "正在校验配置并重启服务..."
-    if ! _warp_commit yes; then
-        _warn "注册信息已保留（${WARP_REG_FILE}），排除故障后可从菜单 [1] 重试"
-        return 1
-    fi
-    _success "WARP 出口已启用"
-    _warp_print_summary
+    _warp_select_peer
 }
 _warp_quota_line() {
     local device token
@@ -4717,9 +4975,14 @@ _warp_node_menu() {
     [ "$choice" -eq 0 ] && return 0
     [ "$choice" -le "${#tags[@]}" ] || { _error "无效输入"; return 1; }
     t="${tags[$((choice - 1))]}"
+    _warp_commit yes keep _warp_change_node "$t" || return 1
+    _success "节点分流已更新"
+}
+
+_warp_change_node() {
+    local t="$1"
     if _warp_inbound_bound_to_warp "$t"; then
         _warp_jq_apply "$WARP_NODES_FILE" 'map(select(. != $in))' --arg in "$t" || return 1
-        _info "已解除节点绑定: $t"
     else
         if _warp_inbound_bound_to_relay "$t"; then
             _error "节点 $t 已作为中转入口，不能同时走 WARP"
@@ -4731,14 +4994,13 @@ _warp_node_menu() {
             return 1
         fi
         _warp_jq_apply "$WARP_NODES_FILE" 'if index($in) == null then . + [$in] else . end' --arg in "$t" || return 1
-        _info "已绑定节点: $t"
     fi
-    _warp_commit yes || return 1
-    _success "节点分流已更新"
+    return 0
 }
 
 _warp_domain_menu() {
     local choice entry added skipped item key prompt
+    local -a valid_items
     while true; do
         echo -e "\\n  ${CYAN}【域名 / IP 分流】${NC}"
         echo -e "  域名后缀: ${CYAN}$(jq -r '(.domain_suffix // []) | join(", ")' "$WARP_RULES_FILE" 2>/dev/null)${NC}"
@@ -4763,6 +5025,7 @@ _warp_domain_menu() {
                 [ -n "$(printf '%s' "$entry" | tr -d ' ')" ] || { _error "输入为空"; continue; }
                 added=0
                 skipped=0
+                valid_items=()
                 for item in $entry; do
                     if [ "$key" = "domain_suffix" ]; then
                         if ! _warp_valid_domain "$item"; then
@@ -4777,26 +5040,33 @@ _warp_domain_menu() {
                             continue
                         fi
                     fi
-                    _warp_jq_apply "$WARP_RULES_FILE" \
-                        ".${key} = (((.${key} // []) + [\$item]) | unique)" --arg item "$item" || return 1
+                    valid_items+=("$item")
                     added=$((added + 1))
                 done
                 if [ "$added" -eq 0 ]; then
                     _error "没有有效条目"
                     continue
                 fi
-                _warp_commit yes || return 1
+                _warp_commit yes keep _warp_add_rules "$key" "${valid_items[@]}" || return 1
                 _success "已添加 ${added} 条分流条目（跳过 ${skipped} 条）"
                 ;;
             3)
                 read -r -p "  确认清空全部分流条目？(y/N): " entry
                 [ "$entry" = "y" ] || continue
-                _atomic_write_json "$WARP_RULES_FILE" '{"domain_suffix":[],"ip_cidr":[]}' || return 1
-                _warp_commit yes || return 1
+                _warp_commit yes keep _atomic_write_json "$WARP_RULES_FILE" '{"domain_suffix":[],"ip_cidr":[]}' || return 1
                 _success "分流条目已清空"
                 ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
+    done
+}
+
+_warp_add_rules() {
+    local key="$1" item
+    shift
+    for item in "$@"; do
+        _warp_jq_apply "$WARP_RULES_FILE" \
+            ".${key} = (((.${key} // []) + [\$item]) | unique)" --arg item "$item" || return 1
     done
 }
 
@@ -4825,13 +5095,11 @@ _warp_family_menu() {
     # [4] 只重探入口线路：本机出站能力变化后（换网络、换机器镜像）
     # 不必重新注册就能换到能通的传输上。
     if [ -z "$family" ]; then
-        _warp_select_peer || return 1
-        _warp_commit yes || return 1
+        _warp_commit yes keep _warp_select_peer || return 1
         _success "入口线路已更新为 $(jq -r '.peer_address' "$WARP_REG_FILE")"
         return 0
     fi
-    _atomic_modify_json "$WARP_REG_FILE" ".address_family = \"${family}\"" || return 1
-    _warp_commit yes || return 1
+    _warp_commit yes keep _atomic_modify_json "$WARP_REG_FILE" ".address_family = \"${family}\"" || return 1
     _success "出口地址族已切换为 $(_warp_family_label)"
 }
 
@@ -4854,11 +5122,12 @@ _warp_uninstall() {
 
 _warp_menu() {
     local choice
+    _relay_write_boundary || return 1
     if ! _warp_require_core; then
         return 1
     fi
-    _warp_ensure_state_files || return 1
     while true; do
+        _relay_write_boundary || return 1
         echo ""
         echo -e "  ${CYAN}【WARP 出口】${NC}"
         echo -e "    ${GREEN}[1]${NC} 安装 / 重新注册 WARP"
@@ -4890,6 +5159,11 @@ _warp_menu() {
 
 # 命令行参数解析：支持 cron 定时任务直接调用刷新函数
 case "${1:-}" in
+    recover-pending)
+        _check_root || exit 1
+        _relay_recover_pending
+        exit $?
+        ;;
     pf-dns-refresh)
         _check_root || exit 1
         _check_deps || exit 1

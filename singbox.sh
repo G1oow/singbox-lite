@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="117"
+export SCRIPT_VERSION="118"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -58,8 +58,22 @@ _flock_wait() {
 
 # 所有脚本组件约定使用同一把状态锁。外层事务持锁时会导出
 # SINGBOXLITE_LOCK_HELD=1，避免原子写函数重复加锁造成父子死锁。
+_state_write_allowed() {
+    local operation="$1" pending
+    case "$operation" in _recover_all_transactions_locked|_recover_pending_main_transactions_locked) return 0 ;; esac
+    [ "${MAIN_RECOVERY_ACTIVE:-0}" != 1 ] || return 0
+    if [ -n "${MAIN_TRANSACTION_DIR:-}" ] && [ -f "$MAIN_TRANSACTION_DIR/complete" ]; then return 0; fi
+    for pending in "${SINGBOX_DIR}/.transactions"/*; do
+        [ -d "$pending" ] && [ -f "$pending/complete" ] && [ ! -f "$pending/committed" ] || continue
+        _error "仍有未恢复事务，已拒绝修改状态，请先运行 recover-pending: $pending"
+        return 1
+    done
+    return 0
+}
+
 _with_state_lock() {
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" = "1" ]; then
+        _state_write_allowed "$1" || return 1
         "$@"
         return $?
     fi
@@ -76,6 +90,7 @@ _with_state_lock() {
             exit 1
         fi
         export SINGBOXLITE_LOCK_HELD=1
+        _state_write_allowed "$1" || exit 1
         "$@"
     )
 }
@@ -413,7 +428,7 @@ _node_name_taken() {
     [ -n "$n" ] || return 1
     if [ -s "${CLASH_YAML_FILE:-}" ] && [ -x "${YQ_BINARY:-}" ]; then
         export NODE_NAME_CHECK="$n"
-        if ${YQ_BINARY} eval '.proxies[] | select(.name == env(NODE_NAME_CHECK)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | grep -Fxq -- "$n"; then
+        if ${YQ_BINARY} eval '.proxies[] | select(.name == env(NODE_NAME_CHECK)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | LC_ALL=C grep -Fxq -- "$n"; then
             return 0
         fi
     fi
@@ -489,7 +504,7 @@ _is_pid_running_cmd() {
     [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
     if [ -r "/proc/${pid}/cmdline" ]; then
-        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "$pattern"
+        tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline" | LC_ALL=C grep -Fq "$pattern"
     else
         ps -p "$pid" -o args= 2>/dev/null | grep -Fq "$pattern"
     fi
@@ -844,10 +859,20 @@ _manage_service() {
             if [ "$action" == "start" ] || [ "$action" == "restart" ]; then
                 systemctl reset-failed sing-box >/dev/null 2>&1 || true
             fi
-            systemctl "$action" sing-box 8>&- 9>&- 219>&- ;;
+            systemctl "$action" sing-box 8>&- 9>&- 219>&- || return 1
+            if [ "$action" = start ] || [ "$action" = restart ]; then
+                sleep 1
+                systemctl is-active --quiet sing-box || return 1
+            fi
+            ;;
         openrc)
             if [ "$action" == "status" ]; then rc-service sing-box status; return; fi
-            rc-service sing-box "$action" 8>&- 9>&- 219>&- ;;
+            rc-service sing-box "$action" 8>&- 9>&- 219>&- || return 1
+            if [ "$action" = start ] || [ "$action" = restart ]; then
+                sleep 1
+                rc-service sing-box status >/dev/null 2>&1 || return 1
+            fi
+            ;;
         direct)
             if ! _prepare_singbox_runtime_pid; then
                 _error "无法准备受保护的运行目录: ${RUNTIME_DIR}"
@@ -879,14 +904,20 @@ _manage_service() {
                         local pid
                         pid=$(cat "$PID_FILE" 2>/dev/null)
                         if _is_pid_running_cmd "$pid" "$SINGBOX_BIN"; then
-                            kill "$pid" 2>/dev/null
+                            kill "$pid" 2>/dev/null || return 1
+                            local attempt
+                            for attempt in 1 2 3 4 5; do
+                                _is_pid_running_cmd "$pid" "$SINGBOX_BIN" || break
+                                sleep 0.2
+                            done
+                            _is_pid_running_cmd "$pid" "$SINGBOX_BIN" && return 1
                         fi
                     fi
                     rm -f "$PID_FILE"
                     _success "sing-box direct 后台进程已停止。"
                     ;;
                 restart)
-                    _manage_service stop
+                    _manage_service stop || return 1
                     sleep 1
                     _manage_service start
                     ;;
@@ -1637,7 +1668,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _conn_ipv4 _conn_ipv6 _choose_connect_addr _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _node_cc_flag _node_cc_name _node_region_name_ok _node_region_detect _node_region _node_machine_id_random _node_machine_id _node_name_taken _node_default_name _node_name_replace_port
+export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _conn_ipv4 _conn_ipv6 _choose_connect_addr _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _state_write_allowed _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _node_cc_flag _node_cc_name _node_region_name_ok _node_region_detect _node_region _node_machine_id_random _node_machine_id _node_name_taken _node_default_name _node_name_replace_port
 
 export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
@@ -2168,7 +2199,7 @@ _start_argo_tunnel() {
         
         # 强制锁定 protocol http2 (h2)，防止 QUIC (UDP) 被阻断导致连接失败
         # 增加 --no-autoupdate 防止在精简系统上因自更新导致的意外进程挂起
-        nohup "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate run --token "$token" > "${log_file}" 2>&1 &
+        nohup "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate run --token "$token" > "${log_file}" 2>&1 7>&- 8>&- 9>&- 219>&- &
             
         local cf_pid=$!
         printf '%s\n' "$cf_pid" > "${pid_file}"
@@ -2193,7 +2224,7 @@ _start_argo_tunnel() {
         # 优化：强制指定 http2 协议并禁用自动更新
         nohup "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate --url "http://127.0.0.1:${target_port}" \
             --logfile "${log_file}" \
-            > /dev/null 2>&1 &
+            > /dev/null 2>&1 7>&- 8>&- 9>&- 219>&- &
         
         local cf_pid=$!
         printf '%s\n' "$cf_pid" > "${pid_file}"
@@ -2289,7 +2320,16 @@ _stop_argo_tunnel() {
         local pid
         pid=$(cat "$pid_file" 2>/dev/null)
         if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
-            kill "$pid" 2>/dev/null
+            kill "$pid" 2>/dev/null || return 1
+            local attempt
+            for attempt in 1 2 3 4 5; do
+                _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN" || break
+                sleep 0.2
+            done
+            if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
+                _error "Argo 隧道未停止，已保留运行信息。"
+                return 1
+            fi
             _success "Argo 隧道 (端口: $target_port) 已停止"
         fi
     fi
@@ -2337,7 +2377,7 @@ _stop_all_argo_tunnels() {
 # 统一 Argo 节点创建函数 (消除 VLESS/Trojan 重复代码)
 # 参数: $1 = 协议类型 ("vless" 或 "trojan")
 # ============================================================
-_add_argo_node() {
+_add_argo_node() (
     local protocol="$1"
     local protocol_label=""
     local proto_name=""
@@ -2496,24 +2536,38 @@ _add_argo_node() {
             }')
     fi
 
+    local tx_dir committed=0 restart_attempted=0 lock_owned=0
+    if [ "${SINGBOXLITE_LOCK_HELD:-0}" != 1 ]; then
+        command -v flock >/dev/null 2>&1 || return 1
+        exec 8>"${SINGBOX_DIR}/.singboxlite.lock" || return 1
+        _flock_wait 8 30 || return 1
+        export SINGBOXLITE_LOCK_HELD=1
+        lock_owned=1
+    fi
+    _check_port_conflict "$port" tcp && { _error "端口在交互期间已被占用。"; return 1; }
+    tx_dir=$(_main_tx_begin main) || return 1
+    _main_create_tx_snapshot "$tx_dir" || { _main_tx_cleanup "$tx_dir"; return 1; }
+    export MAIN_CREATE_TX_ACTIVE=1
+    printf '%s\n' "$port" > "$tx_dir/argo-new-port" || return 1
+    trap 'argo_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then _restore_full_transaction_snapshot "$tx_dir" "$restart_attempted" "Argo 节点创建" || argo_rc=1; fi; if [ "$lock_owned" -eq 1 ]; then flock -u 8; exec 8>&-; fi; exit "$argo_rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
 
     # === [公共] 重启 + 启动隧道 ===
-    _manage_service "restart"
+    : > "$tx_dir/restart-required" || return 1
+    restart_attempted=1
+    _manage_service "restart" || return 1
     sleep 2
 
     if [ "$argo_type" == "fixed" ]; then
         if ! _start_argo_tunnel "$port" "${protocol}-ws" "$token"; then
-             _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-             _manage_service "restart"
              return 1
         fi
     else
         local real_domain=$(_start_argo_tunnel "$port" "${protocol}-ws")
         if [ -z "$real_domain" ] || [ "$real_domain" == "" ]; then
             _error "隧道启动失败，正在回滚配置..."
-            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-            _manage_service "restart"
             return 1
         fi
         tunnel_domain="$real_domain"
@@ -2544,7 +2598,7 @@ _add_argo_node() {
     if [ ! -f "$ARGO_METADATA_FILE" ]; then
         echo '{}' > "$ARGO_METADATA_FILE"
     fi
-    _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta"
+    _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta" || return 1
 
     # === [协议特定] Clash 配置 + 分享链接 ===
     local proxy_json=""
@@ -2606,26 +2660,22 @@ _add_argo_node() {
     fi
 
     if ! _add_node_to_yaml "$proxy_json"; then
-        _stop_argo_tunnel "$port"
-        _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" >/dev/null 2>&1 || true
-        _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
         return 1
     fi
 
     # === [公共] 启用守护 + 显示结果 ===
     # 守护是 Argo 节点的完整性条件；失败时回滚本次节点，避免产生
     # 表面创建成功但重启后无法自愈的半成品状态。
+    if crontab -l 2>/dev/null | grep -Fq "bash ${SELF_SCRIPT_PATH} keepalive"; then
+        : > "$tx_dir/argo-watchdog.present" || return 1
+    fi
+    : > "$tx_dir/argo-watchdog-attempted" || return 1
     if ! _enable_argo_watchdog; then
-        _stop_argo_tunnel "$port"
-        _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" >/dev/null 2>&1 || true
-        _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-        _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
-        _manage_service "restart" >/dev/null 2>&1 || true
         return 1
     fi
 
     echo ""
-    _success "${protocol_label} + Argo 节点创建成功!"
+    _info "${protocol_label} + Argo 节点配置已生成。"
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
     echo -e "隧道类型: ${CYAN}${argo_type}${NC}"
@@ -2635,16 +2685,22 @@ _add_argo_node() {
     
     # 使用统一链接生成器进行展示与持久化
     if [ "$protocol" == "vless" ]; then
-        _show_node_link "vless-ws" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path"
+        _show_node_link "vless-ws" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path" || return 1
     else
-        _show_node_link "trojan-ws" "$name" "$tunnel_domain" "443" "$tag" "$password" "$ws_path"
+        _show_node_link "trojan-ws" "$name" "$tunnel_domain" "443" "$tag" "$password" "$ws_path" || return 1
     fi
+    _main_tx_commit "$tx_dir" || return 1
+    committed=1
+    trap - EXIT INT TERM
+    _main_tx_cleanup "$tx_dir" || _warn "Argo 创建已提交，但事务目录清理失败。"
+    if [ "$lock_owned" -eq 1 ]; then flock -u 8; exec 8>&-; fi
+    _success "${protocol_label} + Argo 节点创建成功！"
     
     echo "-------------------------------------------"
     if [ "$argo_type" == "temp" ]; then
         _warning "注意: 临时隧道每次重启域名会变化！"
     fi
-}
+)
 
 # 保留原始函数名作为薄包装器，确保向后兼容
 _add_argo_vless_ws() { _add_argo_node "vless"; }
@@ -2719,6 +2775,79 @@ _view_argo_nodes() {
     echo "==================================================="
 }
 
+_restore_argo_deleted_runtime() {
+    local tx_dir="$1" entry tag port token protocol name path domain pid_file credential
+    [ -s "$tx_dir/argo-delete.json" ] && [ -s "$tx_dir/argo-delete-tag" ] || return 1
+    read -r tag < "$tx_dir/argo-delete-tag" || return 1
+    entry=$(cat "$tx_dir/argo-delete.json") || return 1
+    port=$(jq -r '.local_port' <<< "$entry") || return 1
+    pid_file=$(_argo_pid_file "$port") || return 1
+    if _is_pid_file_running_cmd "$pid_file" "$CLOUDFLARED_BIN"; then return 0; fi
+    token=$(jq -r '.token // ""' <<< "$entry")
+    protocol=$(jq -r '.protocol // "vless-ws"' <<< "$entry")
+    if [ "$(jq -r '.type' <<< "$entry")" = fixed ]; then
+        _start_argo_tunnel "$port" "$protocol" "$token"
+        return $?
+    fi
+    domain=$(_start_argo_tunnel "$port" "$protocol" "") || return 1
+    [ -n "$domain" ] || return 1
+    name=$(jq -r '.name' <<< "$entry")
+    path=$(jq -r '.path' <<< "$entry")
+    _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].domain = $domain' --arg tag "$tag" --arg domain "$domain" || return 1
+    export ARGO_RESTORE_NAME="$name" ARGO_RESTORE_DOMAIN="$domain"
+    _atomic_modify_yaml "$CLASH_YAML_FILE" '
+        (.proxies[]? | select(.name == env(ARGO_RESTORE_NAME))) |=
+        (.server = env(ARGO_RESTORE_DOMAIN) | .sni = env(ARGO_RESTORE_DOMAIN)
+         | .["ws-opts"].headers.Host = env(ARGO_RESTORE_DOMAIN))
+    ' || return 1
+    if [ "$protocol" = trojan-ws ]; then
+        credential=$(jq -r '.password' <<< "$entry")
+    else
+        credential=$(jq -r '.uuid' <<< "$entry")
+    fi
+    _show_node_link "$protocol" "$name" "$domain" 443 "$tag" "$credential" "$path" >/dev/null || return 1
+    _warn "临时 Argo 隧道已恢复并重新申请域名，请重新导入客户端链接。"
+}
+
+_delete_argo_node_locked() (
+    local tag="$1" expected_port="$2" expected_name="$3" entry tx_dir
+    local committed=0 restart_attempted=0 check_result
+    entry=$(jq -ce --arg tag "$tag" '.[$tag] // empty' "$ARGO_METADATA_FILE") || return 1
+    if [ "$(jq -r '.local_port' <<< "$entry")" != "$expected_port" ] \
+        || [ "$(jq -r '.name' <<< "$entry")" != "$expected_name" ]; then
+        _error "Argo 节点已发生变化，请重新选择。"
+        return 1
+    fi
+    tx_dir=$(_main_tx_begin main) || return 1
+    _main_create_tx_snapshot "$tx_dir" || { _main_tx_cleanup "$tx_dir"; return 1; }
+    printf '%s\n' "$entry" > "$tx_dir/argo-delete.json" \
+        && printf '%s\n' "$tag" > "$tx_dir/argo-delete-tag" || return 1
+    trap 'argo_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then _restore_full_transaction_snapshot "$tx_dir" "$restart_attempted" "Argo 节点删除" || argo_rc=1; fi; exit "$argo_rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds |= map(select(.tag != $tag))' --arg tag "$tag" || return 1
+    _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" || return 1
+    _remove_node_from_yaml "$expected_name" || return 1
+    if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
+        _error "Argo 删除后的组合配置校验失败："
+        printf '%s\n' "$check_result"
+        return 1
+    fi
+    : > "$tx_dir/restart-required" || return 1
+    restart_attempted=1
+    _manage_service restart || return 1
+    : > "$tx_dir/argo-stop-attempted" || return 1
+    _stop_argo_tunnel "$expected_port" || return 1
+    _main_tx_commit "$tx_dir" || return 1
+    committed=1
+    trap - EXIT INT TERM
+    _main_tx_cleanup "$tx_dir" || _warn "Argo 删除已提交，但事务目录清理失败。"
+    if [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
+        _disable_argo_watchdog || _warn "节点已删除，但空闲守护任务清理失败。"
+    fi
+    _success "节点 ${expected_name} 已删除！"
+)
+
 _delete_argo_node() {
     if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
         _warning "没有 Argo 隧道节点可删除。"
@@ -2728,7 +2857,7 @@ _delete_argo_node() {
     _info "--- 删除 Argo 隧道节点 ---"
     
     # 读取所有节点到数组
-    local i=1
+    local i=1 choice
     local keys=()
     local names=()
     local ports=()
@@ -2764,30 +2893,14 @@ _delete_argo_node() {
     
     _info "正在删除节点: ${selected_name} (端口: ${selected_port})..."
     
-    # 1. 停止该节点的隧道进程
-    _stop_argo_tunnel "$selected_port"
-    
-    # 2. 从 sing-box 配置文件中移除 inbound
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$selected_key\"))"
-    
-    # 3. 删除 Argo 元数据
-    _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$selected_key"
-    
-    # 4. 删除 Clash 配置
-    _remove_node_from_yaml "$selected_name"
-    
-    # 5. 检查是否还有节点，如果没有则禁用守护进程
-    if [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
-        _disable_argo_watchdog
-    fi
-
-    # 6. 重启 sing-box
-    _manage_service "restart"
-    
-    _success "节点 ${selected_name} 已删除！"
+    _with_state_lock _delete_argo_node_locked "$selected_key" "$selected_port" "$selected_name"
 }
 
 _stop_argo_menu() {
+    _with_state_lock _stop_argo_menu_locked
+}
+
+_stop_argo_menu_locked() {
     _info "--- 停止 Argo 隧道进程 (保留配置) ---"
     # 复用选择逻辑
     local i=1
@@ -2826,6 +2939,10 @@ _stop_argo_menu() {
 }
 
 _restart_argo_tunnel_menu() {
+    _with_state_lock _restart_argo_tunnel_menu_locked
+}
+
+_restart_argo_tunnel_menu_locked() {
     _info "--- 重启 Argo 隧道 ---"
     
      if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
@@ -2904,7 +3021,7 @@ _restart_argo_tunnel_menu() {
         _info "正在重启: $name (端口: $port)..."
         
         # 停止
-        _stop_argo_tunnel "$port"
+        _stop_argo_tunnel "$port" || return 1
         sleep 1
         
         # 启动
@@ -2939,6 +3056,10 @@ _restart_argo_tunnel_menu() {
 # --- Argo 守护进程逻辑 ---
 
 _argo_keepalive() {
+    _with_state_lock _argo_keepalive_locked
+}
+
+_argo_keepalive_locked() {
     # keepalive 使用受保护运行目录中的 flock，避免可预测 /tmp 锁和并发重启。
     _prepare_argo_runtime_dir || return 1
     command -v flock >/dev/null 2>&1 || { _error "缺少 flock，Argo 守护任务已拒绝无锁运行。"; return 1; }
@@ -3169,12 +3290,16 @@ _disable_argo_watchdog() {
     
     if crontab -l 2>/dev/null | grep -Fq "$job"; then
         _info "正在移除后台守护进程..."
-        crontab -l 2>/dev/null | grep -Fv "$job" | crontab -
+        crontab -l 2>/dev/null | grep -Fv "$job" | crontab - || return 1
         _success "守护进程已移除。"
     fi
 }
 
 _uninstall_argo() {
+    _with_state_lock _uninstall_argo_locked
+}
+
+_uninstall_argo_locked() {
     _warning "！！！警告！！！"
     _warning "本操作将删除所有 Argo 隧道节点和 cloudflared 程序。"
     echo ""
@@ -3286,6 +3411,10 @@ _view_argo_logs() {
 }
 
 _sync_argo_early_data() {
+    _with_state_lock _sync_argo_early_data_locked
+}
+
+_sync_argo_early_data_locked() {
     local config_updated=false
     local links_updated=false
     local yaml_updated=false
@@ -3354,8 +3483,10 @@ _sync_argo_early_data() {
 }
 
 _argo_menu() {
-    _sync_argo_early_data
+    _with_state_lock _recover_all_transactions_locked || return 1
+    _sync_argo_early_data || return 1
     while true; do
+        _with_state_lock _recover_all_transactions_locked || return 1
         clear
         echo -e "${CYAN}"
         echo '  ╔═══════════════════════════════════════╗'
@@ -6076,10 +6207,10 @@ _batch_change_sni_apply() (
     fi
 
     local backup_dir restart_attempted=0 committed=0 check_result
-    backup_dir=$(mktemp -d /tmp/.singbox-sni.XXXXXX) || return 1
+    backup_dir=$(_main_tx_begin main) || return 1
     if ! _main_create_tx_snapshot "$backup_dir"; then
         _error "无法完整创建 SNI 变更事务快照，操作尚未开始。"
-        rm -rf -- "$backup_dir"
+        _main_tx_cleanup "$backup_dir"
 
         if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
         return 1
@@ -6101,12 +6232,14 @@ _batch_change_sni_apply() (
         echo "$check_result"
         return 1
     fi
+    : > "$backup_dir/restart-required" || return 1
     restart_attempted=1
     _manage_service restart || { _error "SNI 变更后服务重启失败。"; return 1; }
 
+    _main_tx_commit "$backup_dir" || return 1
     committed=1
     trap - EXIT INT TERM
-    rm -rf -- "$backup_dir" || _warn "SNI 变更事务快照清理失败: $backup_dir"
+    _main_tx_cleanup "$backup_dir" || _warn "SNI 变更事务快照清理失败: $backup_dir"
     export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
     if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
     _success "全部节点 SNI 已更新，配置校验通过，服务已重启。"
@@ -6535,6 +6668,10 @@ _camouflage_default_scope() {
 
 # 切换伪装站监听范围并更新状态文件；供 Reality 迁移 443 前后调用。
 _caddy_set_scope() {
+    _with_state_lock _caddy_set_scope_locked "$@"
+}
+
+_caddy_set_scope_locked() {
     local scope="$1" domain port cert_mode cert_path key_path
     [ "$scope" = "public" ] || [ "$scope" = "loopback" ] || { _error "内部错误：未知监听范围 ${scope}。"; return 1; }
     domain=$(_camouflage_state_domain)
@@ -6554,15 +6691,7 @@ _caddy_set_scope() {
                 ;;
         esac
     fi
-    _caddy_write_config "$domain" "$port" "$cert_mode" "$cert_path" "$key_path" "$scope" || return 1
-    local validate_err
-    if ! validate_err=$("$CADDY_BIN" validate --config "$CADDY_CONF_FILE" --adapter caddyfile 2>&1); then
-        _error "Caddyfile 校验失败："
-        echo "$validate_err"
-        return 1
-    fi
-    _caddy_service restart || { _error "Caddy 重启失败。"; return 1; }
-    _atomic_modify_json "$CADDY_STATE_FILE" '.listenScope = $scope' --arg scope "$scope" >/dev/null 2>&1 || true
+    _caddy_deploy_site_locked "$domain" "$port" "$cert_mode" "$cert_path" "$key_path" "$scope" || return 1
     if [ "$scope" = "loopback" ]; then
         _info "Caddy 已让出公网 443，仅保留 127.0.0.1:${port} 回落站点。"
     else
@@ -6717,13 +6846,18 @@ EOF
                     systemctl "$action" "$CADDY_SERVICE_NAME"
                     ;;
                 stop)
-                    systemctl stop "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || true
+                    if [ -f "$unit" ] || systemctl is-active --quiet "$CADDY_SERVICE_NAME"; then
+                        systemctl stop "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || return 1
+                    fi
+                    return 0
                     ;;
                 remove)
-                    systemctl stop "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || true
-                    systemctl disable "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || true
-                    rm -f -- "$unit"
-                    systemctl daemon-reload >/dev/null 2>&1 || true
+                    if [ -f "$unit" ] || systemctl is-active --quiet "$CADDY_SERVICE_NAME"; then
+                        systemctl stop "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || return 1
+                    fi
+                    if [ -f "$unit" ]; then systemctl disable "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || return 1; fi
+                    rm -f -- "$unit" || return 1
+                    systemctl daemon-reload >/dev/null 2>&1 || return 1
                     systemctl reset-failed "${CADDY_SERVICE_NAME}.service" >/dev/null 2>&1 || true
                     ;;
                 *) _error "未知服务操作: $action"; return 1 ;;
@@ -6763,11 +6897,16 @@ EOF
                     rc-update add "$CADDY_SERVICE_NAME" default >/dev/null 2>&1 || return 1
                     ;;
                 start|restart|stop)
+                    if [ "$action" = stop ] && [ ! -f "$initd" ]; then return 0; fi
                     rc-service "$CADDY_SERVICE_NAME" "$action"
                     ;;
                 remove)
-                    rc-service "$CADDY_SERVICE_NAME" stop >/dev/null 2>&1 || true
-                    rc-update del "$CADDY_SERVICE_NAME" default >/dev/null 2>&1 || true
+                    if [ -f "$initd" ]; then
+                        rc-service "$CADDY_SERVICE_NAME" stop >/dev/null 2>&1 || return 1
+                    fi
+                    if [ -L "/etc/runlevels/default/$CADDY_SERVICE_NAME" ]; then
+                        rc-update del "$CADDY_SERVICE_NAME" default >/dev/null 2>&1 || return 1
+                    fi
                     rm -f -- "$initd" "$CADDY_PID_FILE"
                     ;;
                 *) _error "未知服务操作: $action"; return 1 ;;
@@ -6802,17 +6941,25 @@ EOF
                     if [ -s "$CADDY_PID_FILE" ]; then
                         local pid
                         pid=$(cat "$CADDY_PID_FILE" 2>/dev/null)
-                        _is_pid_running_cmd "$pid" "$CADDY_BIN" && kill "$pid" 2>/dev/null
+                        if _is_pid_running_cmd "$pid" "$CADDY_BIN"; then
+                            kill "$pid" 2>/dev/null || return 1
+                            local attempt
+                            for attempt in 1 2 3 4 5; do
+                                _is_pid_running_cmd "$pid" "$CADDY_BIN" || break
+                                sleep 0.2
+                            done
+                            _is_pid_running_cmd "$pid" "$CADDY_BIN" && return 1
+                        fi
                     fi
                     rm -f -- "$CADDY_PID_FILE"
                     ;;
                 restart)
-                    _caddy_service stop
+                    _caddy_service stop || return 1
                     sleep 1
                     _caddy_service start
                     ;;
                 remove)
-                    _caddy_service stop >/dev/null 2>&1 || true
+                    _caddy_service stop >/dev/null 2>&1 || return 1
                     rm -f -- "$CADDY_PID_FILE"
                     ;;
                 *) _error "未知服务操作: $action"; return 1 ;;
@@ -6962,10 +7109,10 @@ _camouflage_tx() (
     fi
 
     local backup_dir restart_attempted=0 committed=0 check_result
-    backup_dir=$(mktemp -d /tmp/.singbox-camouflage.XXXXXX) || return 1
+    backup_dir=$(_main_tx_begin main) || return 1
     if ! _main_create_tx_snapshot "$backup_dir"; then
         _error "无法完整创建伪装域名事务快照，操作尚未开始。"
-        rm -rf -- "$backup_dir"
+        _main_tx_cleanup "$backup_dir"
         if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
         return 1
     fi
@@ -6975,8 +7122,8 @@ _camouflage_tx() (
     else
         export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
     fi
-    # 事务内可能临时收回 Caddy 的公网 443；未提交时必须还原，否则伪装域名会失联。
-    trap 'camouflage_rc=$?; trap - EXIT INT TERM; if [ -n "${CAMOUFLAGE_SCOPE_RESTORE:-}" ]; then if ! _caddy_set_scope "$CAMOUFLAGE_SCOPE_RESTORE" >/dev/null 2>&1; then _warn "伪装站监听范围还原失败，请在 [21] 中重新部署。"; fi; fi; if [ "$committed" -ne 1 ]; then if ! _restore_full_transaction_snapshot "$backup_dir" "$restart_attempted" "$context"; then camouflage_rc=1; fi; fi; export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0; if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi; exit "$camouflage_rc"' EXIT
+    # 公网 443 必须在旧节点配置恢复之后交还 Caddy，统一交给快照恢复处理。
+    trap 'camouflage_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then if ! _restore_full_transaction_snapshot "$backup_dir" "$restart_attempted" "$context"; then camouflage_rc=1; fi; fi; export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0; if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi; exit "$camouflage_rc"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
@@ -6994,12 +7141,14 @@ _camouflage_tx() (
         fi
         return 1
     fi
+    : > "$backup_dir/restart-required" || return 1
     restart_attempted=1
     _manage_service restart || { _error "伪装域名切换后服务重启失败。"; return 1; }
 
+    _main_tx_commit "$backup_dir" || return 1
     committed=1
     trap - EXIT INT TERM
-    rm -rf -- "$backup_dir" || _warn "事务快照清理失败: $backup_dir"
+    _main_tx_cleanup "$backup_dir" || _warn "事务快照清理失败: $backup_dir"
     export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
     if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
     return 0
@@ -7073,11 +7222,13 @@ _camouflage_mutate_reality() {
         if [ "$cur_port" != "443" ]; then
             if _camouflage_public_scope; then
                 # Caddy 正在占用公网 443；必须在 Reality 迁移前让出。
+                if [ -n "${MAIN_TRANSACTION_DIR:-}" ]; then
+                    : > "$MAIN_TRANSACTION_DIR/caddy.restart-required" || return 1
+                fi
                 if ! _caddy_set_scope loopback; then
                     _error "无法让 Caddy 让出公网 443，Reality 迁移已取消。"
                     return 1
                 fi
-                CAMOUFLAGE_SCOPE_RESTORE="public"
             fi
             # Caddy 已让出 443，但仍可能读到旧的系统监听快照，故只信配置侧冲突。
             if _check_port_in_singbox_file "$CONFIG_FILE" "443" "tcp" "$port443_tag"; then
@@ -7266,24 +7417,101 @@ _caddy_service_running() {
 }
 
 # 校验临时配置后才替换；证书由 Caddy 自行管理，失败时不删除已签发材料。
+_caddy_service_snapshot() {
+    local snapshot="$1" unit=""
+    case "${INIT_SYSTEM:-direct}" in
+        systemd) unit="/etc/systemd/system/${CADDY_SERVICE_NAME}.service" ;;
+        openrc) unit="/etc/init.d/${CADDY_SERVICE_NAME}" ;;
+        *) return 0 ;;
+    esac
+    _main_create_tx_snapshot_file "$snapshot" caddy.unit "$unit" || return 1
+    printf '%s\n' "$INIT_SYSTEM" > "$snapshot/caddy.init" || return 1
+    if { [ "$INIT_SYSTEM" = systemd ] && systemctl is-enabled --quiet "$CADDY_SERVICE_NAME"; } \
+        || { [ "$INIT_SYSTEM" = openrc ] && [ -L "/etc/runlevels/default/$CADDY_SERVICE_NAME" ]; }; then
+        : > "$snapshot/caddy.enabled" || return 1
+    fi
+    return 0
+}
+
+_caddy_service_restore() {
+    local snapshot="$1" saved_init unit
+    [ -f "$snapshot/caddy.init" ] || return 0
+    read -r saved_init < "$snapshot/caddy.init" || return 1
+    [ "$saved_init" = "${INIT_SYSTEM:-}" ] || return 1
+    case "$saved_init" in
+        systemd) unit="/etc/systemd/system/${CADDY_SERVICE_NAME}.service" ;;
+        openrc) unit="/etc/init.d/${CADDY_SERVICE_NAME}" ;;
+        *) return 1 ;;
+    esac
+    if [ ! -f "$snapshot/caddy.unit.present" ] && [ -f "$unit" ]; then
+        if [ "$saved_init" = systemd ]; then
+            systemctl disable "$CADDY_SERVICE_NAME" >/dev/null 2>&1 || return 1
+        elif [ -L "/etc/runlevels/default/$CADDY_SERVICE_NAME" ]; then
+            rc-update del "$CADDY_SERVICE_NAME" default >/dev/null 2>&1 || return 1
+        fi
+    fi
+    _main_create_tx_restore_file "$snapshot" caddy.unit "$unit" || return 1
+    if [ "$saved_init" = systemd ]; then
+        systemctl daemon-reload || return 1
+        if [ -f "$snapshot/caddy.unit.present" ]; then
+            if [ -f "$snapshot/caddy.enabled" ]; then systemctl enable "$CADDY_SERVICE_NAME" >/dev/null 2>&1
+            else systemctl disable "$CADDY_SERVICE_NAME" >/dev/null 2>&1; fi
+        fi
+    elif [ -f "$snapshot/caddy.enabled" ]; then
+        rc-update add "$CADDY_SERVICE_NAME" default >/dev/null 2>&1
+    else
+        if [ -L "/etc/runlevels/default/$CADDY_SERVICE_NAME" ]; then
+            rc-update del "$CADDY_SERVICE_NAME" default >/dev/null 2>&1 || return 1
+        fi
+        return 0
+    fi
+}
+
+_caddy_tx_restore() {
+    local snapshot="$1" restore_failed=0 label
+    [ -f "$snapshot/complete" ] || return 1
+    for label in conf state index caddy.unit; do
+        if [ -f "$snapshot/$label.present" ]; then [ -f "$snapshot/$label" ] || return 1; fi
+    done
+    _main_create_tx_restore_file "$snapshot" conf "$CADDY_CONF_FILE" || restore_failed=1
+    _main_create_tx_restore_file "$snapshot" state "$CADDY_STATE_FILE" || restore_failed=1
+    _main_create_tx_restore_file "$snapshot" index "${CADDY_WEB_ROOT}/index.html" || restore_failed=1
+    if [ -f "$snapshot/service-attempted" ]; then
+        if [ -f "$snapshot/was-running" ]; then
+            _caddy_service_restore "$snapshot" || restore_failed=1
+            _caddy_service restart >/dev/null 2>&1 || restore_failed=1
+        elif [ -f "$snapshot/conf.present" ]; then
+            _caddy_service stop >/dev/null 2>&1 || restore_failed=1
+            _caddy_service_restore "$snapshot" || restore_failed=1
+        else
+            _caddy_service remove >/dev/null 2>&1 || restore_failed=1
+            _caddy_service_restore "$snapshot" || restore_failed=1
+        fi
+    fi
+    [ "$restore_failed" -eq 0 ]
+}
+
 _caddy_deploy_site_locked() (
     local domain="$1" site_port="$2" cert_mode="$3" cert_path="$4" key_path="$5"
-    local snapshot staged scope verify_port validate_err final_cert final_key not_after=""
+    local snapshot staged scope="${6:-}" verify_port validate_err final_cert final_key not_after="" tag443=""
     local committed=0 service_attempted=0 was_running=0
-    snapshot=$(mktemp -d "${TMPDIR:-/tmp}/.singbox-caddy-deploy.XXXXXX") || return 1
+    snapshot=$(_main_tx_begin caddy) || return 1
     if ! _main_create_tx_snapshot_file "$snapshot" conf "$CADDY_CONF_FILE" \
         || ! _main_create_tx_snapshot_file "$snapshot" state "$CADDY_STATE_FILE" \
         || ! _main_create_tx_snapshot_file "$snapshot" index "${CADDY_WEB_ROOT}/index.html"; then
-        rm -rf -- "$snapshot"
+        _main_tx_cleanup "$snapshot"
         _error "无法完整备份伪装站配置，部署尚未开始。"
         return 1
     fi
     _caddy_service_running && was_running=1
-    staged=$(mktemp "${CADDY_CONF_FILE}.staged.XXXXXX") || { rm -rf -- "$snapshot"; return 1; }
-    trap 'deploy_rc=$?; trap - EXIT INT TERM; restore_failed=0; if [ "$committed" -ne 1 ]; then _main_create_tx_restore_file "$snapshot" conf "$CADDY_CONF_FILE" || restore_failed=1; _main_create_tx_restore_file "$snapshot" state "$CADDY_STATE_FILE" || restore_failed=1; _main_create_tx_restore_file "$snapshot" index "${CADDY_WEB_ROOT}/index.html" || restore_failed=1; if [ "$service_attempted" -eq 1 ]; then if [ "$was_running" -eq 1 ]; then _caddy_service restart >/dev/null 2>&1 || restore_failed=1; elif [ -f "$snapshot/conf.present" ]; then _caddy_service stop >/dev/null 2>&1 || restore_failed=1; else _caddy_service remove >/dev/null 2>&1 || restore_failed=1; fi; fi; fi; rm -f -- "$staged"; if [ "$restore_failed" -eq 0 ]; then rm -rf -- "$snapshot"; else _error "伪装站回滚不完整，快照已保留: $snapshot"; deploy_rc=1; fi; exit "$deploy_rc"' EXIT
+    _caddy_service_snapshot "$snapshot" || return 1
+    if [ "$was_running" -eq 1 ]; then : > "$snapshot/was-running" || return 1; fi
+    printf 'caddy\n' > "$snapshot/kind" && : > "$snapshot/complete" || return 1
+    staged=$(mktemp "${CADDY_CONF_FILE}.staged.XXXXXX") || { _main_tx_cleanup "$snapshot"; return 1; }
+    trap 'deploy_rc=$?; trap - EXIT INT TERM; restore_failed=0; if [ "$committed" -ne 1 ]; then if _caddy_tx_restore "$snapshot"; then _main_tx_commit "$snapshot" || restore_failed=1; else restore_failed=1; fi; fi; rm -f -- "$staged"; if [ "$restore_failed" -eq 0 ]; then _main_tx_cleanup "$snapshot"; else _error "伪装站回滚不完整，快照已保留: $snapshot"; deploy_rc=1; fi; exit "$deploy_rc"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    scope=$(_camouflage_default_scope) || return 1
+    if [ -z "$scope" ]; then scope=$(_camouflage_default_scope) || return 1; fi
     (
         local CADDY_CONF_FILE="$staged"
         _caddy_write_config "$domain" "$site_port" "$cert_mode" "$cert_path" "$key_path" "$scope"
@@ -7297,6 +7525,7 @@ _caddy_deploy_site_locked() (
         printf '<!doctype html><html lang="en"><title>Service Status</title><p>Operational</p></html>\n' > "${CADDY_WEB_ROOT}/index.html" || return 1
         chmod 644 "${CADDY_WEB_ROOT}/index.html" || return 1
     fi
+    : > "$snapshot/service-attempted" || return 1
     mv -f -- "$staged" "$CADDY_CONF_FILE" || return 1
     service_attempted=1
     if { [ "$was_running" -eq 0 ] && ! _caddy_service install; } || ! _caddy_service restart; then
@@ -7319,8 +7548,10 @@ _caddy_deploy_site_locked() (
     if [ -n "$final_cert" ] && [ -f "$final_cert" ]; then
         not_after=$(openssl x509 -in "$final_cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
     fi
-    _camouflage_state_write "$domain" "$site_port" "$cert_mode" "$final_cert" "$final_key" "" "$not_after" "$scope" \
+    if [ "$domain" = "$(_camouflage_state_domain)" ]; then tag443=$(_camouflage_state_field '.port443Tag'); fi
+    _camouflage_state_write "$domain" "$site_port" "$cert_mode" "$final_cert" "$final_key" "$tag443" "$not_after" "$scope" \
         || { _error "伪装站状态写入失败，正在恢复原状态。"; return 1; }
+    _main_tx_commit "$snapshot" || return 1
     committed=1
     return 0
 )
@@ -7410,40 +7641,66 @@ _caddy_camouflage_deploy() {
     _output_base64_subscription
 }
 
-_caddy_camouflage_teardown() {
-    local confirm revert remove_bin
-    read -r -p "确认停止并移除 Caddy 伪装站点？[y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        _info "已取消。"
+_caddy_camouflage_teardown_locked() (
+    local revert="$1" remove_bin="$2" dependencies=0 local_reality=0 tx_dir
+    local committed=0 restart_required=0
+    if [ -s "$CONFIG_FILE" ]; then
+        dependencies=$(jq -r --arg root "${CADDY_DATA_DIR%/}/" '
+        [.inbounds[]? | select(
+            ((.tls.certificate_path // "") | startswith($root)) or
+            ((.tls.key_path // "") | startswith($root))
+        )] | length
+        ' "$CONFIG_FILE") || return 1
+        local_reality=$(jq -r '
+            [.inbounds[]? | select(.tls.reality.enabled == true)
+             | select(.tls.reality.handshake.server as $server
+                 | ["127.0.0.1","localhost","::1","[::1]"] | index($server))] | length
+        ' "$CONFIG_FILE") || return 1
+    fi
+    if [ "$dependencies" -ne 0 ]; then
+        _error "有 ${dependencies} 个 TLS 类节点正在复用伪装站证书，已取消卸载。请先用 [5] 改为自签或自定义证书。"
         return 1
     fi
+    if [ "$local_reality" -gt 0 ] && [[ "$revert" =~ ^[Nn]$ ]]; then
+        _error "Reality 节点仍依赖本机回落站，已取消卸载。"
+        return 1
+    fi
+    tx_dir=$(_main_tx_begin main) || return 1
+    _main_create_tx_snapshot "$tx_dir" || { _main_tx_cleanup "$tx_dir"; return 1; }
+    export MAIN_CREATE_TX_ACTIVE=1
+    trap 'teardown_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then _restore_full_transaction_snapshot "$tx_dir" "$restart_required" "伪装站卸载" || teardown_rc=1; fi; exit "$teardown_rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [ "$local_reality" -gt 0 ]; then
+        : > "$tx_dir/restart-required" || return 1
+        restart_required=1
+        _camouflage_apply_reality revert "$DEFAULT_SNI" "" || return 1
+    fi
+    : > "$tx_dir/caddy.restart-required" || return 1
+    _caddy_service remove || { _error "Caddy 服务移除失败，已中止文件删除。"; return 1; }
+    _main_tx_commit "$tx_dir" || return 1
+    committed=1
+    trap - EXIT INT TERM
+    # 此时已确认没有节点引用这些材料；提交前不删除证书，保证失败可恢复。
+    if ! rm -rf -- "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" \
+        || ! rm -f -- "$CADDY_CONF_FILE" "$CADDY_STATE_FILE"; then
+        _error "Caddy 已停止，但站点文件未完全清理；事务记录已保留: $tx_dir"
+        return 1
+    fi
+    if [[ "$remove_bin" =~ ^[Yy]$ ]]; then rm -f -- "$CADDY_BIN" || return 1; fi
+    _main_tx_cleanup "$tx_dir" || _warn "伪装站已移除，但事务记录清理失败。"
+    _success "Caddy 伪装站点已移除。"
+)
+
+_caddy_camouflage_teardown() {
+    local confirm revert="n" remove_bin
+    read -r -p "确认停止并移除 Caddy 伪装站点？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消。"; return 1; }
     if [ -n "$(_camouflage_list_reality_nodes)" ]; then
         read -r -p "是否把 Reality 节点恢复为默认伪装域名 ${DEFAULT_SNI}？[Y/n]: " revert
-        if [[ ! "$revert" =~ ^[Nn]$ ]]; then
-            _camouflage_apply_reality revert "$DEFAULT_SNI" "" || _warn "Reality 节点恢复失败，请手动检查节点配置。"
-        fi
     fi
-    # 其他 TLS 类节点可能正在复用这张证书；删除后它们会失去有效证书。
-    local domain reuse_tag
-    domain=$(_camouflage_state_domain)
-    if [ -n "$domain" ] && [ -s "${CONFIG_FILE:-}" ]; then
-        reuse_tag=$(jq -r --arg d "/${domain}.crt" '
-            [.inbounds[]? | select((.tls.certificate_path // "") | endswith($d)) | .tag] | length
-        ' "$CONFIG_FILE" 2>/dev/null || true)
-        if [ -n "$reuse_tag" ] && [ "$reuse_tag" != "0" ]; then
-            _warn "有 ${reuse_tag} 个 TLS 类节点正在复用 ${domain} 的伪装站证书。"
-            _warn "移除后这些节点会失去有效证书，请随后用 [5] 改为自签或自定义证书。"
-        fi
-    fi
-    _caddy_service remove >/dev/null 2>&1 || true
-    rm -rf -- "$CADDY_WEB_ROOT" "$CADDY_DATA_DIR" 2>/dev/null || true
-    rm -f -- "$CADDY_CONF_FILE" "$CADDY_STATE_FILE" 2>/dev/null || true
     read -r -p "是否同时删除 Caddy 二进制 ${CADDY_BIN}？[y/N]: " remove_bin
-    if [[ "$remove_bin" =~ ^[Yy]$ ]]; then
-        rm -f -- "$CADDY_BIN"
-    fi
-    _success "Caddy 伪装站点已移除。"
-    return 0
+    _with_state_lock _caddy_camouflage_teardown_locked "$revert" "$remove_bin"
 }
 
 _caddy_camouflage_menu() {
@@ -7498,7 +7755,11 @@ _restore_full_transaction_snapshot() {
         restore_rc=1
     fi
     if [ "$restore_rc" -eq 0 ]; then
-        rm -rf -- "$backup_dir" || _warn "事务已恢复，但快照目录清理失败: $backup_dir"
+        _main_tx_commit "$backup_dir" || {
+            _error "原状态已恢复，但无法记录恢复完成；快照已保留: $backup_dir"
+            return 1
+        }
+        _main_tx_cleanup "$backup_dir" || _warn "事务已恢复，但快照目录清理失败: $backup_dir"
         _error "${context}未提交，已恢复操作前的配置、凭据与 nftables 状态。"
     else
         _error "${context}失败且回滚不完整，请立即检查配置、凭据、服务与 nftables。"
@@ -7546,10 +7807,10 @@ _delete_one_main_node_locked() (
     outbound_tag=$(jq -r --arg inbound "$tag" '[.route.rules[]? | select(.inbound == $inbound) | .outbound // empty][0] // empty' "$CONFIG_FILE" 2>/dev/null) || return 1
 
     local backup_dir
-    backup_dir=$(mktemp -d /tmp/.singbox-delete.XXXXXX) || return 1
+    backup_dir=$(_main_tx_begin main) || return 1
     if ! _main_create_tx_snapshot "$backup_dir"; then
         _error "无法完整创建删除事务快照，操作尚未开始。"
-        rm -rf -- "$backup_dir"
+        _main_tx_cleanup "$backup_dir"
         return 1
     fi
     local delete_committed=0 delete_restart_attempted=0
@@ -7599,6 +7860,7 @@ _delete_one_main_node_locked() (
             return 1
         fi
     fi
+    : > "$backup_dir/restart-required" || return 1
     delete_restart_attempted=1
     if ! _manage_service restart; then
         _error "服务重启失败，正在恢复删除前状态。"
@@ -7606,9 +7868,10 @@ _delete_one_main_node_locked() (
     fi
     _safe_remove_main_credential "$cert_path"
     _safe_remove_main_credential "$key_path"
+    _main_tx_commit "$backup_dir" || return 1
     delete_committed=1
     trap - EXIT INT TERM
-    rm -rf -- "$backup_dir" || _warn "删除事务快照目录清理失败: $backup_dir"
+    _main_tx_cleanup "$backup_dir" || _warn "删除事务快照目录清理失败: $backup_dir"
     _success "节点 ${display_name} 已删除！"
 )
 
@@ -7619,10 +7882,10 @@ _delete_all_main_nodes_locked() (
     [ -n "$primary_nodes" ] || { _warning "没有可删除的主 sing-box 节点。"; return 0; }
 
     local backup_dir names_file credential_paths_file hop_file
-    backup_dir=$(mktemp -d /tmp/.singbox-delete-all.XXXXXX) || return 1
+    backup_dir=$(_main_tx_begin main) || return 1
     if ! _main_create_tx_snapshot "$backup_dir"; then
         _error "无法完整创建批量删除事务快照，操作尚未开始。"
-        rm -rf -- "$backup_dir"
+        _main_tx_cleanup "$backup_dir"
         return 1
     fi
     local delete_all_committed=0 delete_all_restart_attempted=0
@@ -7713,6 +7976,7 @@ _delete_all_main_nodes_locked() (
         return 1
     fi
 
+    : > "$backup_dir/restart-required" || return 1
     delete_all_restart_attempted=1
     if ! _manage_service restart; then
         _error "服务重启失败，已恢复删除前状态。"
@@ -7720,9 +7984,10 @@ _delete_all_main_nodes_locked() (
     fi
 
     sort -u "$credential_paths_file" | while IFS= read -r path; do _safe_remove_main_credential "$path"; done
+    _main_tx_commit "$backup_dir" || return 1
     delete_all_committed=1
     trap - EXIT INT TERM
-    rm -rf -- "$backup_dir" || _warn "批量删除事务快照目录清理失败: $backup_dir"
+    _main_tx_cleanup "$backup_dir" || _warn "批量删除事务快照目录清理失败: $backup_dir"
     _success "主 sing-box 节点已全部删除；Argo、Xray、中转配置均已保留。"
 )
 
@@ -8396,13 +8661,13 @@ _modify_port() (
     fi
 
     local modify_backup_dir modify_restart_attempted=0
-    modify_backup_dir=$(mktemp -d /tmp/.singbox-modify-port.XXXXXX) || {
+    modify_backup_dir=$(_main_tx_begin main) || {
         if [ "$modify_lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
         return 1
     }
     if ! _main_create_tx_snapshot "$modify_backup_dir"; then
         _error "无法完整创建改端口事务快照，操作尚未开始。"
-        rm -rf -- "$modify_backup_dir"
+        _main_tx_cleanup "$modify_backup_dir"
         if [ "$modify_lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
         return 1
     fi
@@ -8761,14 +9026,16 @@ _modify_port() (
         echo "$modify_check_result"
         return 1
     fi
+    : > "$modify_backup_dir/restart-required" || return 1
     modify_restart_attempted=1
     if ! _manage_service restart; then
         _error "端口修改后服务重启失败。"
         return 1
     fi
+    _main_tx_commit "$modify_backup_dir" || return 1
     modify_committed=1
     trap - EXIT INT TERM
-    rm -rf -- "$modify_backup_dir" || _warn "端口修改事务快照目录清理失败: $modify_backup_dir"
+    _main_tx_cleanup "$modify_backup_dir" || _warn "端口修改事务快照目录清理失败: $modify_backup_dir"
     if [ "$modify_lock_owned" = "true" ]; then
         export SINGBOXLITE_LOCK_HELD=0
         flock -u 8
@@ -8791,10 +9058,10 @@ _modify_node_apply() (
     fi
 
     local backup_dir restart_attempted=0 restart_needed=0 committed=0
-    backup_dir=$(mktemp -d /tmp/.singbox-modify-node.XXXXXX) || return 1
+    backup_dir=$(_main_tx_begin main) || return 1
     if ! _main_create_tx_snapshot "$backup_dir"; then
         _error "无法完整创建节点修改事务快照，操作尚未开始。"
-        rm -rf -- "$backup_dir"
+        _main_tx_cleanup "$backup_dir"
         if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
         return 1
     fi
@@ -9024,12 +9291,14 @@ _modify_node_apply() (
         return 1
     fi
     if [ "$restart_needed" -eq 1 ]; then
+        : > "$backup_dir/restart-required" || return 1
         restart_attempted=1
         _manage_service restart || { _error "节点修改后服务重启失败。"; return 1; }
     fi
+    _main_tx_commit "$backup_dir" || return 1
     committed=1
     trap - EXIT INT TERM
-    rm -rf -- "$backup_dir" || _warn "节点修改事务快照清理失败: $backup_dir"
+    _main_tx_cleanup "$backup_dir" || _warn "节点修改事务快照清理失败: $backup_dir"
     export MAIN_CREATE_TX_ACTIVE=0 MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
     if [ "$lock_owned" = "true" ]; then export SINGBOXLITE_LOCK_HELD=0; flock -u 8; exec 8>&-; fi
     _success "节点修改已保存并通过配置校验。"
@@ -9264,7 +9533,35 @@ _download_bash_script_atomic() {
     mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
 }
 
-_update_script_locked() {
+_script_update_restore() {
+    local snapshot="$1" i target tmp failed=0 count
+    [ -f "$snapshot/complete" ] || return 1
+    read -r count < "$snapshot/count" || return 1
+    [[ "$count" == 4 ]] || return 1
+    for ((i=0; i<count; i++)); do
+        read -r target < "$snapshot/target-$i" || return 1
+        case "$target" in
+            "$SELF_SCRIPT_PATH"|"$SCRIPT_DIR/advanced_relay.sh"|"$SCRIPT_DIR/parser.sh"|"$SCRIPT_DIR/xray_manager.sh"|"$SINGBOX_DIR/advanced_relay.sh"|"$SINGBOX_DIR/parser.sh"|"$SINGBOX_DIR/xray_manager.sh") ;;
+            *) _error "拒绝恢复事务清单以外的脚本路径。"; return 1 ;;
+        esac
+        if [ -f "$snapshot/$i.present" ]; then [ -s "$snapshot/$i" ] || return 1; fi
+    done
+    for ((i=0; i<count; i++)); do
+        read -r target < "$snapshot/target-$i" || { failed=1; continue; }
+        if [ -f "$snapshot/$i.present" ]; then
+            tmp=$(mktemp "$(dirname "$target")/.script.restore.XXXXXX") || { failed=1; continue; }
+            if ! cp -p -- "$snapshot/$i" "$tmp" || ! mv -f -- "$tmp" "$target"; then
+                rm -f -- "$tmp"
+                failed=1
+            fi
+        else
+            rm -f -- "$target" || failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ]
+}
+
+_update_script_locked() (
     _info "--- 更新脚本 ---"
 
     if [ "$SCRIPT_UPDATE_URL" == "YOUR_GITHUB_RAW_URL_HERE/singbox.sh" ]; then
@@ -9273,11 +9570,11 @@ _update_script_locked() {
         return 1
     fi
 
-    local cache_bust downloaded_version script_name script_path script_url stage backup i j
+    local cache_bust downloaded_version script_name script_path script_url stage i snapshot committed=0
     local names=("singbox.sh" "advanced_relay.sh" "parser.sh" "xray_manager.sh")
     local targets=("$SELF_SCRIPT_PATH")
     local urls=()
-    local stages=() backups=() had_original=()
+    local stages=()
     cache_bust=$(date +%s)
     urls+=("${SCRIPT_UPDATE_URL}?v=${cache_bust}")
 
@@ -9318,47 +9615,30 @@ _update_script_locked() {
         return 1
     fi
 
-    # 所有组件都验证成功后再建立回滚副本。任何一个替换失败都会恢复整组文件。
+    snapshot=$(_main_tx_begin script-update) || { rm -f -- "${stages[@]}"; return 1; }
+    # 副本保留在持久化事务目录；恢复失败时不能再删除唯一的旧组件。
     for i in "${!targets[@]}"; do
         script_path=${targets[$i]}
-        if [ -e "$script_path" ] || [ -L "$script_path" ]; then
-            backup=$(mktemp "$(dirname "$script_path")/.${names[$i]}.rollback.XXXXXX") || {
-                rm -f -- "${stages[@]}" "${backups[@]}"
+        printf '%s\n' "$script_path" > "$snapshot/target-$i" \
+            && _main_create_tx_snapshot_file "$snapshot" "$i" "$script_path" || {
+                rm -f -- "${stages[@]}"
+                _main_tx_cleanup "$snapshot"
                 return 1
             }
-            if ! cp -p -- "$script_path" "$backup"; then
-                rm -f -- "$backup" "${stages[@]}" "${backups[@]}"
-                return 1
-            fi
-            backups+=("$backup")
-            had_original+=(1)
-        else
-            backups+=("")
-            had_original+=(0)
-        fi
     done
-
-    local commit_failed=0
+    printf '%s\n' "${#targets[@]}" > "$snapshot/count" \
+        && printf 'scripts\n' > "$snapshot/kind" && : > "$snapshot/complete" || return 1
+    trap 'update_rc=$?; trap - EXIT INT TERM; rm -f -- "${stages[@]}"; if [ "$committed" -ne 1 ]; then if _script_update_restore "$snapshot" && _main_tx_commit "$snapshot"; then _main_tx_cleanup "$snapshot"; _error "脚本更新未提交，全部组件已恢复。"; else _error "脚本恢复不完整，已保留旧组件: $snapshot"; update_rc=1; fi; else _main_tx_cleanup "$snapshot"; fi; exit "$update_rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     for i in "${!targets[@]}"; do
         if ! chmod 755 "${stages[$i]}" || ! mv -f -- "${stages[$i]}" "${targets[$i]}"; then
-            commit_failed=1
-            break
+            _error "脚本组替换失败，正在恢复更新前的全部组件。"
+            return 1
         fi
     done
-    if [ "$commit_failed" -ne 0 ]; then
-        _error "脚本组提交失败，正在恢复更新前的全部组件。"
-        for j in "${!targets[@]}"; do
-            if [ "${had_original[$j]}" -eq 1 ] && [ -n "${backups[$j]}" ]; then
-                mv -f -- "${backups[$j]}" "${targets[$j]}" 2>/dev/null || true
-            else
-                rm -f -- "${targets[$j]}"
-            fi
-        done
-        rm -f -- "${stages[@]}" "${backups[@]}"
-        return 1
-    fi
-
-    rm -f -- "${stages[@]}" "${backups[@]}"
+    _main_tx_commit "$snapshot" || return 1
+    committed=1
     _success "脚本组件已作为一个事务完成更新：v${SCRIPT_VERSION} -> v${downloaded_version}"
 
     # yq 是独立工具，不参与脚本文件事务；失败时明确提示，不伪报全部成功。
@@ -9369,7 +9649,7 @@ _update_script_locked() {
     _info "请重新运行脚本以应用所有变更："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
     return 0
-}
+)
 
 _update_script() {
     _with_state_lock _update_script_locked
@@ -9831,6 +10111,7 @@ _xray_features() {
 
 _main_menu() {
     while true; do
+        _with_state_lock _recover_all_transactions_locked || return 1
         clear
         # ASCII Logo
         echo -e "${CYAN}"
@@ -10257,6 +10538,54 @@ EOF
 
 # 主节点创建必须作为一个整体提交：协议生成器会依次修改 JSON、YAML、
 # 凭据和 nftables；任一步失败都恢复创建前状态，且只在组合校验通过后重启一次。
+_main_tx_begin() {
+    local family="$1" root="${SINGBOX_DIR}/.transactions" pending
+    case "$family" in main|caddy|script-update) ;; *) return 1 ;; esac
+    [ ! -L "$root" ] || { _error "事务目录不能是符号链接。"; return 1; }
+    mkdir -p "$root" && chmod 700 "$root" || return 1
+    if [ "${MAIN_CREATE_TX_ACTIVE:-0}" != 1 ]; then
+        for pending in "$root"/*; do
+            [ -d "$pending" ] && [ -f "$pending/complete" ] && [ ! -f "$pending/committed" ] || continue
+            _error "仍有未恢复事务，请重新运行脚本或执行 recover-pending: $pending"
+            return 1
+        done
+    fi
+    mktemp -d "${root}/${family}-XXXXXX"
+}
+
+_main_tx_commit() {
+    local tx_dir="$1"
+    : > "$tx_dir/.committed.tmp" && mv -f -- "$tx_dir/.committed.tmp" "$tx_dir/committed"
+}
+
+_main_tx_cleanup() {
+    local tx_dir="$1" resolved root
+    [ -d "$tx_dir" ] || return 0
+    [ ! -L "$tx_dir" ] || return 1
+    resolved=$(cd -- "$tx_dir" && pwd -P) || return 1
+    root=$(cd -- "${SINGBOX_DIR}/.transactions" && pwd -P) || return 1
+    [ "${resolved%/*}" = "$root" ] || return 1
+    case "${resolved##*/}" in main-*|caddy-*|script-update-*) ;; *) return 1 ;; esac
+    if [ -f "$resolved/complete" ]; then
+        [ -f "$resolved/committed" ] || return 1
+        # complete 必须先删除，防止递归清理中断后误把半份旧快照用于回退。
+        rm -f -- "$resolved/complete" || return 1
+    fi
+    rm -rf -- "$resolved"
+}
+
+_singbox_service_running() {
+    case "${INIT_SYSTEM:-direct}" in
+        systemd) systemctl is-active --quiet sing-box >/dev/null 2>&1 ;;
+        openrc) rc-service sing-box status >/dev/null 2>&1 ;;
+        direct)
+            [ -n "${PID_FILE:-}" ] && [ -n "${SINGBOX_BIN:-}" ] || return 1
+            _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 _main_create_tx_snapshot_file() {
     local tx_dir="$1" label="$2" source_file="$3"
     if [ -e "$source_file" ] || [ -L "$source_file" ]; then
@@ -10279,19 +10608,34 @@ _main_create_tx_restore_file() {
 _main_create_tx_snapshot() {
     local tx_dir="$1" credential credential_name nft_tables
     mkdir -p "${tx_dir}/credentials" || return 1
+    : > "${tx_dir}/credentials.list" || return 1
 
     _main_create_tx_snapshot_file "$tx_dir" config.json "$CONFIG_FILE" || return 1
     _main_create_tx_snapshot_file "$tx_dir" metadata.json "$METADATA_FILE" || return 1
     _main_create_tx_snapshot_file "$tx_dir" clash.yaml "$CLASH_YAML_FILE" || return 1
     _main_create_tx_snapshot_file "$tx_dir" argo_metadata.json "$ARGO_METADATA_FILE" || return 1
     _main_create_tx_snapshot_file "$tx_dir" relay.json "$RELAY_CONFIG_FILE" || return 1
+    _main_create_tx_snapshot_file "$tx_dir" time-sync.json "${SINGBOX_DIR}/time-sync.json" || return 1
     _main_create_tx_snapshot_file "$tx_dir" nft-persist.nft "$NFT_PERSIST_FILE" || return 1
     _main_create_tx_snapshot_file "$tx_dir" nftables.conf /etc/nftables.conf || return 1
+    if _singbox_service_running; then
+        printf 'running\n' > "$tx_dir/core.state" || return 1
+    else
+        printf 'stopped\n' > "$tx_dir/core.state" || return 1
+    fi
+    if [ -n "${CADDY_CONF_FILE:-}" ] && [ -n "${CADDY_STATE_FILE:-}" ]; then
+        _main_create_tx_snapshot_file "$tx_dir" caddy.conf "$CADDY_CONF_FILE" || return 1
+        _main_create_tx_snapshot_file "$tx_dir" caddy.state "$CADDY_STATE_FILE" || return 1
+        _caddy_service_snapshot "$tx_dir" || return 1
+        : > "$tx_dir/caddy.captured" || return 1
+        if _caddy_service_running; then : > "$tx_dir/caddy.running" || return 1; fi
+    fi
 
     for credential in "$SINGBOX_DIR"/*.pem "$SINGBOX_DIR"/*.key; do
         [ -f "$credential" ] && [ ! -L "$credential" ] || continue
         credential_name="${credential##*/}"
         cp -p "$credential" "${tx_dir}/credentials/${credential_name}" || return 1
+        printf '%s\0' "$credential_name" >> "$tx_dir/credentials.list" || return 1
     done
 
     # 该表只归 singboxlite 使用。能够枚举 nftables 时保存完整可回放快照；
@@ -10305,6 +10649,8 @@ _main_create_tx_snapshot() {
     else
         : > "${tx_dir}/nft.unavailable" || return 1
     fi
+    printf 'main\n' > "$tx_dir/kind" && : > "$tx_dir/complete" || return 1
+    export MAIN_TRANSACTION_DIR="$tx_dir"
 }
 
 _main_create_tx_restore_credentials() {
@@ -10347,6 +10693,28 @@ _main_create_tx_remove_new_nft_comments() {
 
 _main_create_tx_restore() {
     local tx_dir="$1" restart_required="$2" restore_failed=0
+    local credential_name label
+    [ -f "$tx_dir/complete" ] && [ -f "$tx_dir/credentials.list" ] || return 1
+    for label in config.json metadata.json clash.yaml argo_metadata.json relay.json time-sync.json nft-persist.nft nftables.conf caddy.conf caddy.state caddy.unit; do
+        if [ -f "$tx_dir/$label.present" ]; then [ -f "$tx_dir/$label" ] || return 1; fi
+    done
+    if [ -f "$tx_dir/nft.present" ]; then [ -s "$tx_dir/nft-table.nft" ] || return 1; fi
+    while IFS= read -r -d '' credential_name; do
+        [[ "$credential_name" != */* && "$credential_name" != *\\* ]] || return 1
+        [ -f "$tx_dir/credentials/$credential_name" ] || return 1
+    done < "$tx_dir/credentials.list"
+    if [ -f "$tx_dir/argo-new-port" ]; then
+        local new_argo_port
+        read -r new_argo_port < "$tx_dir/argo-new-port" || return 1
+        [[ "$new_argo_port" =~ ^[0-9]+$ ]] || return 1
+        _stop_argo_tunnel "$new_argo_port" || return 1
+    fi
+    if [ -f "$tx_dir/argo-watchdog-attempted" ] && [ ! -f "$tx_dir/argo-watchdog.present" ]; then
+        _disable_argo_watchdog || restore_failed=1
+    fi
+    if [ -f "$tx_dir/caddy.restart-required" ]; then
+        _caddy_service stop >/dev/null 2>&1 || restore_failed=1
+    fi
 
     # nft 可枚举时以整表快照恢复；否则按新增 tag 精确清理可能创建的 HY2 规则。
     if [ -f "${tx_dir}/nft.available" ]; then
@@ -10365,23 +10733,107 @@ _main_create_tx_restore() {
     _main_create_tx_restore_file "$tx_dir" clash.yaml "$CLASH_YAML_FILE" || restore_failed=1
     _main_create_tx_restore_file "$tx_dir" argo_metadata.json "$ARGO_METADATA_FILE" || restore_failed=1
     _main_create_tx_restore_file "$tx_dir" relay.json "$RELAY_CONFIG_FILE" || restore_failed=1
+    _main_create_tx_restore_file "$tx_dir" time-sync.json "${SINGBOX_DIR}/time-sync.json" || restore_failed=1
     _main_create_tx_restore_file "$tx_dir" nft-persist.nft "$NFT_PERSIST_FILE" || restore_failed=1
     _main_create_tx_restore_file "$tx_dir" nftables.conf /etc/nftables.conf || restore_failed=1
     _main_create_tx_restore_credentials "$tx_dir" || restore_failed=1
+    if [ -f "$tx_dir/caddy.captured" ]; then
+        _main_create_tx_restore_file "$tx_dir" caddy.conf "$CADDY_CONF_FILE" || restore_failed=1
+        _main_create_tx_restore_file "$tx_dir" caddy.state "$CADDY_STATE_FILE" || restore_failed=1
+    fi
     _secure_state_permissions
 
     if [ "$restart_required" -eq 1 ]; then
-        _manage_service restart >/dev/null 2>&1 || restore_failed=1
+        if [ "$(cat "$tx_dir/core.state" 2>/dev/null)" = running ]; then
+            _manage_service restart >/dev/null 2>&1 || restore_failed=1
+        else
+            _manage_service stop >/dev/null 2>&1 || restore_failed=1
+        fi
+    fi
+    if [ -f "$tx_dir/caddy.restart-required" ]; then
+        _caddy_service_restore "$tx_dir" || restore_failed=1
+        if [ -f "$tx_dir/caddy.running" ]; then
+            _caddy_service restart >/dev/null 2>&1 || restore_failed=1
+        else
+            _caddy_service stop >/dev/null 2>&1 || restore_failed=1
+        fi
+    fi
+    if [ -f "$tx_dir/argo-stop-attempted" ]; then
+        _restore_argo_deleted_runtime "$tx_dir" || restore_failed=1
     fi
     [ "$restore_failed" -eq 0 ]
 }
 
+_recover_pending_main_transactions_locked() {
+    local root="${SINGBOX_DIR}/.transactions" tx_dir kind restart_required MAIN_RECOVERY_ACTIVE=1
+    [ -d "$root" ] || return 0
+    [ ! -L "$root" ] || return 1
+    for tx_dir in "$root"/main-* "$root"/caddy-* "$root"/script-update-*; do
+        [ -d "$tx_dir" ] || continue
+        [ ! -L "$tx_dir" ] || return 1
+        if [ -f "$tx_dir/committed" ]; then
+            _main_tx_cleanup "$tx_dir" || return 1
+            continue
+        fi
+        # complete 写入前不会改动活动文件，不能把半份快照用于恢复。
+        if [ ! -f "$tx_dir/complete" ]; then
+            _warn "发现未完成的事务快照，已保留且跳过: $tx_dir"
+            continue
+        fi
+        read -r kind < "$tx_dir/kind" || return 1
+        case "$kind" in
+            main)
+                restart_required=0
+                [ ! -f "$tx_dir/restart-required" ] || restart_required=1
+                _main_create_tx_restore "$tx_dir" "$restart_required" || {
+                    _error "未提交的主事务恢复失败，已保留快照: $tx_dir"; return 1;
+                }
+                ;;
+            caddy)
+                _caddy_tx_restore "$tx_dir" || {
+                    _error "Caddy 未提交事务恢复失败，已保留快照: $tx_dir"; return 1;
+                }
+                ;;
+            scripts)
+                _script_update_restore "$tx_dir" || {
+                    _error "脚本组恢复失败，已保留旧组件: $tx_dir"; return 1;
+                }
+                ;;
+            *) _error "无法识别事务类型，已保留快照: $tx_dir"; return 1 ;;
+        esac
+        _main_tx_commit "$tx_dir" && _main_tx_cleanup "$tx_dir" || return 1
+        _warn "已恢复上次中断的操作。"
+    done
+}
+
+_recover_all_transactions_locked() {
+    local root="${SINGBOX_DIR}/.transactions" family tx_dir script_name script_path pending
+    _recover_pending_main_transactions_locked || return 1
+    for family in relay xray; do
+        pending=0
+        for tx_dir in "$root"/"$family"-*; do
+            [ -d "$tx_dir" ] && [ -f "$tx_dir/complete" ] || continue
+            pending=1
+            break
+        done
+        [ "$pending" -eq 1 ] || continue
+        if [ "$family" = relay ]; then script_name=advanced_relay.sh; else script_name=xray_manager.sh; fi
+        script_path="${SINGBOX_DIR}/${script_name}"
+        [ ! -f "${SCRIPT_DIR}/${script_name}" ] || script_path="${SCRIPT_DIR}/${script_name}"
+        if [ ! -f "$script_path" ]; then
+            _error "恢复 ${family} 事务需要匹配版本的 ${script_name}，请先恢复该组件。"
+            return 1
+        fi
+        bash "$script_path" recover-pending || return 1
+    done
+}
+
 _run_main_create_transaction_locked() (
     local tx_dir committed=0 restart_attempted=0 target_rc=0 check_result
-    tx_dir=$(mktemp -d /tmp/.singbox-create.XXXXXX) || return 1
+    tx_dir=$(_main_tx_begin main) || return 1
     if ! _main_create_tx_snapshot "$tx_dir"; then
         _error "无法完整创建主节点事务快照，操作尚未开始。"
-        rm -rf -- "$tx_dir"
+        _main_tx_cleanup "$tx_dir"
         return 1
     fi
 
@@ -10391,7 +10843,7 @@ _run_main_create_transaction_locked() (
     else
         export MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE=0
     fi
-    trap 'tx_exit_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then if _main_create_tx_restore "$tx_dir" "$restart_attempted"; then _error "主节点创建未提交，已恢复创建前状态。"; rm -rf -- "$tx_dir" || _warn "创建事务已恢复，但快照目录清理失败: $tx_dir"; else _error "主节点创建失败且回滚不完整，请立即检查配置、凭据与 nftables。"; _error "为便于人工恢复，事务快照已保留: $tx_dir"; tx_exit_rc=1; fi; fi; exit "$tx_exit_rc"' EXIT
+    trap 'tx_exit_rc=$?; trap - EXIT INT TERM; if [ "$committed" -ne 1 ]; then _restore_full_transaction_snapshot "$tx_dir" "$restart_attempted" "主节点创建" || tx_exit_rc=1; fi; exit "$tx_exit_rc"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
@@ -10409,15 +10861,17 @@ _run_main_create_transaction_locked() (
         return 1
     fi
 
+    : > "$tx_dir/restart-required" || return 1
     restart_attempted=1
     if ! _manage_service restart; then
         _error "新节点配置重启失败，正在恢复创建前运行状态。"
         return 1
     fi
 
+    _main_tx_commit "$tx_dir" || return 1
     committed=1
     trap - EXIT INT TERM
-    rm -rf -- "$tx_dir"
+    _main_tx_cleanup "$tx_dir"
     unset MAIN_CREATE_TX_ACTIVE MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE
     _success "主节点创建事务已通过组合校验并提交。"
     return 0
@@ -10735,7 +11189,8 @@ main() {
     chmod 700 "${SINGBOX_DIR}" 2>/dev/null || true
     
     # 1. 首次安装或依赖状态失效时才完整检查，避免每次 sb 进入菜单都触发包管理器
-    _install_dependencies
+    _install_dependencies || return 1
+    _with_state_lock _recover_all_transactions_locked || return 1
     
     # 2. 根据核心安装状态决定初始化路径
     if [ -f "${SINGBOX_BIN}" ]; then
@@ -10830,9 +11285,14 @@ main() {
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        recover-pending)
+            _check_root
+            _with_state_lock _recover_all_transactions_locked
+            exit $?
+            ;;
         keepalive)
-            _argo_keepalive
-            exit 0
+            _with_state_lock _recover_all_transactions_locked && _argo_keepalive
+            exit $?
             ;;
         cleanup-logs)
             _cleanup_runtime_logs

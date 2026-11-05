@@ -48,10 +48,12 @@ awk '/^# --- WARP 出口 ---$/,/^# --- WARP 出口结束 ---$/' "$ROOT/advanced_
 
 # 这些基础设施是被测代码的真实依赖（原子写、事务快照），必须用真实实现。
 for fn in _make_same_dir_tmp _atomic_modify_json _atomic_write_json \
-          _txn_begin _txn_snapshot_file _txn_restore_file _txn_cleanup; do
+          _restart_checked; do
     sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/advanced_relay.sh" > "$WORK/${fn}.sh"
     [ -s "$WORK/${fn}.sh" ] || { echo "抽取 ${fn} 失败" >&2; exit 1; }
 done
+awk '/^# --- 中转持久事务 ---$/,/^# --- 中转持久事务结束 ---$/' "$ROOT/advanced_relay.sh" > "$WORK/transactions.sh"
+[ -s "$WORK/transactions.sh" ] || { echo "抽取中转事务块失败" >&2; exit 1; }
 
 SINGBOX_DIR="$WORK/etc"
 RELAY_CONFIG_FILE="$WORK/etc/relay.json"
@@ -70,7 +72,7 @@ _state_lock_release() { return 0; }
 
 # shellcheck disable=SC1090
 for f in _make_same_dir_tmp _atomic_modify_json _atomic_write_json \
-         _txn_begin _txn_snapshot_file _txn_restore_file _txn_cleanup warp_block; do
+         _restart_checked transactions warp_block; do
     . "$WORK/${f}.sh"
 done
 
@@ -104,6 +106,7 @@ SINGBOX_BIN="$WORK/bin/sing-box"
 
 _manage_service() { echo "service:$1" >> "$WORK/service_calls"; return 0; }
 _check_combined_config() { return 0; }
+WARP_REAL_SELFCHECK=$(declare -f _warp_selfcheck)
 _warp_selfcheck() { return 0; }
 _warp_api_register() {
     cat <<'EOJ'
@@ -127,6 +130,7 @@ reset_main() { # 入站 tag 列表
     printf '%s' "{\"inbounds\": $tags}" > "$MAIN_CONFIG_FILE"
 }
 reset_state() {
+    RELAY_TX_ACTIVE="" RELAY_TX_BLOCKED=0 RELAY_TX_RECOVERING=0
     rm -rf "$SINGBOX_DIR"
     mkdir -p "$SINGBOX_DIR"
     reset_relay
@@ -302,11 +306,148 @@ fi
 reset_state
 _warp_register_device >/dev/null 2>&1
 before=$(jq -c '.' "$RELAY_CONFIG_FILE")
-_check_combined_config() { return 1; }
+_check_combined_config() {
+    if [ ! -f "$WORK/check-failed" ]; then
+        : > "$WORK/check-failed"
+        return 1
+    fi
+    return 0
+}
 _warp_commit yes >/dev/null 2>&1
 check_rc "组合校验失败时事务返回失败" 1 "$?"
 check "relay.json 已回滚到操作前" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
 _check_combined_config() { return 0; }
+
+# 菜单操作失败后，状态文件和运行配置必须一起恢复，后续操作不能重放失败的解绑。
+reset_state
+_warp_register_device >/dev/null 2>&1
+printf '%s\n' '["vless-reality-in-1"]' > "$WARP_NODES_FILE"
+_warp_sync_relay >/dev/null 2>&1
+before=$(jq -c '.' "$RELAY_CONFIG_FILE")
+_manage_service() {
+    [ "$1" != status ] || return 0
+    if [ ! -f "$WORK/restart-failed" ]; then
+        : > "$WORK/restart-failed"
+        return 1
+    fi
+    return 0
+}
+node_choice=$(_warp_candidate_inbounds | grep -nx 'vless-reality-in-1' | cut -d: -f1)
+printf '%s\n' "$node_choice" | _warp_node_menu >/dev/null 2>&1
+check_rc "解绑重启失败返回非零" 1 "$?"
+check "失败解绑恢复节点绑定清单" '["vless-reality-in-1"]' "$(jq -c '.' "$WARP_NODES_FILE")"
+check "失败解绑恢复运行配置" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+_warp_commit no >/dev/null 2>&1
+check_rc "恢复后下一次提交可成功" 0 "$?"
+check "下一次提交不会重放失败的解绑" "1" "$(jq '[.route.rules[] | select(.outbound == "warp" and .inbound == ["vless-reality-in-1"])] | length' "$RELAY_CONFIG_FILE")"
+_manage_service() { echo "service:$1" >> "$WORK/service_calls"; return 0; }
+
+# 分流与地址族菜单必须在改写源状态之前取得整组快照。
+reset_state
+_warp_register_device >/dev/null 2>&1
+_warp_sync_relay >/dev/null 2>&1
+rules_before=$(jq -c '.' "$WARP_RULES_FILE")
+reg_before=$(jq -c '.' "$WARP_REG_FILE")
+_warp_selfcheck() { return 1; }
+_warp_domain_menu <<< $'1\nexample.org\n' >/dev/null 2>&1
+check_rc "域名菜单自检失败返回非零" 1 "$?"
+check "域名菜单失败恢复分流清单" "$rules_before" "$(jq -c '.' "$WARP_RULES_FILE")"
+_warp_family_menu <<< '2' >/dev/null 2>&1
+check_rc "地址族菜单自检失败返回非零" 1 "$?"
+check "地址族菜单失败恢复注册状态" "$reg_before" "$(jq -c '.' "$WARP_REG_FILE")"
+_warp_selfcheck() { return 0; }
+
+# 读取失败不能被当作空清单提交，否则已有节点会静默退回原出口。
+reset_state
+_warp_register_device >/dev/null 2>&1
+printf '%s\n' '["vless-reality-in-1"]' > "$WARP_NODES_FILE"
+_warp_sync_relay >/dev/null 2>&1
+before=$(jq -c '.' "$RELAY_CONFIG_FILE")
+printf 'invalid-json\n' > "$WARP_NODES_FILE"
+_warp_commit no >/dev/null 2>&1
+check_rc "状态清单损坏时拒绝提交" 1 "$?"
+check "读取失败不会清空已有节点路由" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+
+# 进程内中断要先恢复整组状态，再释放锁退出。
+reset_state
+_warp_register_device >/dev/null 2>&1
+printf '%s\n' '["vless-reality-in-1"]' > "$WARP_NODES_FILE"
+_warp_sync_relay >/dev/null 2>&1
+before=$(jq -c '.' "$RELAY_CONFIG_FILE")
+node_choice=$(_warp_candidate_inbounds | grep -nx 'vless-reality-in-1' | cut -d: -f1)
+(
+    trap '_relay_exit "$?"' EXIT
+    trap '_relay_exit 143' TERM
+    _manage_service() {
+        [ "$1" != status ] || return 0
+        if [ ! -f "$WORK/warp-signal-fired" ]; then
+            : > "$WORK/warp-signal-fired"
+            kill -TERM "$BASHPID"
+        fi
+        cp "$RELAY_CONFIG_FILE" "$WORK/warp-running"
+    }
+    _warp_node_menu <<< "$node_choice"
+) >/dev/null 2>&1
+check_rc "解绑期间 TERM 返回非零" 1 "$?"
+check "TERM 后恢复节点清单" '["vless-reality-in-1"]' "$(jq -c '.' "$WARP_NODES_FILE")"
+check "TERM 后恢复配置" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+check "TERM 后服务加载原配置" "$before" "$(jq -c '.' "$WORK/warp-running")"
+
+# 使用真实自检启动逻辑；只有探测核心和 curl 是替身，中断不能留下后台进程。
+cat > "$WORK/bin/probe-core" <<'EOS'
+#!/usr/bin/env bash
+case "${1:-}" in
+    check) exit 0 ;;
+    run) printf '%s\n' "$$" > "$PROBE_PID_FILE"; exec sleep 60 ;;
+    *) exit 1 ;;
+esac
+EOS
+chmod 755 "$WORK/bin/probe-core"
+export PROBE_PID_FILE="$WORK/probe.pid"
+(
+    trap '_relay_exit "$?"' EXIT
+    trap '_relay_exit 143' TERM
+    eval "$WARP_REAL_SELFCHECK"
+    SINGBOX_BIN="$WORK/bin/probe-core"
+    _warp_pick_free_port() { printf '48000\n'; }
+    probe_owner="$BASHPID"
+    curl() { kill -TERM "$probe_owner"; }
+    _warp_selfcheck
+) >/dev/null 2>&1
+check_rc "自检期间 TERM 返回非零" 1 "$?"
+probe_pid=$(cat "$PROBE_PID_FILE")
+check "自检中断清理后台核心" "stopped" "$(kill -0 "$probe_pid" 2>/dev/null && echo running || echo stopped)"
+kill "$probe_pid" 2>/dev/null || true
+
+# 恢复本身失败时不得清掉最后一份快照或继续接受写入；新进程可重试恢复。
+reset_state
+_warp_register_device >/dev/null 2>&1
+printf '%s\n' '["vless-reality-in-1"]' > "$WARP_NODES_FILE"
+_warp_sync_relay >/dev/null 2>&1
+before=$(jq -c '.' "$RELAY_CONFIG_FILE")
+cp() {
+    [ "${RESTORE_FAIL:-0}" = 1 ] && [[ "${2:-}" == */relay ]] && return 1
+    command cp "$@"
+}
+RESTORE_FAIL=1
+_warp_selfcheck() { return 1; }
+_warp_commit yes keep _warp_change_node vless-reality-in-1 >/dev/null 2>&1
+check_rc "恢复失败返回非零" 1 "$?"
+check "恢复失败阻止后续写入" "1" "${RELAY_TX_BLOCKED:-0}"
+retained="$RELAY_TX_ACTIVE"
+check "恢复失败保留完整快照" "yes" "$([ -f "$retained/complete" ] && echo yes || echo no)"
+after_failure=$(jq -c '.' "$RELAY_CONFIG_FILE")
+_warp_commit no keep _warp_change_node vless-reality-in-1 >/dev/null 2>&1
+check_rc "恢复失败后新的变更被拒绝" 1 "$?"
+check "拒绝变更不会改写配置" "$after_failure" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+unset RESTORE_FAIL
+unset -f cp
+_warp_selfcheck() { return 0; }
+RELAY_TX_ACTIVE="" RELAY_TX_BLOCKED=0
+_relay_recover_pending >/dev/null 2>&1
+check_rc "重新启动后可恢复持久快照" 0 "$?"
+check "持久恢复还原原配置" "$before" "$(jq -c '.' "$RELAY_CONFIG_FILE")"
+check "持久恢复成功后清理事务" "no" "$([ -d "$retained" ] && echo yes || echo no)"
 
 # --- 校验函数 -----------------------------------------------------------
 _warp_valid_domain "openai.com"
