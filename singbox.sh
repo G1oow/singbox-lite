@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="118"
+export SCRIPT_VERSION="119"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4169,6 +4169,102 @@ _choose_tls_material() {
     esac
 }
 
+# 伪装域名/SNI 候选清单 (TSV: 来源说明 \t 域名)。
+# 手打域名既容易写错，也容易和本机已有配置不一致，因此把本机已知可用的域名做成选项：
+#   1. [21] 部署的伪装站域名：Reality 回落站点与 TLS 类协议共用同一域名，证书可直接复用；
+#   2. 现有 Reality 节点正在用的伪装域名：新建节点沿用它，回落站点与探针表现保持一致。
+# 两类都没有时返回空，调用方退回纯手输，是否需要必填仍由调用方决定。
+_sni_candidates() {
+    local cfg="${CONFIG_FILE:-}" state="${CADDY_STATE_FILE:-}" domain seen=" "
+    if [ -n "$state" ] && [ -s "$state" ]; then
+        # 归一化 CRLF：Windows 原生 jq 会带 \r，域名会因此与去重表、SNI 比较不上
+        domain=$(jq -r '.domain // empty' "$state" 2>/dev/null | head -n 1 | tr -d '\r')
+        if [ -n "$domain" ]; then
+            printf '自建伪装站域名，证书可直接复用\t%s\n' "$domain"
+            seen="${seen}${domain} "
+        fi
+    fi
+    [ -n "$cfg" ] && [ -s "$cfg" ] || return 0
+    while IFS= read -r domain; do
+        [ -n "$domain" ] || continue
+        case "$seen" in *" ${domain} "*) continue ;; esac
+        seen="${seen}${domain} "
+        printf '现有 Reality 节点正在使用\t%s\n' "$domain"
+    done < <(jq -r '
+        .inbounds[]?
+        | select(type == "object")
+        | (.tls // {}) as $tls
+        | select(($tls.reality.enabled // false) == true)
+        | ($tls.server_name // $tls.reality.handshake.server // empty)
+        | select(. != "" and . != "127.0.0.1" and . != "::1")
+    ' "$cfg" 2>/dev/null | tr -d '\r')
+}
+
+# 交互式输入伪装域名/SNI：有候选就先列成选项（回车默认第 1 项），没有候选才退回纯手输。
+# $1=名称（如“伪装域名/SNI”），$2=手输或空输入时的默认值（可空）。
+# 域名单走 stdout，菜单与提示走 stderr，调用方可以直接写在 $(...) 里。
+_prompt_sni_choice() {
+    local label="${1:-伪装域名/SNI}" default="${2:-}"
+    local -a domains=() origins=()
+    local origin domain choice manual i total
+    while IFS=$'\t' read -r origin domain; do
+        [ -n "$domain" ] || continue
+        domains+=("$domain")
+        origins+=("$origin")
+    done < <(_sni_candidates)
+    total=${#domains[@]}
+
+    if [ "$total" -gt 0 ]; then
+        echo "请选择${label}:" >&2
+        for i in "${!domains[@]}"; do
+            echo "  $((i + 1))) ${domains[$i]}  (${origins[$i]})" >&2
+        done
+        echo "  $((total + 1))) 手动输入" >&2
+        read -p "请选择 [1-$((total + 1))] 或直接输入域名 (默认: 1): " choice
+        choice=$(printf '%s' "${choice:-1}" | tr -d '[:space:]')
+        if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+            # 允许在编号处直接打域名，省掉先选“手动输入”这一步
+            printf '%s' "$choice"
+            return 0
+        fi
+        if [ "$choice" -lt 1 ] || [ "$choice" -gt "$((total + 1))" ]; then
+            _error "无效选择。"
+            return 1
+        fi
+        if [ "$choice" -le "$total" ]; then
+            printf '%s' "${domains[$((choice - 1))]}"
+            return 0
+        fi
+    fi
+
+    if [ -n "$default" ]; then
+        read -p "请输入${label} (默认: ${default}): " manual
+        printf '%s' "${manual:-$default}"
+    else
+        read -p "请输入${label}: " manual
+        printf '%s' "$manual"
+    fi
+    return 0
+}
+
+# Reality 用伪装站域名做 SNI 时，证书来自 Caddy。
+# 回环回落模式（Reality 自己占 443）下 handshake 必须指向 127.0.0.1:<回环端口>，
+# 否则 Reality 会回头连自己的 443 端口形成自环；Caddy 独占 443 时保持域名即可。
+_reality_handshake_align_camouflage() {
+    local tag="$1" sni="$2" camo scope fallback
+    camo=$(_camouflage_state_field '.domain' 2>/dev/null | tr -d '\r' || true)
+    [ -n "$camo" ] && [ "$sni" = "$camo" ] || return 0
+    scope=$(_camouflage_state_field '.listenScope' 2>/dev/null | tr -d '\r' || true)
+    [ "$scope" = "loopback" ] || return 0
+    fallback=$(_camouflage_state_field '.fallbackPort' 2>/dev/null | tr -d '\r' || true)
+    fallback=${fallback:-${CADDY_FALLBACK_PORT:-8443}}
+    _atomic_modify_json "$CONFIG_FILE" '
+        (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = "127.0.0.1"
+        | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server_port) = ($port | tonumber)
+    ' --arg tag "$tag" --arg port "$fallback" || return 1
+    _info "伪装站域名的证书由 Caddy 提供，该 Reality 节点的 handshake 已指向 127.0.0.1:${fallback}。"
+}
+
 # 注意: _atomic_modify_json, _atomic_modify_yaml, _get_proxy_field, _add_node_to_yaml, _remove_node_from_yaml
 # 均在上方统一定义，此处不再重复定义以避免不一致
 
@@ -4417,9 +4513,8 @@ _add_vless_ws_tls() {
              client_server_addr="[${client_server_addr}]"
         fi
 
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
-        _info " (例如: xxx.741865.xyz)"
-        read -p "请输入伪装域名: " camouflage_domain
+        _info "伪装域名必须是本机证书对应的域名；已部署的伪装站域名可直接选。"
+        camouflage_domain=$(_prompt_sni_choice "伪装域名") || return 1
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
@@ -4562,9 +4657,8 @@ _add_vless_grpc_tls() {
              client_server_addr="[${client_server_addr}]"
         fi
 
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
-        _info " (例如: xxx.741865.xyz)"
-        read -p "请输入伪装域名: " camouflage_domain
+        _info "伪装域名必须是本机证书对应的域名；已部署的伪装站域名可直接选。"
+        camouflage_domain=$(_prompt_sni_choice "伪装域名") || return 1
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
@@ -4694,8 +4788,8 @@ _add_trojan_ws_tls() {
              client_server_addr="[${client_server_addr}]"
         fi
 
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
-        read -p "请输入伪装域名: " camouflage_domain
+        _info "伪装域名必须是本机证书对应的域名；已部署的伪装站域名可直接选。"
+        camouflage_domain=$(_prompt_sni_choice "伪装域名") || return 1
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
@@ -4961,6 +5055,7 @@ _create_anyreality_node() {
         }')
 
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+    _reality_handshake_align_camouflage "$tag" "$server_name" || return 1
 
     local link_ip="$node_ip"
     [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
@@ -5022,8 +5117,8 @@ _add_anytls() {
             fi
             break
         done
-        read -p "请输入伪装域名/SNI (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        camouflage_domain=$(_prompt_sni_choice "伪装域名/SNI" "$DEFAULT_SNI") || return 1
+        server_name=${camouflage_domain:-$DEFAULT_SNI}
     fi
 
     local password=""
@@ -5103,8 +5198,8 @@ _add_vless_reality() {
         [ -z "$node_ip" ] && node_ip="$server_ip"
     else
         node_ip=$(_choose_connect_addr "$server_ip")
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        camouflage_domain=$(_prompt_sni_choice "伪装域名" "$DEFAULT_SNI") || return 1
+        server_name=${camouflage_domain:-$DEFAULT_SNI}
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -5129,6 +5224,7 @@ _add_vless_reality() {
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pk "$private_key" --arg sid "$short_id" \
         '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+    _reality_handshake_align_camouflage "$tag" "$server_name" || return 1
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$public_key\", \"shortId\": \"$short_id\"}}" || return 1
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
@@ -5239,8 +5335,8 @@ _add_hysteria2() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        camouflage_domain=$(_prompt_sni_choice "伪装域名" "$DEFAULT_SNI") || return 1
+        server_name=${camouflage_domain:-$DEFAULT_SNI}
     fi
 
     local tag="hy2-in-${port}"
@@ -5403,8 +5499,8 @@ _add_tuic() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        camouflage_domain=$(_prompt_sni_choice "伪装域名" "$DEFAULT_SNI") || return 1
+        server_name=${camouflage_domain:-$DEFAULT_SNI}
     fi
 
     local tag="tuic-in-${port}"
@@ -5549,8 +5645,8 @@ _add_shadowsocks_menu() {
     local shadowtls_sni="www.amd.com"
     if [ "$use_shadowtls" == "true" ]; then
         shadowtls_password=$(${SINGBOX_BIN} generate rand --hex 16)
-        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.amd.com): " custom_sni
-        shadowtls_sni=${custom_sni:-www.amd.com}
+        shadowtls_sni=$(_prompt_sni_choice "ShadowTLS 伪装白名单域名" "$DEFAULT_SNI") || return 1
+        shadowtls_sni=${shadowtls_sni:-$DEFAULT_SNI}
     fi
 
     local tag="${name_prefix}-in-${port}"
@@ -9417,20 +9513,20 @@ _modify_node() {
             case "$variant" in
                 vless-reality|any-reality)
                     current=$(printf '%s' "$expected_node" | jq -r '.tls.server_name // .tls.reality.handshake.server // empty')
-                    read -r -p "请输入新伪装域名/SNI (当前: ${current}): " value
+                    value=$(_prompt_sni_choice "新伪装域名/SNI" "$current") || return 1
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
                     ;;
                 shadowsocks-shadowtls)
                     current=$(printf '%s' "$expected_node" | jq -r '.handshake.server // empty')
-                    read -r -p "请输入新伪装域名 (当前: ${current}): " value
+                    value=$(_prompt_sni_choice "新伪装域名" "$current") || return 1
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "伪装域名格式无效。"; return 1; }
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
                     ;;
                 vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic)
                     current=$(printf '%s' "$expected_node" | jq -r '.tls.server_name // empty')
                     [ -n "$current" ] || current=$(_get_proxy_field "$proxy_name" '.sni // .servername // ""')
-                    read -r -p "请输入新 SNI/证书域名 (当前: ${current}): " value
+                    value=$(_prompt_sni_choice "新 SNI/证书域名" "$current") || return 1
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
                     local shared_pair="" shared_cert="" shared_key=""
                     if [ "$value" = "$(_camouflage_state_domain)" ]; then
