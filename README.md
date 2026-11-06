@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v118`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v119`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -595,3 +595,10 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 脚本更新恢复失败时保留旧组件；主节点、Caddy、中转、WARP 与 Xray 的完整事务快照持久化，提供 `recover-pending` 重试入口。
 - 清空端口转发传播删除与持久化失败；WARP 回退覆盖注册信息、分流和节点绑定。
 - Xray 监听迁移失败恢复原状态，元数据写入失败触发回滚，改端口保持分享链接传输参数不变。
+
+### v119：伪装域名/SNI 候选选择
+
+- 创建节点（VLESS-Reality、VLESS-WS/gRPC-TLS、Trojan-WS-TLS、AnyTLS、Any-Reality、Hysteria2、TUIC、Shadowsocks+ShadowTLS）与 `[5] 修改节点` 的伪装域名/SNI 输入改为选项式：先检测 `[21]` 自建伪装站域名，存在时作为首选（证书可直接复用），否则列出其他 Reality 节点正在使用的域名，最后一项才手动输入，编号处也可直接打域名；没有任何候选时行为与原来一致。
+- 新增 `_sni_candidates` / `_prompt_sni_choice` 作为统一入口，各协议不再各自拼提示语；默认值统一取 `DEFAULT_SNI`，不再散落硬编码。
+- 新建 Reality 节点若选了伪装站域名，`handshake` 与 `[21]` 保持一致：回环回落模式下指向 `127.0.0.1:<回环端口>`，避免 Reality 回头连自己的 443 端口形成自环。
+- 新增上述函数的回归测试；`SCRIPT_VERSION` 递增到 119。

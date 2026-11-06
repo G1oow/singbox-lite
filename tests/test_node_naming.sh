@@ -151,6 +151,89 @@ check "探测失败且无地址时手动输入" "vpn.example.org" \
 STUB_V4="192.0.2.10"; STUB_V6="2001:db8::1"
 check "NODE_CONNECT_ADDR 覆盖" "my.domain" \
     "$(printf '\n' | NODE_CONNECT_ADDR=my.domain _choose_connect_addr 198.51.100.10)"
+echo "== 伪装域名/SNI 候选选择 =="
+# 按函数名抽取（这几段不在按锚点抽取的范围内）
+SNI_FNS="$WORK/sni_choice.sh"
+: > "$SNI_FNS"
+for fn in _sni_candidates _prompt_sni_choice _reality_handshake_align_camouflage _camouflage_state_field; do
+    sed -n "/^${fn}() {\$/,/^}\$/p" "$ROOT/singbox.sh" >> "$SNI_FNS"
+done
+# shellcheck disable=SC1090
+. "$SNI_FNS"
+
+DEFAULT_SNI="www.amd.com"
+SNI_STATE="$WORK/sni-state.json"
+SNI_CFG="$WORK/sni-config.json"
+rm -f "$SNI_STATE" "$SNI_CFG"
+
+# 候选与默认值都走 stdout，Windows 原生 jq 的 CRLF 在断言边界归一化
+sni_candidates() { CONFIG_FILE="$SNI_CFG" CADDY_STATE_FILE="$SNI_STATE" _sni_candidates | tr -d '\r'; }
+sni_pick() { local stdin="$1"; shift; printf '%s' "$stdin" | CONFIG_FILE="$SNI_CFG" CADDY_STATE_FILE="$SNI_STATE" _prompt_sni_choice "$@" | tr -d '\r'; }
+
+check "无候选时退回手输" "custom.example.net" "$(sni_pick $'custom.example.net\n' "伪装域名" "$DEFAULT_SNI")"
+check "无候选时空输入取默认值" "$DEFAULT_SNI" "$(sni_pick $'\n' "伪装域名" "$DEFAULT_SNI")"
+check "无候选且无默认值时允许空值" "" "$(sni_pick $'\n' "伪装域名")"
+
+jq -n --arg d "vpn.example.com" '{domain:$d, fallbackPort:8443, listenScope:"loopback"}' > "$SNI_STATE"
+check "自建伪装站域名排第一" "$(printf '%s\t%s' '自建伪装站域名，证书可直接复用' 'vpn.example.com')" "$(sni_candidates)"
+check "默认选中伪装站域名" "vpn.example.com" "$(sni_pick $'\n' "伪装域名" "$DEFAULT_SNI")"
+
+jq -n '{inbounds:[
+    {type:"vless", tag:"vless-in-443", listen_port:443,
+     tls:{enabled:true, server_name:"relay.example.org",
+          reality:{enabled:true, handshake:{server:"127.0.0.1", server_port:8443}}}},
+    {type:"anytls", tag:"anytls-in-10000", listen_port:10000,
+     tls:{enabled:true, server_name:"tls.example.net"}}
+]}' > "$SNI_CFG"
+check "候选包含现有 Reality 域名并排除非 Reality 节点的 SNI" \
+    "$(printf '%s\t%s\n%s\t%s' '自建伪装站域名，证书可直接复用' 'vpn.example.com' '现有 Reality 节点正在使用' 'relay.example.org')" \
+    "$(sni_candidates)"
+check "选中第 2 项" "relay.example.org" "$(sni_pick $'2\n' "伪装域名" "$DEFAULT_SNI")"
+check "最后一项为手动输入" "manual.example.io" "$(sni_pick $'3\nmanual.example.io\n' "伪装域名" "$DEFAULT_SNI")"
+check "编号处直接输入域名等同手动输入" "typed.example.io" "$(sni_pick $'typed.example.io\n' "伪装域名" "$DEFAULT_SNI")"
+check "手动输入为空时取默认值" "$DEFAULT_SNI" "$(sni_pick $'3\n\n' "伪装域名" "$DEFAULT_SNI")"
+check "无效编号返回失败" "1" "$(sni_pick $'9\n' "伪装域名" >/dev/null 2>&1; echo $?)"
+
+jq -n '{inbounds:[{type:"vless", tag:"vless-in-443", listen_port:443,
+    tls:{enabled:true, server_name:"vpn.example.com",
+         reality:{enabled:true, handshake:{server:"vpn.example.com", server_port:443}}}}]}' > "$SNI_CFG"
+check "与伪装站同名的 Reality 域名不重复列出" \
+    "$(printf '%s\t%s' '自建伪装站域名，证书可直接复用' 'vpn.example.com')" "$(sni_candidates)"
+
+rm -f "$SNI_STATE"
+check "没有伪装站时参考现有 Reality 域名" \
+    "$(printf '%s\t%s' '现有 Reality 节点正在使用' 'vpn.example.com')" "$(sni_candidates)"
+
+echo "== Reality handshake 与伪装站域名对齐 =="
+ALIGN_CFG="$WORK/sni-align.json"
+# 测试替身：真实实现走临时文件 + mv，这里只落实同样的 jq 改写语义
+_atomic_modify_json() {
+    local file="$1" filter="$2"; shift 2
+    jq "$@" "$filter" "$file" > "${file}.tmp" && mv -f "${file}.tmp" "$file"
+}
+write_align_cfg() {
+    jq -n '{inbounds:[{type:"vless", tag:"vless-in-443", listen_port:443,
+        tls:{enabled:true, server_name:"vpn.example.com",
+             reality:{enabled:true, handshake:{server:"vpn.example.com", server_port:443}}}}]}' > "$ALIGN_CFG"
+}
+align_handshake() { CONFIG_FILE="$ALIGN_CFG" CADDY_STATE_FILE="$SNI_STATE" \
+    _reality_handshake_align_camouflage "$1" "$2" >/dev/null 2>&1
+    jq -r '.inbounds[0].tls.reality.handshake | "\(.server):\(.server_port)"' "$ALIGN_CFG" | tr -d '\r'; }
+
+write_align_cfg
+jq -n --arg d "vpn.example.com" '{domain:$d, fallbackPort:8443, listenScope:"loopback"}' > "$SNI_STATE"
+check "回环回落模式指向本机回落站" "127.0.0.1:8443" "$(align_handshake "vless-in-443" "vpn.example.com")"
+
+write_align_cfg
+jq -n --arg d "vpn.example.com" '{domain:$d, fallbackPort:8443, listenScope:"public"}' > "$SNI_STATE"
+check "Caddy 独占 443 时保留域名" "vpn.example.com:443" "$(align_handshake "vless-in-443" "vpn.example.com")"
+
+write_align_cfg
+jq -n --arg d "vpn.example.com" '{domain:$d, fallbackPort:8443, listenScope:"loopback"}' > "$SNI_STATE"
+check "SNI 不是伪装站域名时不改写" "vpn.example.com:443" "$(align_handshake "vless-in-443" "other.example.org")"
+
+rm -f "$SNI_STATE" "$SNI_CFG"
+
 
 echo "== Xray 单独运行时的地址选择兜底 =="
 standalone_addr=$(bash -c '
