@@ -897,6 +897,7 @@ EOF
 # 事务故障回归复用本测试入口，CI 无需新增任务。
 if [ "${XRAY_OPERATIONS_ONLY:-0}" != 1 ]; then
     bash "$ROOT/tests/test_runtime_transactions.sh" || fail=$((fail + 1))
+    bash "$ROOT/tests/test_ntp_probe.sh" || fail=$((fail + 1))
 fi
 
 echo

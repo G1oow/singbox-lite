@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="119"
+export SCRIPT_VERSION="120"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -846,6 +846,7 @@ _manage_service() {
             return 1
         fi
         _secure_state_permissions
+        _time_mark_verify_window
     fi
 
     [ -z "$INIT_SYSTEM" ] && _detect_init_system
@@ -935,6 +936,12 @@ _manage_service() {
             ;;
         *) _error "不支持的服务管理系统" ;;
     esac
+
+    # 脚本探测走本机直连，核心走自己的 DNS/出站；重启后用核心日志复核一次。
+    if [[ "$action" == "start" || "$action" == "restart" ]]; then
+        _time_confirm_core_ntp || true
+    fi
+    return 0
 }
 
 # 智能包管理
@@ -1143,6 +1150,109 @@ _time_probe_ntp() {
     TIME_PROBE_SOURCE="$server:$port"
 }
 
+# 探测方式要写进日志与 sidecar：脚本走本机直连 UDP，核心走自己的 DNS 与出站，
+# 两条路径可以得出相反结论（脚本说可达、核心超时）。
+TIME_NTP_PROBE_METHOD="本机直连 UDP/123，3s 超时，不经代理"
+
+# 核心的 NTP 结论只出现在自身日志里：成功是 INFO，超时是 ERROR。
+_time_core_ntp_logs() {
+    local since="$1" limit="${2:-500}" log_path="${LOG_FILE:-/var/log/sing-box.log}"
+    if [ "${INIT_SYSTEM:-}" = systemd ] && command -v journalctl >/dev/null 2>&1; then
+        journalctl -u sing-box --since "$since" -n "$limit" --no-pager 2>/dev/null
+    elif [ -r "$log_path" ]; then
+        tail -n "$limit" "$log_path" 2>/dev/null
+    fi
+}
+
+# 在有界窗口内轮询核心日志；取不到明确结论就报告未知，不假设成功。
+_time_core_ntp_verdict() {
+    local since="$1" waited="${TIME_CORE_VERIFY_WAIT:-8}" i logs
+    [[ "$waited" =~ ^[0-9]+$ ]] || waited=8
+    TIME_CORE_NTP_VERDICT=unknown TIME_CORE_NTP_DETAIL=""
+    for ((i = 0; i <= waited; i++)); do
+        logs=$(_time_core_ntp_logs "$since")
+        if printf '%s\n' "$logs" | grep -q 'ntp: updated time'; then
+            TIME_CORE_NTP_VERDICT=ok
+            return 0
+        fi
+        if printf '%s\n' "$logs" | grep -q 'ntp: initialize time'; then
+            TIME_CORE_NTP_VERDICT=failed
+            TIME_CORE_NTP_DETAIL=$(printf '%s\n' "$logs" | grep 'ntp: initialize time' | tail -n 1)
+            return 0
+        fi
+        ((i < waited)) && sleep 1
+    done
+    return 0
+}
+
+# 核心已证明不可达的源，后续自动探测直接跳过，避免被同一个坏源反复带偏。
+_time_ntp_source_rejected() {
+    local state_file="${SINGBOX_DIR}/time-sync.json"
+    [ -s "$state_file" ] || return 1
+    jq -e --arg s "$1" '(.core_failed_sources // []) | index($s) != null' "$state_file" >/dev/null 2>&1
+}
+
+# 重启后用核心日志复核刚写入的 ntp.server：核心侧不可达就回退到改动前的配置。
+# 回退只重启一次，TIME_NTP_ROLLBACK_ACTIVE 阻断嵌套探测与二次复核。
+# 复核窗口必须从这次重启开始算，否则会读到新源生效前的旧 ERROR 日志而误判。
+_time_mark_verify_window() {
+    local state_file="${SINGBOX_DIR}/time-sync.json"
+    [ -s "$state_file" ] || return 0
+    [ -n "$(jq -r '.pending_verify // empty' "$state_file" 2>/dev/null)" ] || return 0
+    _atomic_modify_json "$state_file" '.pending_verify.since = $since' \
+        --arg since "$(date '+%Y-%m-%d %H:%M:%S')" || true
+}
+
+_time_confirm_core_ntp() {
+    local state_file="${SINGBOX_DIR}/time-sync.json"
+    local since source previous present host checked
+    [ "${TIME_CORE_VERIFY:-1}" = 0 ] && return 0
+    [ "${TIME_NTP_ROLLBACK_ACTIVE:-0}" = 1 ] && return 0
+    [ -s "$state_file" ] || return 0
+    [ -n "$(jq -r '.pending_verify // empty' "$state_file" 2>/dev/null)" ] || return 0
+    since=$(jq -r '.pending_verify.since // empty' "$state_file" 2>/dev/null)
+    [ -n "$since" ] || return 0
+    source=$(jq -r '.pending_verify.source // empty' "$state_file" 2>/dev/null)
+    previous=$(jq -c '.pending_verify.previous_ntp // null' "$state_file" 2>/dev/null)
+    present=$(jq -r 'if .pending_verify.previous_present == true then "true" else "false" end' "$state_file" 2>/dev/null)
+    [ -n "$previous" ] && [ -n "$present" ] || return 0
+    _time_core_ntp_verdict "$since"
+    checked=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    case "$TIME_CORE_NTP_VERDICT" in
+        ok)
+            _atomic_modify_json "$state_file" \
+                '.pending_verify = null | .last_probe_status = "core-reachable" | .checked_at_system_utc = $checked' \
+                --arg checked "$checked" || true
+            _info "核心侧复核通过：sing-box 已从 ${source:-配置时间源} 取得时间。"
+            ;;
+        failed)
+            host=${source%:*}
+            _warn "核心侧复核失败：${source:-配置时间源} 在 sing-box 内不可达（脚本直连探测成功不代表核心可用）。"
+            [ -z "$TIME_CORE_NTP_DETAIL" ] || _warn "核心日志: ${TIME_CORE_NTP_DETAIL}"
+            if _atomic_modify_json "$CONFIG_FILE" \
+                'if $present then .ntp = $prev else del(.ntp) end' \
+                --argjson prev "$previous" --argjson present "$present"; then
+                _atomic_modify_json "$state_file" \
+                    '.pending_verify = null | .last_probe_status = "core-unreachable" | .managed_ntp = $prev
+                     | .checked_at_system_utc = $checked
+                     | .core_failed_sources = (if $host == "" then (.core_failed_sources // [])
+                       else ((.core_failed_sources // []) + [$host] | unique) end)' \
+                    --argjson prev "$previous" --arg host "$host" --arg checked "$checked" || true
+                _success "已把 config.json 的 ntp 回退到改动前的配置；后续不再自动选用 ${host:-原时间源}。"
+                TIME_NTP_ROLLBACK_ACTIVE=1
+                _manage_service restart || _error "回退后重启 sing-box 失败，请手动重启。"
+                TIME_NTP_ROLLBACK_ACTIVE=0
+            else
+                _error "回退 config.json 的 ntp 配置失败，请手动修正 ntp.server 后重启。"
+            fi
+            ;;
+        *)
+            _warn "等待窗口内没有取到核心校时结论；保留当前配置，下次重启会继续复核。"
+            ;;
+    esac
+    return 0
+}
+
 _time_has_ss2022() {
     local config
     for config in "$CONFIG_FILE" "${RELAY_CONFIG_FILE:-${SINGBOX_DIR}/relay.json}"; do
@@ -1153,13 +1263,22 @@ _time_has_ss2022() {
 }
 
 _time_prepare_ntp_config() {
+    # 回退重启期间禁止二次探测，否则会把刚被核心证伪的源再写回去。
+    [ "${TIME_NTP_ROLLBACK_ACTIVE:-0}" = 1 ] && return 0
     _with_state_lock _time_prepare_ntp_config_locked
 }
 
 _time_prepare_ntp_config_locked() {
     [ -s "$CONFIG_FILE" ] || return 0
-    local current managed="" wanted server state_file="${SINGBOX_DIR}/time-sync.json"
-    local status="unreachable" previous_status="" tmp old_present config_changed=false
+    # 显式锁定优先于任何自动迁移：运维指定的配置不再被探测结果覆盖。
+    if [ "${TIME_NTP_LOCK:-0}" = 1 ]; then
+        _info "TIME_NTP_LOCK=1：跳过 NTP 源自动探测与改写，保留 config.json 现有 ntp 配置。"
+        return 0
+    fi
+    local current managed="" wanted="" server next_ntp state_file="${SINGBOX_DIR}/time-sync.json"
+    local status="unreachable" previous_status="" tmp old_present config_changed=false pending='null'
+    local locked_server="${TIME_NTP_SERVER:-}" skipped=""
+    local -a candidates=()
     current=$(jq -cS '.ntp // null' "$CONFIG_FILE") || return 1
     old_present=$(jq -r 'has("ntp")' "$CONFIG_FILE") || return 1
     [ ! -s "$state_file" ] || managed=$(jq -cS '.managed_ntp // null' "$state_file" 2>/dev/null)
@@ -1193,21 +1312,47 @@ _time_prepare_ntp_config_locked() {
         fi
     fi
 
-    wanted='{"enabled":false}'
-    for server in time.apple.com time.cloudflare.com time.google.com; do
-        if _time_probe_ntp "$server" 123; then
-            wanted=$(jq -cn --arg s "$server" '{enabled:true,server:$s,server_port:123,interval:"1m",write_to_system:false,connect_timeout:"3s"}') || return 1
-            status="reachable"
-            break
-        fi
+    # 显式锁定的源优先；否则跳过核心日志判定不可达的源，避免被同一个坏源反复带偏。
+    if [ -n "$locked_server" ]; then
+        candidates=("$locked_server")
+    else
+        for server in time.apple.com time.cloudflare.com time.google.com; do
+            if _time_ntp_source_rejected "$server"; then
+                skipped+="${server} "
+            else
+                candidates+=("$server")
+            fi
+        done
+    fi
+    for server in "${candidates[@]}"; do
+        _time_probe_ntp "$server" 123 || continue
+        wanted=$(jq -cn --arg s "$server" '{enabled:true,server:$s,server_port:123,interval:"1m",write_to_system:false,connect_timeout:"3s"}') || return 1
+        status="reachable"
+        break
     done
+    if [ -z "$wanted" ]; then
+        # 探测失败绝不销毁现有配置：旧实现写 {"enabled":false} 会停掉正在工作的核心校时。
+        # 只有本来没有 ntp 配置时才落一个显式关闭，避免留下半成品字段。
+        wanted="$current"
+        [ "$current" != null ] || wanted='{"enabled":false}'
+    fi
+    next_ntp=$(printf '%s' "$wanted" | jq -cS .) || return 1
+    # 只有真正换成新源时才登记核心复核；保留原配置不属于核心侧改动。
+    if [ "$status" = reachable ] && [ "$current" != "$next_ntp" ]; then
+        pending=$(jq -cn --argjson prev "$current" --argjson present "$old_present" \
+            --arg src "${TIME_PROBE_SOURCE:-}" --arg since "$(date '+%Y-%m-%d %H:%M:%S')" \
+            '{previous_ntp:$prev,previous_present:$present,source:$src,since:$since}') || return 1
+    fi
     tmp=$(mktemp "${state_file}.tmp.XXXXXX") || return 1
-    if ! jq -n --argjson ntp "$wanted" --arg status "$status" --arg offset "${TIME_PROBE_OFFSET:-}" --arg source "${TIME_PROBE_SOURCE:-}" --arg checked "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-        '{managed_ntp:$ntp,last_probe_status:$status,system_offset_seconds:$offset,source:$source,checked_at_system_utc:$checked}' > "$tmp" || ! chmod 600 "$tmp"; then
+    if ! jq -n --argjson ntp "$wanted" --arg status "$status" --arg offset "${TIME_PROBE_OFFSET:-}" \
+        --arg source "${TIME_PROBE_SOURCE:-}" --arg method "$TIME_NTP_PROBE_METHOD" \
+        --arg checked "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --argjson pending "$pending" \
+        --argjson failed "$(jq -c '.core_failed_sources // []' "$state_file" 2>/dev/null || printf '[]')" \
+        '{managed_ntp:$ntp,last_probe_status:$status,system_offset_seconds:$offset,probe_method:$method,source:$source,pending_verify:$pending,core_failed_sources:$failed,checked_at_system_utc:$checked}' > "$tmp" || ! chmod 600 "$tmp"; then
         rm -f -- "$tmp"
         return 1
     fi
-    if [ "$current" != "$(printf '%s' "$wanted" | jq -cS .)" ]; then
+    if [ "$current" != "$next_ntp" ]; then
         if ! _atomic_modify_json "$CONFIG_FILE" '.ntp = $ntp' --argjson ntp "$wanted"; then
             rm -f -- "$tmp"
             return 1
@@ -1221,10 +1366,19 @@ _time_prepare_ntp_config_locked() {
     fi
     if [ "$status" = reachable ]; then
         if [ "$config_changed" = true ] || [ "$previous_status" != reachable ]; then
-            _info "NTP 探测 ${TIME_PROBE_SOURCE} 可达；已配置 sing-box 每 1 分钟补偿协议时钟；系统偏差约 ${TIME_PROBE_OFFSET} 秒，未修改系统时钟。"
+            _info "NTP 探测 ${TIME_PROBE_SOURCE} 可达（${TIME_NTP_PROBE_METHOD}）；已配置 sing-box 每 1 分钟补偿协议时钟；系统偏差约 ${TIME_PROBE_OFFSET} 秒，未修改系统时钟。"
+        fi
+        if [ "$config_changed" = true ]; then
+            _info "脚本探测与核心出站不是同一条路径；重启后用核心日志复核，失败会自动回退。"
         fi
     else
-        _warn "三个 NTP 时间源均未通过有界探测，暂不启用脚本管理的内置 NTP，避免拖延其他节点启动。"
+        if [ "$current" != null ]; then
+            _warn "候选 NTP 源（${candidates[*]:-无}）均未通过有界探测（${TIME_NTP_PROBE_METHOD}）：保持现有 ntp 配置不变，不打断可能仍在工作的核心校时。"
+        else
+            _warn "候选 NTP 源（${candidates[*]:-无}）均未通过有界探测（${TIME_NTP_PROBE_METHOD}），暂不启用脚本管理的内置 NTP，避免拖延其他节点启动。"
+        fi
+        [ -z "$locked_server" ] || _warn "TIME_NTP_SERVER=${locked_server} 为显式锁定源，探测失败时不会回退到其他候选。"
+        [ -z "$skipped" ] || _warn "已跳过核心曾判定不可达的源（${skipped% }）；确认核心侧已恢复后可删除 ${state_file} 或用 TIME_NTP_SERVER 指定重试。"
         _warn "下次启动/重启或 [11] 修复会重新探测；未校时不等于 SS2022 已可用。"
         _time_has_ss2022 && _warn "检测到 SS2022：系统偏差超过 30 秒时将被拒绝；请使用可达时间源或联系宿主机管理员。"
     fi
@@ -1244,10 +1398,15 @@ _time_diagnostics() {
     else
         server=time.apple.com port=123
     fi
+    # 脚本侧结论与核心侧复核结果分开显示，避免把「脚本可达」当成「核心已校时」。
+    if [ -s "${SINGBOX_DIR}/time-sync.json" ]; then
+        jq -r '"脚本记录: status=\(.last_probe_status // "未知"), source=\(.source // "无"), 探测方式=\(.probe_method // "旧版未记录"), 上次探测=\(.checked_at_system_utc // "未知"), 待核心复核=\(.pending_verify != null), 核心不可达源=\(((.core_failed_sources // []) | join(",")) | if . == "" then "无" else . end)"' \
+            "${SINGBOX_DIR}/time-sync.json" 2>/dev/null
+    fi
     if _time_probe_ntp "$server" "$port"; then
         found=true
     else
-        _warn "配置时间源的直连探测失败（自定义 detour 需结合核心日志判断）。"
+        _warn "配置时间源的直连探测失败（${TIME_NTP_PROBE_METHOD}；自定义 detour 需结合核心日志判断）。"
         for server in time.cloudflare.com time.google.com; do
             if _time_probe_ntp "$server" 123; then found=true; break; fi
         done
@@ -1261,11 +1420,7 @@ _time_diagnostics() {
     else
         _warn "无可用 NTP 应答，不能确认时间准确或 SS2022 可用。HTTPS Date 只能辅助诊断，不能直接补偿核心。"
     fi
-    if [ "${INIT_SYSTEM:-}" = systemd ]; then
-        logs=$(journalctl -u sing-box --since '2 hours ago' -n 1000 --no-pager 2>/dev/null | grep -E 'ntp:|bad timestamp' | tail -n 8)
-    elif [ -r "${LOG_FILE:-/var/log/sing-box.log}" ]; then
-        logs=$(tail -n 1000 "${LOG_FILE:-/var/log/sing-box.log}" | grep -E 'ntp:|bad timestamp' | tail -n 8)
-    fi
+    logs=$(_time_core_ntp_logs '2 hours ago' 1000 | grep -E 'ntp:|bad timestamp' | tail -n 8)
     if [ -n "$logs" ]; then
         _info "近期核心日志（历史成功不代表当前仍准确）："
         printf '%s\n' "$logs"
@@ -1670,7 +1825,7 @@ esac
 
 export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _conn_ipv4 _conn_ipv6 _choose_connect_addr _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _state_write_allowed _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _node_cc_flag _node_cc_name _node_region_name_ok _node_region_detect _node_region _node_machine_id_random _node_machine_id _node_name_taken _node_default_name _node_name_replace_port
 
-export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
+export -f _time_is_container _time_probe_ntp _time_core_ntp_logs _time_core_ntp_verdict _time_ntp_source_rejected _time_mark_verify_window _time_confirm_core_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
 server_ip=""
 BATCH_MODE=false

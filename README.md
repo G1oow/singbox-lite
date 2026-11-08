@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v119`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v120`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -331,7 +331,8 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 
 ## 安全与可靠性机制
 
-- sing-box 使用每分钟一次的进程内 NTP 时间补偿，不要求 LXC/Podman 修改系统时间；启动前有界探测备用时间源，只迁移脚本管理的默认项并保留用户自定义设置。所有默认时间源不可达时会暂缓启用补偿并告警，下次启动/重启或 `[11]` 修复时重新探测，不把服务运行当作 SS2022 可用证明。
+- sing-box 使用每分钟一次的进程内 NTP 时间补偿，不要求 LXC/Podman 修改系统时间；启动前有界探测备用时间源（本机直连 UDP/123，3s 超时，不经代理），只迁移脚本管理的默认项并保留用户自定义设置。候选源全部不可达时不再改写 `config.json`，保留现有 `ntp.server` 并告警，下次启动/重启或 `[11]` 修复时重新探测，不把服务运行当作 SS2022 可用证明。
+- 脚本探测与核心不是同一条路径（核心用自己的 DNS 与出站），因此脚本每次写入新时间源后都用重启后的核心日志复核：出现 `ntp: updated time` 记为通过，出现 `ntp: initialize time` 即回退到改动前的 `ntp` 并只重启一次，该源写入 `core_failed_sources` 后不再自动选用。复核相关环境变量：`TIME_NTP_LOCK=1` 完全跳过自动探测与改写，`TIME_NTP_SERVER=<host>` 锁定唯一候选源，`TIME_CORE_VERIFY=0` 关闭复核，`TIME_CORE_VERIFY_WAIT` 调整等待窗口（默认 8 秒）。
 - `[11]` 区分时间诊断、核心补偿修复和系统校时；容器不执行系统校时，不新增常驻校时程序。Xray 仍依赖系统时间，不继承 sing-box 的补偿，创建 SS2022 时会明确提示。SS2022 始终保留 30 秒时间窗口，客户端也需时间准确。
 - 所有脚本共享同一把状态锁，避免主脚本、中转脚本和 Xray 脚本并发写配置。
 - JSON/YAML 使用同目录临时文件、格式校验和原子替换。
@@ -602,3 +603,10 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 新增 `_sni_candidates` / `_prompt_sni_choice` 作为统一入口，各协议不再各自拼提示语；默认值统一取 `DEFAULT_SNI`，不再散落硬编码。
 - 新建 Reality 节点若选了伪装站域名，`handshake` 与 `[21]` 保持一致：回环回落模式下指向 `127.0.0.1:<回环端口>`，避免 Reality 回头连自己的 443 端口形成自环。
 - 新增上述函数的回归测试；`SCRIPT_VERSION` 递增到 119。
+
+### v120：NTP 探测与核心复核
+
+- 修复「脚本判定时间源可达、sing-box 核心却超时」：脚本把探测到的时间源写进 `config.json` 后核心侧同步失败，SS2022 的时钟补偿实际失效（issue #20）。现在每次写入新源后都用重启后的核心日志复核——出现 `ntp: updated time` 记为通过，出现 `ntp: initialize time` 则认为核心不可达，回退到改动前的 `ntp` 并只重启一次，同时把该源记入 `core_failed_sources`，后续自动探测直接跳过。
+- 修复探测失败反而销毁可用配置：旧实现写 `{"enabled":false}`，会把正在工作的 `ntp.server` 直接停掉。现在候选源全部不可达时保持 `config.json` 的 `ntp` 原样，只有本来就没有 `ntp` 配置时才落显式关闭。
+- 新增显式锁定：`TIME_NTP_LOCK=1` 跳过自动探测与改写，`TIME_NTP_SERVER=<host>` 强制唯一候选源；探测与复核日志都标注探测方式（本机直连 UDP/123，3s 超时，不经代理），`[11] 时间诊断` 额外显示 sidecar 的探测状态、核心不可达源与待复核状态。
+- 新增 `tests/test_ntp_probe.sh`（离线替身，不访问外网、不启动真实服务）并接入 CI；`SCRIPT_VERSION` 递增到 120。
