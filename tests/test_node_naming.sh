@@ -66,10 +66,10 @@ check "缓存命中地区" "🇭🇰 香港" "$(_node_region)"
 echo "== 默认节点名 =="
 check "普通节点不带端口" "🇭🇰 香港-hy2-ZT7K2M" "$(_node_default_name hy2 8443)"
 check "无端口参数" "🇭🇰 香港-Vless-Reality-ZT7K2M" "$(_node_default_name Vless-Reality)"
-check "批量模式强制带端口" "🇭🇰 香港-Vless-WS-2053-ZT7K2M" "$(_node_default_name Vless-WS 2053 true)"
+check "批量模式不追加端口" "🇭🇰 香港-Vless-WS-ZT7K2M" "$(BATCH_MODE=true _node_default_name Vless-WS 2053)"
 check "NODE_REGION 覆盖" "🇯🇵 日本-tuic-ZT7K2M" "$(NODE_REGION='🇯🇵 日本' _node_default_name tuic)"
-check "Argo 标签" "🇭🇰 香港-Argo-Temp-Vless-8443-ZT7K2M" \
-    "$(_node_default_name "Argo-Temp-Vless" 8443 true)"
+check "Argo 标签" "🇭🇰 香港-Argo-Temp-Vless-ZT7K2M" \
+    "$(_node_default_name "Argo-Temp-Vless" 8443)"
 
 echo "== 机器ID =="
 check "机器ID 复用缓存" "ZT7K2M" "$(_node_machine_id)"
@@ -90,6 +90,7 @@ check "元数据命中判定占用" taken "$r"
 _node_name_taken "🇭🇰 香港-tuic-ZT7K2M" && r=taken || r=free
 check "元数据未命中判定空闲" free "$r"
 check "同名时自动追加端口" "🇭🇰 香港-hy2-8443-ZT7K2M" "$(_node_default_name hy2 8443)"
+check "批量模式下重名仍追加端口" "🇭🇰 香港-hy2-8443-ZT7K2M" "$(BATCH_MODE=true _node_default_name hy2 8443)"
 
 echo "== 重名检测 (yq: clash.yaml) =="
 cat > "$CLASH_YAML_FILE" <<'YAML'

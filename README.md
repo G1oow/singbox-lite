@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v120`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v121`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -136,13 +136,12 @@ sb
 | Trojan + WebSocket + TLS | `🇭🇰 香港-Trojan-WS-ZT7K2M` |
 | TUIC v5 | `🇭🇰 香港-tuic-ZT7K2M` |
 | Shadowsocks | `🇭🇰 香港-SS-2022-aes256-ZT7K2M` |
-| Argo 临时/固定隧道 | `🇭🇰 香港-Argo-Temp-Vless-8443-ZT7K2M` |
-| 批量创建 | `🇭🇰 香港-Vless-WS-8443-ZT7K2M` |
+| Argo 临时/固定隧道 | `🇭🇰 香港-Argo-Temp-Vless-ZT7K2M` |
 | Xray VLESS + gRPC + Reality | `🇭🇰 香港-Vless-gRPC-Reality-ZT7K2M` |
 
 - 地区：按本机公网 IP 归属地自动识别，结果写入 `/usr/local/etc/sing-box/node-region.cache`；只有首次创建节点时会联网查询，之后直接使用缓存。
 - 机器ID：首次创建节点时提示输入，默认自动生成 `ZT` + 4 位大写字母/数字，写入 `/usr/local/etc/sing-box/machine-id` 并在之后复用。
-- 端口：普通节点默认不带端口；批量创建、或同一名称已存在时会自动追加端口，避免 `clash.yaml` 出现重名节点。
+- 端口：默认名称一律不带端口，批量创建与单节点规则一致；仅当同一名称已存在于 `clash.yaml` 或各核心元数据（例如批量里重复创建同一协议）时才追加端口，如 `🇭🇰 香港-Vless-WS-2053-ZT7K2M`，避免出现重名节点。
 - 覆盖方式：`NODE_REGION="🇯🇵 日本" sb` 可临时指定地区；删除上述两个缓存文件即可重新识别地区或重新生成机器ID；节点名称仍可在创建时手动修改。
 - 归属地查询使用 `ipwho.is`，失败时回退 `ipinfo.io/country`；两者都不可用时显示 `🌐 未知`，不影响节点创建。
 
@@ -610,3 +609,9 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 修复探测失败反而销毁可用配置：旧实现写 `{"enabled":false}`，会把正在工作的 `ntp.server` 直接停掉。现在候选源全部不可达时保持 `config.json` 的 `ntp` 原样，只有本来就没有 `ntp` 配置时才落显式关闭。
 - 新增显式锁定：`TIME_NTP_LOCK=1` 跳过自动探测与改写，`TIME_NTP_SERVER=<host>` 强制唯一候选源；探测与复核日志都标注探测方式（本机直连 UDP/123，3s 超时，不经代理），`[11] 时间诊断` 额外显示 sidecar 的探测状态、核心不可达源与待复核状态。
 - 新增 `tests/test_ntp_probe.sh`（离线替身，不访问外网、不启动真实服务）并接入 CI；`SCRIPT_VERSION` 递增到 120。
+
+### v121：节点命名不再按批量模式追加端口
+
+- 批量创建节点时默认名称不再插入端口段：`_node_default_name` 移除 `force_port` 参数，批量模式与单节点模式统一为 `地区旗帜 地区-协议-机器ID`（如 `🇭🇰 香港-hy2-ZT7K2M`）。
+- 重名保护不变：只有目标名称已存在于 `clash.yaml` 或各核心元数据时才追加端口段，批量里重复创建同一协议仍会得到唯一名称。
+- 同步更新 `tests/test_node_naming.sh` 的命名断言，新增「批量模式不追加端口」与「批量模式下重名仍追加端口」两条回归；`SCRIPT_VERSION` 递增到 121。

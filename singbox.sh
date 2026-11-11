@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="120"
+export SCRIPT_VERSION="121"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -439,15 +439,16 @@ _node_name_taken() {
     return 1
 }
 
-# 生成默认节点名: "<旗帜> <地区>-<协议>-<机器ID>"，同名冲突或批量模式时追加端口
-# 用法: _node_default_name <协议标签> [端口] [force_port]
+# 生成默认节点名: "<旗帜> <地区>-<协议>-<机器ID>"，仅当同名已存在时追加端口
+# 批量模式与普通模式规则一致，端口段只在重名冲突时出现，避免默认名里塞无意义的端口。
+# 用法: _node_default_name <协议标签> [端口]
 _node_default_name() {
-    local proto="$1" port="${2:-}" force_port="${3:-false}" region="" machine_id=""
+    local proto="$1" port="${2:-}" region="" machine_id=""
     [ -n "$proto" ] || return 1
     region=$(_node_region)
     [ -n "$region" ] || region="🌐 未知"
     machine_id=$(_node_machine_id)
-    if [ -n "$port" ] && { [ "$force_port" = "true" ] || _node_name_taken "${region}-${proto}-${machine_id}"; }; then
+    if [ -n "$port" ] && _node_name_taken "${region}-${proto}-${machine_id}"; then
         printf '%s-%s-%s-%s' "$region" "$proto" "$port" "$machine_id"
     else
         printf '%s-%s-%s' "$region" "$proto" "$machine_id"
@@ -2635,7 +2636,7 @@ _add_argo_node() (
     if [ "$argo_type" == "fixed" ]; then
         default_prefix="Argo-Fixed"
     fi
-    local default_name=$(_node_default_name "${default_prefix}-${proto_name}" "$port" true)
+    local default_name=$(_node_default_name "${default_prefix}-${proto_name}" "$port")
 
     echo ""
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -4712,7 +4713,7 @@ _add_vless_ws_tls() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_node_default_name "Vless-WS" "$port" true)
+        name=$(_node_default_name "Vless-WS" "$port")
     else
         local default_name=$(_node_default_name "Vless-WS" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -4849,7 +4850,7 @@ _add_vless_grpc_tls() {
 
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_node_default_name "Vless-gRPC" "$port" true)
+        name=$(_node_default_name "Vless-gRPC" "$port")
     else
         local default_name=$(_node_default_name "Vless-gRPC" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -5001,7 +5002,7 @@ _add_trojan_ws_tls() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_node_default_name "Trojan-WS" "$port" true)
+        name=$(_node_default_name "Trojan-WS" "$port")
     else
         local default_name=$(_node_default_name "Trojan-WS" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -5289,7 +5290,7 @@ _add_anytls() {
         1)
             local name
             if [ "$BATCH_MODE" = "true" ]; then
-                name=$(_node_default_name "AnyTLS" "$port" true)
+                name=$(_node_default_name "AnyTLS" "$port")
             else
                 local default_name=$(_node_default_name "AnyTLS" "$port")
                 read -p "请输入 AnyTLS 节点名称 (默认: ${default_name}): " custom_name
@@ -5301,7 +5302,7 @@ _add_anytls() {
         2)
             local name
             if [ "$BATCH_MODE" = "true" ]; then
-                name=$(_node_default_name "Any-Reality" "$port" true)
+                name=$(_node_default_name "Any-Reality" "$port")
             else
                 local default_name=$(_node_default_name "Any-Reality" "$port")
                 read -p "请输入 Any-Reality 节点名称 (默认: ${default_name}): " custom_name
@@ -5315,8 +5316,8 @@ _add_anytls() {
             local reality_port=$((port + 1))
             local tls_name reality_name
             if [ "$BATCH_MODE" = "true" ]; then
-                tls_name=$(_node_default_name "AnyTLS" "$tls_port" true)
-                reality_name=$(_node_default_name "Any-Reality" "$reality_port" true)
+                tls_name=$(_node_default_name "AnyTLS" "$tls_port")
+                reality_name=$(_node_default_name "Any-Reality" "$reality_port")
             else
                 local default_tls_name=$(_node_default_name "AnyTLS" "$tls_port")
                 local default_reality_name=$(_node_default_name "Any-Reality" "$reality_port")
@@ -5348,7 +5349,7 @@ _add_vless_reality() {
         # 批量模式变量预加载，增加多层保底，防止变量泄露
         server_name=$(echo "${BATCH_SNI}" | xargs)
         [[ -z "$server_name" ]] && server_name="$DEFAULT_SNI"
-        name=$(_node_default_name "Vless-Reality" "$port" true)
+        name=$(_node_default_name "Vless-Reality" "$port")
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
     else
@@ -5412,7 +5413,7 @@ _add_vless_tcp() {
     local default_name=$(_node_default_name "Vless-TCP" "$port")
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_node_default_name "Vless-TCP" "$port" true)
+        name=$(_node_default_name "Vless-TCP" "$port")
     else
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
@@ -5545,7 +5546,7 @@ _add_hysteria2() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_node_default_name "hy2" "$port" true)
+        name=$(_node_default_name "hy2" "$port")
     else
         local default_name=$(_node_default_name "hy2" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -5668,7 +5669,7 @@ _add_tuic() {
     # [!] 自主生成与名称分配
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_node_default_name "tuic" "$port" true)
+        name=$(_node_default_name "tuic" "$port")
     else
         local default_name=$(_node_default_name "tuic" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -5789,7 +5790,7 @@ _add_shadowsocks_menu() {
     # [!] 新增：自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_node_default_name "${name_prefix}" "$port" true)
+        name=$(_node_default_name "${name_prefix}" "$port")
     else
         local default_name=$(_node_default_name "${name_prefix}" "$port")
         read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -5967,7 +5968,7 @@ _add_socks() {
     local tag="socks-in-${port}"
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_node_default_name "SOCKS5" "$port" true)
+        name=$(_node_default_name "SOCKS5" "$port")
     else
         name=$(_node_default_name "SOCKS5" "$port")
     fi
