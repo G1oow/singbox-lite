@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="121"
+export SCRIPT_VERSION="122"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -114,6 +114,28 @@ _secure_state_permissions() {
 _check_root() {
     if [[ $EUID -ne 0 ]]; then
         _error "此脚本必须以 root 权限运行。"
+        exit 1
+    fi
+}
+
+# 交互式读取包装：stdin 关闭（EOF）时 read 会立即返回非零，而菜单与端口询问都在
+# while true 中循环，调用方若不检查返回值就会退化成全速空转，并每轮 fork clear、
+# sing-box version 等子进程（实测单核机器 240 fork/秒、0% idle、load 3.0）。
+# 约定：交互式 while true 循环内的 read 一律走本函数，EOF 立即退出，不留空转实例。
+# 用法：_read_or_exit [read 参数...] 变量名
+_read_or_exit() {
+    read "$@" && return 0
+    printf '\n' >&2
+    _warn "标准输入已关闭（EOF），已退出 sb。"
+    exit 0
+}
+
+# 菜单只能由交互式终端驱动：stdin 为 EOF 时无人响应输入，stdout 非终端时用户看不到
+# 菜单。cron 调用的 recover-pending / keepalive / cleanup-logs 在参数解析阶段就已
+# exit，因此该校验只放在 main() 内，不放进脚本顶层。
+_require_interactive_tty() {
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        _error "sb 需要交互式终端运行；非交互场景请使用 recover-pending / keepalive / cleanup-logs 子命令。"
         exit 1
     fi
 }
@@ -3670,7 +3692,7 @@ _argo_menu() {
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
         
-        read -p "  请输入选项 [0-7]: " choice
+        _read_or_exit -p "  请输入选项 [0-7]: " choice
 
         case $choice in
             1) _add_argo_vless_ws ;;
@@ -3684,7 +3706,7 @@ _argo_menu() {
             *) _error "无效选项" ;;
         esac
         echo ""
-        read -n 1 -s -r -p "按任意键继续..."
+        _read_or_exit -n 1 -s -r -p "按任意键继续..."
     done
 }
 
@@ -4674,7 +4696,7 @@ _add_vless_ws_tls() {
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
+            _read_or_exit -p "请输入监听端口 (直连模式下首推 443 端口): " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -4818,7 +4840,7 @@ _add_vless_grpc_tls() {
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
+            _read_or_exit -p "请输入监听端口 (直连模式下首推 443 端口): " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -4949,7 +4971,7 @@ _add_trojan_ws_tls() {
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
+            _read_or_exit -p "请输入监听端口 (直连模式下首推 443 端口): " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -5260,7 +5282,7 @@ _add_anytls() {
 
         node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
-            read -p "请输入起始监听端口: " port
+            _read_or_exit -p "请输入起始监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             if [[ "$mode_choice" == "1,2" || "$mode_choice" == "2,1" || "$mode_choice" == "1 2" || "$mode_choice" == "2 1" ]]; then
@@ -5357,7 +5379,7 @@ _add_vless_reality() {
         camouflage_domain=$(_prompt_sni_choice "伪装域名" "$DEFAULT_SNI") || return 1
         server_name=${camouflage_domain:-$DEFAULT_SNI}
         while true; do
-            read -p "请输入监听端口: " port
+            _read_or_exit -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -5403,7 +5425,7 @@ _add_vless_tcp() {
     else
         node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
-            read -p "请输入监听端口: " port
+            _read_or_exit -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -5486,7 +5508,7 @@ _add_hysteria2() {
     else
         node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
-            read -p "请输入监听端口: " port
+            _read_or_exit -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "udp" && continue
             break
@@ -5650,7 +5672,7 @@ _add_tuic() {
     else
         node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
-            read -p "请输入监听端口: " port
+            _read_or_exit -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "udp" && continue
             break
@@ -5957,7 +5979,7 @@ _add_socks() {
     else
         node_ip=$(_choose_connect_addr "$server_ip")
         while true; do
-            read -p "请输入监听端口: " port
+            _read_or_exit -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -8393,7 +8415,7 @@ _dns_config_menu() {
         echo ""
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-8]: " choice
+        _read_or_exit -p "  请输入选项 [0-8]: " choice
 
         dns_address=""
         dns_strategy="$current_strategy"
@@ -8406,11 +8428,11 @@ _dns_config_menu() {
             6)
                 echo ""
                 echo "  支持 local、IP、udp://、tcp://、tls://、https:// 等 sing-box DNS 地址。"
-                read -r -p "  请输入 DNS 地址（留空取消）: " dns_address
+                _read_or_exit -r -p "  请输入 DNS 地址（留空取消）: " dns_address
                 [ -z "$dns_address" ] && continue
                 if [[ "$dns_address" =~ [[:space:]] ]]; then
                     _error "DNS 地址不能包含空白字符。"
-                    read -n 1 -s -r -p "按任意键继续..."
+                    _read_or_exit -n 1 -s -r -p "按任意键继续..."
                     continue
                 fi
                 ;;
@@ -8420,13 +8442,13 @@ _dns_config_menu() {
                 echo "    2) prefer_ipv6（IPv6 优先）"
                 echo "    3) ipv4_only（仅 IPv4）"
                 echo "    4) ipv6_only（仅 IPv6）"
-                read -p "  请选择解析策略 [1-4]: " strategy_choice
+                _read_or_exit -p "  请选择解析策略 [1-4]: " strategy_choice
                 case "$strategy_choice" in
                     1) dns_strategy="prefer_ipv4" ;;
                     2) dns_strategy="prefer_ipv6" ;;
                     3) dns_strategy="ipv4_only" ;;
                     4) dns_strategy="ipv6_only" ;;
-                    *) _error "无效输入。"; read -n 1 -s -r -p "按任意键继续..."; continue ;;
+                    *) _error "无效输入。"; _read_or_exit -n 1 -s -r -p "按任意键继续..."; continue ;;
                 esac
                 dns_address="$current_address"
                 if [ "$dns_address" = "未设置" ]; then
@@ -8437,22 +8459,22 @@ _dns_config_menu() {
                 echo ""
                 jq '.dns' "$CONFIG_FILE" 2>/dev/null || _error "无法读取 DNS 配置。"
                 echo ""
-                read -n 1 -s -r -p "按任意键继续..."
+                _read_or_exit -n 1 -s -r -p "按任意键继续..."
                 continue
                 ;;
             0) return ;;
-            *) _error "无效输入，请重试。"; read -n 1 -s -r -p "按任意键继续..."; continue ;;
+            *) _error "无效输入，请重试。"; _read_or_exit -n 1 -s -r -p "按任意键继续..."; continue ;;
         esac
 
         echo ""
         _info "准备设置 DNS 为 ${dns_address}，解析策略为 ${dns_strategy}。"
-        read -r -p "  确认保存并重启 sing-box？[Y/n]: " confirm
+        _read_or_exit -r -p "  确认保存并重启 sing-box？[Y/n]: " confirm
         if [[ "$confirm" =~ ^[Nn]$ ]]; then
             continue
         fi
         _apply_dns_config "$dns_address" "$dns_strategy"
         echo ""
-        read -n 1 -s -r -p "按任意键继续..."
+        _read_or_exit -n 1 -s -r -p "按任意键继续..."
     done
 }
 
@@ -10532,7 +10554,7 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-22]: " choice
+        _read_or_exit -p "  请输入选项 [0-22]: " choice
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -10561,7 +10583,7 @@ _main_menu() {
             *) _error "无效输入，请重试。" ;;
         esac
         echo
-        read -n 1 -s -r -p "按任意键返回主菜单..."
+        _read_or_exit -n 1 -s -r -p "按任意键返回主菜单..."
     done
 }
 
@@ -11251,7 +11273,7 @@ _batch_create_nodes() {
     local ports_list=()
     _info "共需规划 $proto_count 个批量监听端口。"
     while true; do
-        read -p "请输入端口号 (范围如 10001-10010 或空格分隔): " p_input
+        _read_or_exit -p "请输入端口号 (范围如 10001-10010 或空格分隔): " p_input
         local current_p_list=()
         local invalid_port=false
         local duplicate_port=false
@@ -11434,6 +11456,7 @@ _show_add_node_menu() {
 
 main() {
     _check_root
+    _require_interactive_tty
     _detect_init_system
     
     # 强制预创建目录，防止后续 cp/mv 因路径不存在报错 (保底机制)

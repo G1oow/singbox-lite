@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v121`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
+当前文档按以下脚本版本整理：`singbox.sh v122`、`advanced_relay.sh v22`、`xray_manager.sh v3.1.5`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -615,3 +615,10 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - 批量创建节点时默认名称不再插入端口段：`_node_default_name` 移除 `force_port` 参数，批量模式与单节点模式统一为 `地区旗帜 地区-协议-机器ID`（如 `🇭🇰 香港-hy2-ZT7K2M`）。
 - 重名保护不变：只有目标名称已存在于 `clash.yaml` 或各核心元数据时才追加端口段，批量里重复创建同一协议仍会得到唯一名称。
 - 同步更新 `tests/test_node_naming.sh` 的命名断言，新增「批量模式不追加端口」与「批量模式下重名仍追加端口」两条回归；`SCRIPT_VERSION` 递增到 121。
+
+### v122：stdin 关闭时菜单不再空转
+
+- 修复「终端消失后 sb 常驻空转打满单核 CPU」：菜单与端口询问都在 `while true` 中读取输入，而 `read` 遇到 stdin EOF 会立即返回非零，旧实现不检查返回值，于是循环退化为每秒数百次的空转，并每轮 fork `clear`、`sing-box version` 等子进程（报告实测 240 fork/秒、`0% idle`、load 3.0）；残留实例还会互抢状态锁，让用户看到「等待状态锁超时」这类伪故障。
+- 新增 `_read_or_exit` 统一包装交互式读取，约定交互式 `while true` 循环内的 `read` 一律走该函数：EOF 时打印提示并以 0 退出，不再无限渲染菜单。覆盖主菜单、Argo 菜单、DNS 菜单、批量创建端口规划与 9 处「请输入监听端口」询问循环。
+- 新增 `_require_interactive_tty`，在 `main()` 内 `_check_root` 之后校验 stdin/stdout 是否为终端；`recover-pending` / `keepalive` / `cleanup-logs` 在参数解析阶段就已 exit，仍可被 cron 以非交互方式调用，不受该校验影响。
+- `tests/test_main_regressions.sh` 新增 EOF 行为回归：`_read_or_exit` 退出且不继续执行后续语句、`_main_menu` 在 stdin 为 `/dev/null` 时自行退出（带看门狗，不会挂住测试）、`_require_interactive_tty` 在非终端环境下返回 1，以及 CLI 子命令仍在 `main` 之前 exit；`SCRIPT_VERSION` 递增到 122。
