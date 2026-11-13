@@ -264,4 +264,73 @@ done
     [ -f "$SINGBOX_DIR/recovery" ] || exit 5
 ) > "$WORK/foreign-state.log" 2>&1
 check "待恢复事务阻止 Argo 卸载和手动重启，但保留恢复入口" 0 "$?"
+
+# --- stdin EOF 保护：菜单与端口询问不得空转 ----------------------------
+(
+    load_fn _read_or_exit
+    _warn() { printf '[warn] %s\n' "$1"; }
+    _read_or_exit -p "  请输入选项: " choice
+    printf 'unreachable\n'
+) < /dev/null > "$WORK/eof-exit.log" 2>&1
+check "stdin 关闭时 _read_or_exit 以 0 退出" 0 "$?"
+check "stdin 关闭时不再执行后续语句" no "$(grep -q unreachable "$WORK/eof-exit.log" && echo yes || echo no)"
+check "stdin 关闭时打印 EOF 提示" yes "$(grep -q '标准输入已关闭' "$WORK/eof-exit.log" && echo yes || echo no)"
+(
+    load_fn _read_or_exit
+    _read_or_exit -p "  请输入选项: " choice <<< '3'
+    printf 'choice=%s\n' "$choice"
+) > "$WORK/eof-normal.log" 2>&1
+check "有输入时 _read_or_exit 正常回填变量" yes "$(grep -q '^choice=3$' "$WORK/eof-normal.log" && echo yes || echo no)"
+
+# 真实主菜单在 stdin 为 /dev/null 时必须自行退出，而不是 while true 空转。
+# 用看门狗轮询而不是 timeout，保证回归重现时也只失败、不挂住测试。
+(
+    load_fn _read_or_exit; load_fn _main_menu
+    _warn() { :; }; _error() { :; }; _info() { :; }; clear() { :; }
+    _with_state_lock() { return 0; }
+    _recover_all_transactions_locked() { return 0; }
+    _singbox_core_is_locked() { return 1; }
+    SCRIPT_VERSION=0; INIT_SYSTEM=stub
+    SINGBOX_BIN="$WORK/absent-sing-box"; CLOUDFLARED_BIN="$WORK/absent-cloudflared"
+    ARGO_METADATA_FILE="$WORK/absent-argo.json"
+    SINGBOX_DIR="$WORK"; RUNTIME_DIR="$WORK"
+    PID_FILE="$WORK/absent.pid"; XRAY_PID_FILE="$WORK/absent-xray.pid"
+    _main_menu
+) < /dev/null > "$WORK/menu-eof.log" 2>&1 &
+menu_pid=$!
+menu_waited=0
+while kill -0 "$menu_pid" 2>/dev/null && [ "$menu_waited" -lt 10 ]; do
+    sleep 1
+    menu_waited=$((menu_waited + 1))
+done
+if kill -0 "$menu_pid" 2>/dev/null; then
+    kill -9 "$menu_pid" 2>/dev/null
+    wait "$menu_pid" 2>/dev/null
+    check "stdin 关闭时主菜单自行退出" 已退出 仍在空转
+else
+    wait "$menu_pid"
+    check "stdin 关闭时主菜单自行退出" 0 "$?"
+fi
+
+# 非交互入口：stdin/stdout 都不是终端时必须拒绝进入菜单。
+(
+    load_fn _require_interactive_tty
+    _error() { printf '[error] %s\n' "$1"; }
+    _require_interactive_tty
+    printf 'unreachable\n'
+) < /dev/null > "$WORK/tty-deny.log" 2>&1
+check "非终端环境下 _require_interactive_tty 以 1 退出" 1 "$?"
+check "非终端环境下打印终端要求提示" yes "$(grep -q '交互式终端' "$WORK/tty-deny.log" && echo yes || echo no)"
+check "tty 校验只否决不进入菜单" no "$(grep -q unreachable "$WORK/tty-deny.log" && echo yes || echo no)"
+
+# cron 入口与非交互子命令在参数解析阶段就已 exit，tty 校验不能挡住它们。
+main_def_line=$(grep -n '^main() {$' "$ROOT/singbox.sh" | head -1 | cut -d: -f1)
+tty_check_line=$(grep -n '^    _require_interactive_tty$' "$ROOT/singbox.sh" | head -1 | cut -d: -f1)
+install_line=$(awk -v start="$main_def_line" 'NR > start && /^    _install_dependencies/ { print NR; exit }' "$ROOT/singbox.sh")
+cron_entry_line=$(grep -n '^        recover-pending)$' "$ROOT/singbox.sh" | head -1 | cut -d: -f1)
+main_call_line=$(grep -n '^main$' "$ROOT/singbox.sh" | tail -1 | cut -d: -f1)
+check "tty 校验位于 main() 内" yes "$([ -n "$tty_check_line" ] && [ -n "$main_def_line" ] && [ "$tty_check_line" -gt "$main_def_line" ] && echo yes || echo no)"
+check "tty 校验早于重量级初始化" yes "$([ -n "$install_line" ] && [ "$tty_check_line" -lt "$install_line" ] && echo yes || echo no)"
+check "cron 子命令仍在 main 之前 exit" yes "$([ -n "$cron_entry_line" ] && [ -n "$main_call_line" ] && [ "$cron_entry_line" -lt "$main_call_line" ] && echo yes || echo no)"
+
 exit "$fail"
